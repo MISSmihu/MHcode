@@ -1,0 +1,30 @@
+# Binaries and build output
+/build/
+/dist/
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Wails and frontend output
+/frontend/node_modules/
+/frontend/dist/*
+!/frontend/dist/.gitkeep
+/frontend/wailsjs/
+/frontend/package.json.md5
+
+# Go
+/coverage.out
+
+# Local editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+/.vite-*.log
+
+# Temporary scaffolding
+/.wails-template/
+/.wails-*.log
+/.cache-experiments/

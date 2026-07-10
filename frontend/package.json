@@ -1,0 +1,20 @@
+{
+  "name": "mhcode-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "lucide-solid": "^0.468.0",
+    "solid-js": "^1.9.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^6.0.1",
+    "vite-plugin-solid": "^2.10.2"
+  }
+}

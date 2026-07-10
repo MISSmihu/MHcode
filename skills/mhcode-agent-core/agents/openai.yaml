@@ -1,0 +1,4 @@
+interface:
+  display_name: "MHcode Agent 核心"
+  short_description: "统一管理推理强度、Skills、MCP、工具调用、缓存命中和成本控制。"
+  default_prompt: "请使用 MHcode Agent 核心 Skill 设计一次低成本、高缓存命中的 Agent 执行流程。"

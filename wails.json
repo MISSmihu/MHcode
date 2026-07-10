@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "MHcode",
+  "outputfilename": "MHcode",
+  "frontend:install": "bun.cmd install",
+  "frontend:build": "bun.cmd run build",
+  "frontend:dev:watcher": "bun.cmd run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "MISSmihu",
+    "email": ""
+  }
+}
