@@ -372,6 +372,8 @@ func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.
 				APIType:        "anthropic-messages",
 				Enabled:        true,
 				DefaultModelID: "claude-custom",
+				ExtraHeaders:   "X-Route: mhcode",
+				ExtraBodyJSON:  `{"metadata":{"source":"mhcode"},"model":"blocked"}`,
 				Models: []ProviderModel{{
 					ID:          "claude-custom",
 					DisplayName: "Claude Custom",
@@ -387,12 +389,18 @@ func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.
 				if got := r.Header.Get("x-api-key"); got != "sk-ant" {
 					t.Fatalf("x-api-key = %q", got)
 				}
+				if got := r.Header.Get("X-Route"); got != "mhcode" {
+					t.Fatalf("X-Route = %q", got)
+				}
 				var payload map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 					t.Fatalf("decode payload: %v", err)
 				}
 				if payload["model"] != "claude-custom" {
 					t.Fatalf("model = %v, want claude-custom", payload["model"])
+				}
+				if metadata, ok := payload["metadata"].(map[string]any); !ok || metadata["source"] != "mhcode" {
+					t.Fatalf("metadata = %#v, want source mhcode", payload["metadata"])
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic ok\"}}\n\n"))
@@ -409,6 +417,8 @@ func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.
 				APIType:        "gemini-generate-content",
 				Enabled:        true,
 				DefaultModelID: "gemini-custom",
+				ExtraHeaders:   "X-Route: mhcode",
+				ExtraBodyJSON:  `{"safetySettings":[{"category":"HARM_CATEGORY_DANGEROUS_CONTENT","threshold":"BLOCK_NONE"}],"contents":[{"role":"user","parts":[{"text":"blocked"}]}]}`,
 				Models: []ProviderModel{{
 					ID:          "gemini-custom",
 					DisplayName: "Gemini Custom",
@@ -423,6 +433,20 @@ func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.
 				}
 				if got := r.URL.Query().Get("key"); got != "sk-gemini" {
 					t.Fatalf("key = %q", got)
+				}
+				if got := r.Header.Get("X-Route"); got != "mhcode" {
+					t.Fatalf("X-Route = %q", got)
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode payload: %v", err)
+				}
+				if safety, ok := payload["safetySettings"].([]any); !ok || len(safety) != 1 {
+					t.Fatalf("safetySettings = %#v", payload["safetySettings"])
+				}
+				contents, ok := payload["contents"].([]any)
+				if !ok || len(contents) == 0 {
+					t.Fatalf("contents = %#v", payload["contents"])
 				}
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini ok\"}]}}]}\n\n"))

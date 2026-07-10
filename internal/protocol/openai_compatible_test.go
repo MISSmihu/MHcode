@@ -69,3 +69,52 @@ func TestOpenAICompatibleListModelsAllowsLocalNoAuth(t *testing.T) {
 		t.Fatalf("models = %#v, want local-model", models)
 	}
 }
+
+func TestOpenAICompatibleStreamUsesCompatibilityOptions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("path = %s, want /chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Title"); got != "MHcode" {
+			t.Fatalf("X-Title = %q, want MHcode", got)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload["model"] != "router/model" {
+			t.Fatalf("model = %v, want protected router/model", payload["model"])
+		}
+		if payload["enable_thinking"] != true {
+			t.Fatalf("enable_thinking = %v, want true", payload["enable_thinking"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	provider := OpenAICompatibleProvider{
+		BaseURL:       server.URL,
+		APIKey:        "test-key",
+		ProviderID:    "router",
+		ExtraHeaders:  "X-Title: MHcode",
+		ExtraBodyJSON: `{"enable_thinking":true,"model":"blocked"}`,
+	}
+	events, err := provider.Stream(context.Background(), ChatRequest{
+		Model:    "router/model",
+		Messages: []Message{{Role: "user", Content: "ping"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	for event := range events {
+		if event.Type == "delta" {
+			got += event.Delta
+		}
+	}
+	if got != "ok" {
+		t.Fatalf("stream content = %q, want ok", got)
+	}
+}

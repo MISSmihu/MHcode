@@ -27,9 +27,11 @@ const (
 )
 
 type DeepSeekProvider struct {
-	APIKey     string
-	BaseURL    string
-	HTTPClient *http.Client
+	APIKey        string
+	BaseURL       string
+	HTTPClient    *http.Client
+	ExtraHeaders  string
+	ExtraBodyJSON string
 }
 
 func NewDeepSeekProvider(apiKey string) DeepSeekProvider {
@@ -99,6 +101,10 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 		}
 	}
 	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options"))
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +179,9 @@ func (p DeepSeekProvider) doRequestWithRetry(ctx context.Context, method string,
 		p.applyHeaders(req)
 		if accept != "" {
 			req.Header.Set("Accept", accept)
+		}
+		if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+			return nil, err
 		}
 
 		resp, err := p.client().Do(req)

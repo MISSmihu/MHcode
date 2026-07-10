@@ -101,6 +101,8 @@ type ModelProviderSetting struct {
 	APIType             string          `json:"apiType"`
 	BaseURL             string          `json:"baseUrl"`
 	BalanceURL          string          `json:"balanceUrl"`
+	ExtraHeaders        string          `json:"extraHeaders"`
+	ExtraBodyJSON       string          `json:"extraBodyJson"`
 	Enabled             bool            `json:"enabled"`
 	APIKeyConfigured    bool            `json:"apiKeyConfigured"`
 	DefaultModelID      string          `json:"defaultModelId"`
@@ -489,6 +491,8 @@ func normalizeModelSettings(settings ModelSettings, defaults ModelSettings) Mode
 			provider.BaseURL = defaultBaseURLForProtocol(provider.Protocol)
 		}
 		provider.BalanceURL = strings.TrimSpace(provider.BalanceURL)
+		provider.ExtraHeaders = strings.TrimSpace(provider.ExtraHeaders)
+		provider.ExtraBodyJSON = strings.TrimSpace(provider.ExtraBodyJSON)
 		provider.DefaultModelID = strings.TrimSpace(provider.DefaultModelID)
 		if provider.ContextWindowTokens < 0 {
 			provider.ContextWindowTokens = 0

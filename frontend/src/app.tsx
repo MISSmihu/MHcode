@@ -360,6 +360,7 @@ function App() {
   const runtimeSettings = createMemo(() => state()?.runtimeSettings ?? fallbackRuntimeSettings());
   const configFiles = createMemo(() => state()?.configFiles ?? fallbackConfigFiles());
   const activeRuntimeDraft = createMemo(() => runtimeDraft() ?? runtimeSettings());
+  const hasProviderKeyDrafts = createMemo(() => Object.values(providerKeyDrafts()).some((apiKey) => apiKey.trim()));
   const diagnostics = createMemo(() => state()?.cacheDiagnostics ?? []);
   const deepSeek = createMemo(() => state()?.deepSeek ?? fallbackDeepSeekState());
   const deepSeekSession = createMemo(() => state()?.deepSeekSession ?? fallbackDeepSeekSession());
@@ -588,9 +589,24 @@ function App() {
     setSavingRuntime(true);
     setError("");
     try {
-      const next = await saveRuntimeSettings(activeRuntimeDraft());
+      let next = await saveRuntimeSettings(activeRuntimeDraft());
+      const pendingProviderKeys = Object.entries(providerKeyDrafts()).filter(([, apiKey]) => apiKey.trim());
+      const savedProviderIDs: string[] = [];
+      for (const [providerID, apiKey] of pendingProviderKeys) {
+        next = await saveModelProviderAPIKey(providerID, apiKey.trim());
+        savedProviderIDs.push(providerID);
+      }
       setState(next);
       setRuntimeDraft(undefined);
+      if (savedProviderIDs.length > 0) {
+        setProviderKeyDrafts((current) => {
+          const copy = { ...current };
+          for (const providerID of savedProviderIDs) {
+            delete copy[providerID];
+          }
+          return copy;
+        });
+      }
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -645,6 +661,7 @@ function App() {
 
   const resetRuntimeDraft = () => {
     setRuntimeDraft(undefined);
+    setProviderKeyDrafts({});
   };
 
   const sendMessage = async () => {
@@ -1141,7 +1158,7 @@ function App() {
             providerKeyDrafts={providerKeyDrafts()}
             reasoningOptions={options()}
             runtimeDraft={activeRuntimeDraft()}
-            runtimeDirty={Boolean(runtimeDraft())}
+            runtimeDirty={Boolean(runtimeDraft()) || hasProviderKeyDrafts()}
             configFiles={configFiles()}
             clearProviderKey={clearProviderKey}
             saveKey={saveKey}
@@ -2144,21 +2161,21 @@ function ModelSettingsPanel(props: {
             </div>
           </Show>
 
-          <Show when={entryMode() === "custom" ? activeProvider() : undefined} keyed>
+          <Show when={entryMode() === "custom" ? activeProvider() : undefined}>
             {(provider) => (
               <div class="provider-editor">
                 <div class="provider-editor-head">
                   <div>
-                    <strong>{provider.name || "自定义供应商"}</strong>
-                    <span>{provider.id}</span>
+                    <strong>{provider().name || "自定义供应商"}</strong>
+                    <span>{provider().id}</span>
                   </div>
                   <div class="settings-row-actions">
                     <StatusPill
-                      icon={provider.lastSyncStatus === "ok" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
-                      label={provider.lastSyncStatus === "ok" ? "连接正常" : provider.lastSyncStatus === "error" ? "连接异常" : "待测试"}
-                      tone={provider.lastSyncStatus === "ok" ? "good" : provider.lastSyncStatus === "error" ? "bad" : "neutral"}
+                      icon={provider().lastSyncStatus === "ok" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
+                      label={provider().lastSyncStatus === "ok" ? "连接正常" : provider().lastSyncStatus === "error" ? "连接异常" : "待测试"}
+                      tone={provider().lastSyncStatus === "ok" ? "good" : provider().lastSyncStatus === "error" ? "bad" : "neutral"}
                     />
-                    <SwitchControl checked={provider.enabled} onChange={(value) => updateProvider(provider.id, { enabled: value })} />
+                    <SwitchControl checked={provider().enabled} onChange={(value) => updateProvider(provider().id, { enabled: value })} />
                   </div>
                 </div>
                 <SettingsCard>
@@ -2168,8 +2185,8 @@ function ModelSettingsPanel(props: {
                     control={
                       <input
                         class="settings-input row-control"
-                        value={provider.name}
-                        onInput={(event) => updateProvider(provider.id, { name: event.currentTarget.value })}
+                        value={provider().name}
+                        onInput={(event) => updateProvider(provider().id, { name: event.currentTarget.value })}
                       />
                     }
                   />
@@ -2178,9 +2195,9 @@ function ModelSettingsPanel(props: {
                     description="OpenAI 兼容协议支持自动获取上游模型"
                     control={
                       <SelectControl
-                        value={provider.protocol}
+                        value={provider().protocol}
                         options={providerProtocolOptions}
-                        onChange={(value) => changeProviderProtocol(provider, value)}
+                        onChange={(value) => changeProviderProtocol(provider(), value)}
                       />
                     }
                   />
@@ -2189,52 +2206,78 @@ function ModelSettingsPanel(props: {
                     description="后续路由会按 API 类型选择请求格式"
                     control={
                       <SelectControl
-                        value={provider.apiType}
+                        value={provider().apiType}
                         options={providerAPITypeOptions}
-                        onChange={(value) => updateProvider(provider.id, { apiType: value })}
+                        onChange={(value) => updateProvider(provider().id, { apiType: value })}
                       />
                     }
                   />
                   <SettingsRow
                     title="API 地址"
-                    description={providerBaseURLHint(provider.protocol)}
+                    description={providerBaseURLHint(provider().protocol)}
                     control={
                       <input
                         class="settings-input row-control"
-                        value={provider.baseUrl}
+                        value={provider().baseUrl}
                         spellcheck={false}
-                        placeholder={providerBaseURLPlaceholder(provider.protocol)}
-                        onInput={(event) => updateProvider(provider.id, { baseUrl: event.currentTarget.value })}
+                        placeholder={providerBaseURLPlaceholder(provider().protocol)}
+                        onInput={(event) => updateProvider(provider().id, { baseUrl: event.currentTarget.value })}
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title="额外请求头（可选）"
+                    description="用于 OpenRouter 等要求来源标识的兼容转发。一行一个 Header: value；API Key 仍建议通过上方密钥保存。"
+                    control={
+                      <textarea
+                        class="settings-textarea row-control provider-compat-textarea"
+                        value={provider().extraHeaders ?? ""}
+                        spellcheck={false}
+                        placeholder={"HTTP-Referer: https://example.com\nX-Title: MHcode"}
+                        onInput={(event) => updateProvider(provider().id, { extraHeaders: event.currentTarget.value })}
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title="额外请求体（可选）"
+                    description="合并到聊天请求体顶层 JSON；model、messages、stream 等核心字段仍由 MHcode 控制。"
+                    control={
+                      <textarea
+                        class="settings-textarea row-control provider-compat-textarea"
+                        value={provider().extraBodyJson ?? ""}
+                        spellcheck={false}
+                        placeholder={'{\n  "enable_thinking": true\n}'}
+                        onInput={(event) => updateProvider(provider().id, { extraBodyJson: event.currentTarget.value })}
                       />
                     }
                   />
                   <SettingsRow
                     title="密钥"
-                    description={provider.apiKeyConfigured ? "密钥已保存在本地 vault，不写入 JSON 设置" : "本地兼容服务可留空"}
+                    description={provider().apiKeyConfigured ? "密钥已保存到该供应商的本地凭据项，不写入 JSON 明文" : "输入后点保存设置或保存密钥；本地兼容服务可留空"}
                     control={
                       <div class="settings-row-stack">
                         <input
                           class="settings-input row-control"
                           type="password"
-                          value={props.providerKeyDrafts[provider.id] ?? ""}
-                          placeholder={provider.apiKeyConfigured ? "输入新 Key 可覆盖" : "sk-..."}
-                          onInput={(event) => props.setProviderKeyDraft(provider.id, event.currentTarget.value)}
+                          value={props.providerKeyDrafts[provider().id] ?? ""}
+                          placeholder={provider().apiKeyConfigured ? "输入新 Key 可覆盖" : "sk-..."}
+                          onInput={(event) => props.setProviderKeyDraft(provider().id, event.currentTarget.value)}
                         />
                         <div class="settings-row-actions">
                           <button
                             class="settings-soft-button"
                             type="button"
-                            disabled={props.savingProviderID === provider.id}
-                            onClick={() => void props.saveProviderKey(provider.id)}
+                            disabled={props.savingProviderID === provider().id}
+                            onClick={() => void props.saveProviderKey(provider().id)}
                           >
                             <Save size={14} />
-                            {props.savingProviderID === provider.id ? "保存中" : "保存密钥"}
+                            {props.savingProviderID === provider().id ? "保存中" : "保存密钥"}
                           </button>
                           <button
                             class="settings-soft-button"
                             type="button"
-                            disabled={!provider.apiKeyConfigured || props.clearingProviderID === provider.id}
-                            onClick={() => void props.clearProviderKey(provider.id)}
+                            disabled={!provider().apiKeyConfigured || props.clearingProviderID === provider().id}
+                            onClick={() => void props.clearProviderKey(provider().id)}
                           >
                             清除密钥
                           </button>
@@ -2244,16 +2287,16 @@ function ModelSettingsPanel(props: {
                   />
                   <SettingsRow
                     title="测试并获取模型"
-                    description={provider.lastSyncMessage || "会使用上方 API 地址与密钥确认连接，并用返回结果填充模型列表。"}
+                    description={provider().lastSyncMessage || "会使用上方 API 地址与密钥确认连接，并用返回结果填充模型列表。"}
                     control={
                       <button
                         class="settings-soft-button"
                         type="button"
-                        disabled={!provider.supportsModelFetch || props.syncingProviderID === provider.id}
-                        onClick={() => void props.syncProviderModels(provider.id)}
+                        disabled={!provider().supportsModelFetch || props.syncingProviderID === provider().id}
+                        onClick={() => void props.syncProviderModels(provider().id)}
                       >
-                        <RefreshCw size={14} classList={{ spinning: props.syncingProviderID === provider.id }} />
-                        {props.syncingProviderID === provider.id ? "获取中" : "测试并获取"}
+                        <RefreshCw size={14} classList={{ spinning: props.syncingProviderID === provider().id }} />
+                        {props.syncingProviderID === provider().id ? "获取中" : "测试并获取"}
                       </button>
                     }
                   />
@@ -2263,10 +2306,10 @@ function ModelSettingsPanel(props: {
                     control={
                       <input
                         class="settings-input row-control"
-                        value={provider.balanceUrl}
+                        value={provider().balanceUrl}
                         spellcheck={false}
                         placeholder="https://..."
-                        onInput={(event) => updateProvider(provider.id, { balanceUrl: event.currentTarget.value })}
+                        onInput={(event) => updateProvider(provider().id, { balanceUrl: event.currentTarget.value })}
                       />
                     }
                   />
@@ -2279,9 +2322,9 @@ function ModelSettingsPanel(props: {
                         type="number"
                         min="0"
                         step="1"
-                        value={provider.contextWindowTokens}
+                        value={provider().contextWindowTokens}
                         onInput={(event) =>
-                          updateProvider(provider.id, { contextWindowTokens: Math.max(0, Number(event.currentTarget.value) || 0) })
+                          updateProvider(provider().id, { contextWindowTokens: Math.max(0, Number(event.currentTarget.value) || 0) })
                         }
                       />
                     }
@@ -2291,25 +2334,25 @@ function ModelSettingsPanel(props: {
                     description="该提供商被选中时优先使用的模型"
                     control={
                       <SelectControl
-                        value={provider.defaultModelId}
+                        value={provider().defaultModelId}
                         options={[
                           { value: "", label: "自动选择" },
-                          ...provider.models.map((model) => ({ value: model.id, label: model.displayName || model.id })),
+                          ...provider().models.map((model) => ({ value: model.id, label: model.displayName || model.id })),
                         ]}
-                        onChange={(value) => updateProvider(provider.id, { defaultModelId: value })}
+                        onChange={(value) => updateProvider(provider().id, { defaultModelId: value })}
                       />
                     }
                   />
                   <SettingsRow
                     title="当前路由"
-                    description={props.runtimeDraft.model.selectedProviderId === provider.id ? "当前会话会优先使用该供应商" : "保存后后续会话可使用该供应商"}
+                    description={props.runtimeDraft.model.selectedProviderId === provider().id ? "当前会话会优先使用该供应商" : "保存后后续会话可使用该供应商"}
                     control={
                       <div class="settings-row-actions">
-                        <button class="settings-soft-button" type="button" onClick={() => setCurrentRoute(provider)}>
+                        <button class="settings-soft-button" type="button" onClick={() => setCurrentRoute(provider())}>
                           设为当前
                         </button>
-                        <Show when={provider.id !== "deepseek"}>
-                          <IconButton title="删除供应商" danger onClick={() => removeProvider(provider.id)}>
+                        <Show when={provider().id !== "deepseek"}>
+                          <IconButton title="删除供应商" danger onClick={() => removeProvider(provider().id)}>
                             <Trash2 size={14} />
                           </IconButton>
                         </Show>
@@ -2322,25 +2365,25 @@ function ModelSettingsPanel(props: {
                   <div class="provider-model-editor-head">
                     <div>
                       <strong>模型列表</strong>
-                      <span>{provider.models.length} 个模型 · 上下文 {formatTokenWindow(provider.contextWindowTokens)}</span>
+                      <span>{provider().models.length} 个模型 · 上下文 {formatTokenWindow(provider().contextWindowTokens)}</span>
                     </div>
                     <div class="settings-row-actions">
-                      <button class="settings-soft-button" type="button" onClick={() => addProviderModel(provider)}>
+                      <button class="settings-soft-button" type="button" onClick={() => addProviderModel(provider())}>
                         <Plus size={14} />
                         添加模型
                       </button>
                       <button
                         class="settings-soft-button"
                         type="button"
-                        disabled={!provider.supportsModelFetch || props.syncingProviderID === provider.id}
-                        onClick={() => void props.syncProviderModels(provider.id)}
+                        disabled={!provider().supportsModelFetch || props.syncingProviderID === provider().id}
+                        onClick={() => void props.syncProviderModels(provider().id)}
                       >
-                        <RefreshCw size={14} classList={{ spinning: props.syncingProviderID === provider.id }} />
+                        <RefreshCw size={14} classList={{ spinning: props.syncingProviderID === provider().id }} />
                         从上游获取
                       </button>
                     </div>
                   </div>
-                  <For each={provider.models} fallback={<p class="empty-line">暂无模型，可手动添加或从上游获取。</p>}>
+                  <For each={provider().models} fallback={<p class="empty-line">暂无模型，可手动添加或从上游获取。</p>}>
                     {(model, index) => (
                       <div class="provider-model-row">
                         <input
@@ -2349,7 +2392,7 @@ function ModelSettingsPanel(props: {
                           spellcheck={false}
                           placeholder="模型 ID"
                           onInput={(event) =>
-                            updateProviderModel(provider, index(), {
+                            updateProviderModel(provider(), index(), {
                               id: event.currentTarget.value,
                               displayName: model.displayName || event.currentTarget.value,
                             })
@@ -2359,7 +2402,7 @@ function ModelSettingsPanel(props: {
                           class="settings-input"
                           value={model.displayName}
                           placeholder="显示名称"
-                          onInput={(event) => updateProviderModel(provider, index(), { displayName: event.currentTarget.value })}
+                          onInput={(event) => updateProviderModel(provider(), index(), { displayName: event.currentTarget.value })}
                         />
                         <input
                           class="settings-input numeric"
@@ -2369,12 +2412,12 @@ function ModelSettingsPanel(props: {
                           value={model.contextWindowTokens}
                           title="模型上下文窗口，0 表示服务默认"
                           onInput={(event) =>
-                            updateProviderModel(provider, index(), {
+                            updateProviderModel(provider(), index(), {
                               contextWindowTokens: Math.max(0, Number(event.currentTarget.value) || 0),
                             })
                           }
                         />
-                        <IconButton title="删除模型" danger onClick={() => removeProviderModel(provider, index())}>
+                        <IconButton title="删除模型" danger onClick={() => removeProviderModel(provider(), index())}>
                           <Trash2 size={14} />
                         </IconButton>
                       </div>
@@ -3652,6 +3695,8 @@ function fallbackRuntimeSettings(): RuntimeSettings {
           apiType: "chat-completions",
           baseUrl: "https://api.deepseek.com",
           balanceUrl: "",
+          extraHeaders: "",
+          extraBodyJson: "",
           enabled: true,
           apiKeyConfigured: false,
           defaultModelId: "",
@@ -3668,6 +3713,8 @@ function fallbackRuntimeSettings(): RuntimeSettings {
           apiType: "chat-completions",
           baseUrl: "https://api.openai.com/v1",
           balanceUrl: "",
+          extraHeaders: "",
+          extraBodyJson: "",
           enabled: false,
           apiKeyConfigured: false,
           defaultModelId: "",
@@ -3684,6 +3731,8 @@ function fallbackRuntimeSettings(): RuntimeSettings {
           apiType: "chat-completions",
           baseUrl: "http://127.0.0.1:11434/v1",
           balanceUrl: "",
+          extraHeaders: "",
+          extraBodyJson: "",
           enabled: false,
           apiKeyConfigured: false,
           defaultModelId: "",
@@ -4030,6 +4079,8 @@ function providerFromPreset(preset: ProviderPreset, existing?: ModelProviderSett
     apiType: preset.apiType,
     baseUrl: preset.baseUrl,
     balanceUrl: preset.balanceUrl ?? existing?.balanceUrl ?? "",
+    extraHeaders: existing?.extraHeaders ?? "",
+    extraBodyJson: existing?.extraBodyJson ?? "",
     enabled: existing?.enabled ?? true,
     apiKeyConfigured: existing?.apiKeyConfigured ?? false,
     defaultModelId: existing?.defaultModelId ?? "",
@@ -4052,6 +4103,8 @@ function createEmptyProvider(providers: ModelProviderSetting[]): ModelProviderSe
     apiType: "chat-completions",
     baseUrl: "",
     balanceUrl: "",
+    extraHeaders: "",
+    extraBodyJson: "",
     enabled: true,
     apiKeyConfigured: false,
     defaultModelId: "",

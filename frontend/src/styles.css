@@ -2054,6 +2054,13 @@ code,
   line-height: 1.45;
 }
 
+.settings-row-control .provider-compat-textarea {
+  width: min(520px, 48vw);
+  min-height: 84px;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+  font-size: 12px;
+}
+
 .settings-input:focus,
 .settings-textarea:focus,
 .settings-select:focus {

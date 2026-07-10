@@ -14,12 +14,14 @@ import (
 )
 
 type OpenAICompatibleProvider struct {
-	BaseURL     string
-	APIKey      string
-	ProviderID  string
-	DisplayName string
-	HTTPClient  *http.Client
-	AllowNoAuth bool
+	BaseURL       string
+	APIKey        string
+	ProviderID    string
+	DisplayName   string
+	HTTPClient    *http.Client
+	AllowNoAuth   bool
+	ExtraHeaders  string
+	ExtraBodyJSON string
 }
 
 func (p OpenAICompatibleProvider) Name() string {
@@ -42,6 +44,9 @@ func (p OpenAICompatibleProvider) ListModels(ctx context.Context) ([]Model, erro
 		return nil, err
 	}
 	p.applyHeaders(req, "")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 	resp, err := p.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI-compatible models request failed: %w", err)
@@ -90,11 +95,18 @@ func (p OpenAICompatibleProvider) Stream(ctx context.Context, request ChatReques
 	if err != nil {
 		return nil, err
 	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options"))
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/chat/completions"), bytes.NewReader(encoded))
 	if err != nil {
 		return nil, err
 	}
 	p.applyHeaders(req, "text/event-stream")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := p.client().Do(req)
 	if err != nil {

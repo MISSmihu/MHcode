@@ -17,10 +17,12 @@ import (
 const DefaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
 type GeminiProvider struct {
-	BaseURL    string
-	APIKey     string
-	ProviderID string
-	HTTPClient *http.Client
+	BaseURL       string
+	APIKey        string
+	ProviderID    string
+	HTTPClient    *http.Client
+	ExtraHeaders  string
+	ExtraBodyJSON string
 }
 
 func (p GeminiProvider) Name() string {
@@ -39,6 +41,9 @@ func (p GeminiProvider) ListModels(ctx context.Context) ([]Model, error) {
 		return nil, err
 	}
 	p.applyHeaders(req)
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := p.client().Do(req)
 	if err != nil {
@@ -102,6 +107,10 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	if err != nil {
 		return nil, err
 	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction"))
+	if err != nil {
+		return nil, err
+	}
 	path := "/" + normalizeGeminiModelName(request.Model) + ":streamGenerateContent"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(path, true)+"&alt=sse", bytes.NewReader(encoded))
 	if err != nil {
@@ -109,6 +118,9 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	}
 	p.applyHeaders(req)
 	req.Header.Set("Accept", "text/event-stream")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := p.client().Do(req)
 	if err != nil {

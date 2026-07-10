@@ -677,26 +677,34 @@ func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, erro
 		}
 		client := protocol.NewDeepSeekProvider(route.APIKey)
 		client.BaseURL = route.Provider.BaseURL
+		client.ExtraHeaders = route.Provider.ExtraHeaders
+		client.ExtraBodyJSON = route.Provider.ExtraBodyJSON
 		return client, nil
 	case "openai-compatible", "local":
 		return protocol.OpenAICompatibleProvider{
-			BaseURL:     route.Provider.BaseURL,
-			APIKey:      route.APIKey,
-			ProviderID:  route.Provider.ID,
-			DisplayName: route.Provider.Name,
-			AllowNoAuth: route.AllowNoAuth || route.Provider.Protocol == "local",
+			BaseURL:       route.Provider.BaseURL,
+			APIKey:        route.APIKey,
+			ProviderID:    route.Provider.ID,
+			DisplayName:   route.Provider.Name,
+			AllowNoAuth:   route.AllowNoAuth || route.Provider.Protocol == "local",
+			ExtraHeaders:  route.Provider.ExtraHeaders,
+			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
 		}, nil
 	case "anthropic", "anthropic-compatible":
 		return protocol.AnthropicProvider{
-			BaseURL:    route.Provider.BaseURL,
-			APIKey:     route.APIKey,
-			ProviderID: route.Provider.ID,
+			BaseURL:       route.Provider.BaseURL,
+			APIKey:        route.APIKey,
+			ProviderID:    route.Provider.ID,
+			ExtraHeaders:  route.Provider.ExtraHeaders,
+			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
 		}, nil
 	case "gemini":
 		return protocol.GeminiProvider{
-			BaseURL:    route.Provider.BaseURL,
-			APIKey:     route.APIKey,
-			ProviderID: route.Provider.ID,
+			BaseURL:       route.Provider.BaseURL,
+			APIKey:        route.APIKey,
+			ProviderID:    route.Provider.ID,
+			ExtraHeaders:  route.Provider.ExtraHeaders,
+			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
 		}, nil
 	default:
 		return nil, fmt.Errorf("当前协议暂未接入聊天发送：%s", route.Provider.Protocol)
@@ -897,28 +905,32 @@ func (s *Service) listProviderModels(ctx context.Context, provider ModelProvider
 		}
 		client := protocol.NewDeepSeekProvider(apiKey)
 		client.BaseURL = provider.BaseURL
+		client.ExtraHeaders = provider.ExtraHeaders
 		return client.ListModels(ctx)
 	case "openai-compatible", "local":
 		client := protocol.OpenAICompatibleProvider{
-			BaseURL:     provider.BaseURL,
-			APIKey:      apiKey,
-			ProviderID:  provider.ID,
-			DisplayName: provider.Name,
-			AllowNoAuth: allowNoAuth || provider.Protocol == "local",
+			BaseURL:      provider.BaseURL,
+			APIKey:       apiKey,
+			ProviderID:   provider.ID,
+			DisplayName:  provider.Name,
+			AllowNoAuth:  allowNoAuth || provider.Protocol == "local",
+			ExtraHeaders: provider.ExtraHeaders,
 		}
 		return client.ListModels(ctx)
 	case "anthropic", "anthropic-compatible":
 		client := protocol.AnthropicProvider{
-			BaseURL:    provider.BaseURL,
-			APIKey:     apiKey,
-			ProviderID: provider.ID,
+			BaseURL:      provider.BaseURL,
+			APIKey:       apiKey,
+			ProviderID:   provider.ID,
+			ExtraHeaders: provider.ExtraHeaders,
 		}
 		return client.ListModels(ctx)
 	case "gemini":
 		client := protocol.GeminiProvider{
-			BaseURL:    provider.BaseURL,
-			APIKey:     apiKey,
-			ProviderID: provider.ID,
+			BaseURL:      provider.BaseURL,
+			APIKey:       apiKey,
+			ProviderID:   provider.ID,
+			ExtraHeaders: provider.ExtraHeaders,
 		}
 		return client.ListModels(ctx)
 	default:

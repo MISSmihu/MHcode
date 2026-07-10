@@ -206,6 +206,8 @@ export type ModelProviderSetting = {
   apiType: "chat-completions" | "responses" | "anthropic-messages" | "gemini-generate-content" | string;
   baseUrl: string;
   balanceUrl: string;
+  extraHeaders: string;
+  extraBodyJson: string;
   enabled: boolean;
   apiKeyConfigured: boolean;
   defaultModelId: string;

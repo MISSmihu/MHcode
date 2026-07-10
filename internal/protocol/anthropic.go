@@ -18,10 +18,12 @@ const DefaultAnthropicBaseURL = "https://api.anthropic.com"
 const anthropicVersion = "2023-06-01"
 
 type AnthropicProvider struct {
-	BaseURL    string
-	APIKey     string
-	ProviderID string
-	HTTPClient *http.Client
+	BaseURL       string
+	APIKey        string
+	ProviderID    string
+	HTTPClient    *http.Client
+	ExtraHeaders  string
+	ExtraBodyJSON string
 }
 
 func (p AnthropicProvider) Name() string {
@@ -40,6 +42,9 @@ func (p AnthropicProvider) ListModels(ctx context.Context) ([]Model, error) {
 		return nil, err
 	}
 	p.applyHeaders(req, "")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := p.client().Do(req)
 	if err != nil {
@@ -96,11 +101,18 @@ func (p AnthropicProvider) Stream(ctx context.Context, request ChatRequest) (<-c
 	if err != nil {
 		return nil, err
 	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream"))
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/v1/messages"), bytes.NewReader(encoded))
 	if err != nil {
 		return nil, err
 	}
 	p.applyHeaders(req, "text/event-stream")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := p.client().Do(req)
 	if err != nil {
