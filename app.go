@@ -51,11 +51,15 @@ func (a *App) TestDeepSeekConnection() (agent.WorkbenchState, error) {
 }
 
 func (a *App) SendDeepSeekMessage(prompt string) (agent.ChatResult, error) {
+	return a.SendChatMessage(prompt)
+}
+
+func (a *App) SendChatMessage(prompt string) (agent.ChatResult, error) {
 	ctx := a.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return a.service.SendDeepSeekMessage(ctx, prompt)
+	return a.service.SendChatMessage(ctx, prompt)
 }
 
 func (a *App) ResetDeepSeekSession() (agent.WorkbenchState, error) {

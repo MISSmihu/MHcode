@@ -56,6 +56,9 @@ type DeepSeekState struct {
 
 type DeepSeekSessionState struct {
 	Active                      bool           `json:"active"`
+	ProviderID                  string         `json:"providerId"`
+	ProviderName                string         `json:"providerName"`
+	Protocol                    string         `json:"protocol"`
 	Model                       string         `json:"model"`
 	Reasoning                   ReasoningLevel `json:"reasoning"`
 	ThinkingMode                string         `json:"thinkingMode"`
@@ -293,33 +296,44 @@ func (s *Service) ResetDeepSeekSession() (WorkbenchState, error) {
 	return s.WorkbenchState(), nil
 }
 
+func (s *Service) SendChatMessage(ctx context.Context, prompt string) (ChatResult, error) {
+	return s.SendDeepSeekMessage(ctx, prompt)
+}
+
+type chatRoute struct {
+	Provider    ModelProviderSetting
+	ModelID     string
+	APIKey      string
+	AllowNoAuth bool
+}
+
 func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatResult, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return ChatResult{State: s.WorkbenchState()}, errors.New("消息内容不能为空")
 	}
-	apiKey, err := s.secretVault.Get(secretServiceName, deepSeekAccountName)
+
+	route, err := s.selectChatRoute()
 	if err != nil {
-		s.deepSeekState.Configured = false
-		s.deepSeekState.LastCheckStatus = "error"
-		s.deepSeekState.LastCheckMessage = "请先保存 DeepSeek API Key。"
-		s.deepSeekState.CheckedAt = time.Now().Format(time.RFC3339)
-		return ChatResult{State: s.WorkbenchState()}, errors.New("请先保存 DeepSeek API Key")
+		return ChatResult{State: s.WorkbenchState()}, err
 	}
 
 	preview := s.contextPreview()
-	model := s.selectDeepSeekModel()
-	s.ensureDeepSeekSession(model, preview)
-	thinkingMode, reasoningEffort := s.deepSeekThinkingConfig()
+	thinkingMode, reasoningEffort := s.thinkingConfigForProvider(route.Provider)
+	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
 	baseMessageCount := len(s.sessionMessages)
 	s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "user", Content: prompt})
 	requestMessages := cloneProtocolMessages(s.sessionMessages)
 	prefixDiagnostic := s.compareRequestPrefix(requestMessages)
 
-	provider := protocol.NewDeepSeekProvider(apiKey)
-	provider.BaseURL = s.deepSeekBaseURL()
-	events, err := provider.Stream(ctx, protocol.ChatRequest{
-		Model:           model,
+	chatProvider, err := s.chatProviderForRoute(route)
+	if err != nil {
+		s.sessionMessages = s.sessionMessages[:baseMessageCount]
+		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
+		return ChatResult{State: s.WorkbenchState(), Model: route.ModelID}, err
+	}
+	events, err := chatProvider.Stream(ctx, protocol.ChatRequest{
+		Model:           route.ModelID,
 		Temperature:     s.temperatureForReasoning(),
 		Messages:        requestMessages,
 		ThinkingMode:    thinkingMode,
@@ -330,12 +344,8 @@ func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatR
 	})
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
-		s.deepSeekState.Configured = true
-		s.deepSeekState.BaseURL = s.deepSeekBaseURL()
-		s.deepSeekState.LastCheckStatus = "error"
-		s.deepSeekState.LastCheckMessage = err.Error()
-		s.deepSeekState.CheckedAt = time.Now().Format(time.RFC3339)
-		return ChatResult{State: s.WorkbenchState(), Model: model}, err
+		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
+		return ChatResult{State: s.WorkbenchState(), Model: route.ModelID}, err
 	}
 
 	var content strings.Builder
@@ -359,12 +369,8 @@ func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatR
 			}
 		case "error":
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
-			s.deepSeekState.Configured = true
-			s.deepSeekState.BaseURL = s.deepSeekBaseURL()
-			s.deepSeekState.LastCheckStatus = "error"
-			s.deepSeekState.LastCheckMessage = event.Error
-			s.deepSeekState.CheckedAt = time.Now().Format(time.RFC3339)
-			return ChatResult{State: s.WorkbenchState(), Model: model}, errors.New(event.Error)
+			s.markChatProviderStatus(route.Provider.ID, "error", event.Error)
+			return ChatResult{State: s.WorkbenchState(), Model: route.ModelID}, errors.New(event.Error)
 		case "done":
 		}
 	}
@@ -374,16 +380,12 @@ func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatR
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
-	s.deepSeekState.Configured = true
-	s.deepSeekState.BaseURL = s.deepSeekBaseURL()
-	s.deepSeekState.LastCheckStatus = "ok"
-	s.deepSeekState.LastCheckMessage = fmt.Sprintf("试聊成功，%s 流式通道正常。", model)
-	s.deepSeekState.CheckedAt = time.Now().Format(time.RFC3339)
+	s.markChatProviderStatus(route.Provider.ID, "ok", fmt.Sprintf("试聊成功，%s / %s 流式通道正常。", route.Provider.Name, route.ModelID))
 
 	return ChatResult{
 		Content:   answer,
 		Reasoning: reasoning.String(),
-		Model:     model,
+		Model:     route.ModelID,
 		Usage:     s.metrics,
 		State:     s.WorkbenchState(),
 	}, nil
@@ -441,9 +443,10 @@ func (s *Service) workbenchStateWithPreview(preview RequestContext) WorkbenchSta
 	}
 }
 
-func (s *Service) ensureDeepSeekSession(model string, preview RequestContext) {
+func (s *Service) ensureProviderSession(route chatRoute, preview RequestContext, thinkingMode string, reasoningEffort string) {
 	if len(s.sessionMessages) > 0 &&
-		s.sessionState.Model == model &&
+		s.sessionState.ProviderID == route.Provider.ID &&
+		s.sessionState.Model == route.ModelID &&
 		s.sessionState.Reasoning == s.reasoning &&
 		s.sessionState.PrefixHash == preview.PrefixHash {
 		return
@@ -457,10 +460,13 @@ func (s *Service) ensureDeepSeekSession(model string, preview RequestContext) {
 	startedAt := time.Now().Format(time.RFC3339)
 	s.sessionState = DeepSeekSessionState{
 		Active:                 true,
-		Model:                  model,
+		ProviderID:             route.Provider.ID,
+		ProviderName:           route.Provider.Name,
+		Protocol:               route.Provider.Protocol,
+		Model:                  route.ModelID,
 		Reasoning:              s.reasoning,
-		ThinkingMode:           s.deepSeekThinkingMode(),
-		ReasoningEffort:        s.deepSeekReasoningEffort(),
+		ThinkingMode:           thinkingMode,
+		ReasoningEffort:        reasoningEffort,
 		PrefixHash:             preview.PrefixHash,
 		SystemPromptHash:       cache.HashStablePrefix(systemPrompt),
 		StablePromptTokens:     estimatePromptTokens(systemPrompt),
@@ -556,6 +562,78 @@ func (s *Service) deepSeekBaseURL() string {
 	return deepSeekBaseURLFromSettings(s.runtimeSettings.Normalized(), s.config.DeepSeekBaseURL)
 }
 
+func (s *Service) selectChatRoute() (chatRoute, error) {
+	settings := s.stateRuntimeSettings()
+	provider, _, ok := findModelProvider(settings.Model.Providers, settings.Model.SelectedProviderID)
+	if !ok {
+		provider, ok = firstUsableProvider(settings.Model.Providers)
+	}
+	if !ok {
+		return chatRoute{}, errors.New("请先在模型设置中启用一个模型供应商")
+	}
+	if provider.ID == "deepseek" {
+		provider.BaseURL = s.deepSeekBaseURL()
+	}
+	provider.BaseURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	if provider.BaseURL == "" {
+		provider.BaseURL = defaultBaseURLForProtocol(provider.Protocol)
+	}
+	modelID := s.selectModelForProvider(settings, provider)
+	if strings.TrimSpace(modelID) == "" {
+		return chatRoute{}, fmt.Errorf("请先为 %s 获取或手动添加模型", provider.Name)
+	}
+
+	allowNoAuth := provider.Protocol == "local" || isLocalProviderBaseURL(provider.BaseURL)
+	apiKey, err := s.secretVault.Get(secretServiceName, providerSecretAccountName(provider.ID))
+	if err != nil && !allowNoAuth {
+		message := fmt.Sprintf("请先保存 %s API Key", provider.Name)
+		s.markChatProviderStatus(provider.ID, "error", message)
+		return chatRoute{}, errors.New(message)
+	}
+	if err != nil {
+		apiKey = ""
+	}
+	return chatRoute{
+		Provider:    provider,
+		ModelID:     modelID,
+		APIKey:      apiKey,
+		AllowNoAuth: allowNoAuth,
+	}, nil
+}
+
+func firstUsableProvider(providers []ModelProviderSetting) (ModelProviderSetting, bool) {
+	for _, provider := range providers {
+		if provider.Enabled && (provider.APIKeyConfigured || provider.Protocol == "local" || isLocalProviderBaseURL(provider.BaseURL)) {
+			return provider, true
+		}
+	}
+	for _, provider := range providers {
+		if provider.Enabled {
+			return provider, true
+		}
+	}
+	if len(providers) > 0 {
+		return providers[0], true
+	}
+	return ModelProviderSetting{}, false
+}
+
+func (s *Service) selectModelForProvider(settings RuntimeSettings, provider ModelProviderSetting) string {
+	if settings.Model.SelectedProviderID == provider.ID && strings.TrimSpace(settings.Model.SelectedModelID) != "" {
+		return strings.TrimSpace(settings.Model.SelectedModelID)
+	}
+	if provider.ID == "deepseek" {
+		return s.selectDeepSeekModel()
+	}
+	if strings.TrimSpace(provider.DefaultModelID) != "" {
+		return strings.TrimSpace(provider.DefaultModelID)
+	}
+	if len(provider.Models) > 0 {
+		return strings.TrimSpace(provider.Models[0].ID)
+	}
+	return ""
+}
+
 func (s *Service) selectDeepSeekModel() string {
 	settings := s.stateRuntimeSettings()
 	if settings.Model.SelectedProviderID == "deepseek" && strings.TrimSpace(settings.Model.SelectedModelID) != "" {
@@ -577,6 +655,35 @@ func (s *Service) selectDeepSeekModel() string {
 		return s.deepSeekState.Models[0].ID
 	}
 	return preferred
+}
+
+func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, error) {
+	switch route.Provider.Protocol {
+	case "deepseek-official":
+		if strings.TrimSpace(route.APIKey) == "" {
+			return nil, errors.New("DeepSeek API Key 不能为空")
+		}
+		client := protocol.NewDeepSeekProvider(route.APIKey)
+		client.BaseURL = route.Provider.BaseURL
+		return client, nil
+	case "openai-compatible", "local":
+		return protocol.OpenAICompatibleProvider{
+			BaseURL:     route.Provider.BaseURL,
+			APIKey:      route.APIKey,
+			ProviderID:  route.Provider.ID,
+			DisplayName: route.Provider.Name,
+			AllowNoAuth: route.AllowNoAuth || route.Provider.Protocol == "local",
+		}, nil
+	default:
+		return nil, fmt.Errorf("当前协议暂未接入聊天发送：%s", route.Provider.Protocol)
+	}
+}
+
+func (s *Service) thinkingConfigForProvider(provider ModelProviderSetting) (string, string) {
+	if provider.Protocol != "deepseek-official" {
+		return "", ""
+	}
+	return s.deepSeekThinkingConfig()
 }
 
 func (s *Service) deepSeekThinkingConfig() (string, string) {
@@ -794,6 +901,22 @@ func (s *Service) syncDeepSeekStateFromProvider(provider ModelProviderSetting, m
 	s.deepSeekState.LastCheckMessage = provider.LastSyncMessage
 	s.deepSeekState.CheckedAt = provider.CheckedAt
 	s.deepSeekState.Models = models
+}
+
+func (s *Service) markChatProviderStatus(providerID string, status string, message string) {
+	settings := s.runtimeSettings.Normalized()
+	provider, index, ok := findModelProvider(settings.Model.Providers, providerID)
+	if !ok {
+		return
+	}
+	now := time.Now().Format(time.RFC3339)
+	provider.LastSyncStatus = status
+	provider.LastSyncMessage = message
+	provider.CheckedAt = now
+	settings.Model.Providers[index] = provider
+	s.runtimeSettings = s.runtimeSettingsWithSecretFlags(settings)
+	s.syncDeepSeekStateFromProvider(provider, nil)
+	_ = saveRuntimeSettings(s.settingsPath, s.runtimeSettings)
 }
 
 func findModelProvider(providers []ModelProviderSetting, id string) (ModelProviderSetting, int, bool) {

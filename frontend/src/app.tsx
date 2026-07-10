@@ -345,10 +345,19 @@ function App() {
   const sessionHasCacheTokens = createMemo(
     () => deepSeekSession().sessionCacheHitTokens + deepSeekSession().sessionCacheMissTokens > 0,
   );
-  const modelName = createMemo(
-    () => deepSeekSession().model || deepSeek().models[0]?.displayName || deepSeek().models[0]?.id || "DeepSeek",
-  );
-  const canSend = createMemo(() => promptDraft().trim().length > 0 && deepSeek().configured && !sendingMessage());
+  const activeChatProvider = createMemo(() => selectedModelProvider(runtimeSettings()));
+  const activeChatModel = createMemo(() => selectedModelName(runtimeSettings(), deepSeekSession().model));
+  const activeProviderReady = createMemo(() => providerReadyForChat(activeChatProvider()));
+  const activeProviderConnection = createMemo(() => providerConnectionSummary(activeChatProvider(), deepSeek()));
+  const modelName = createMemo(() => {
+    const provider = activeChatProvider();
+    const model = deepSeekSession().model || activeChatModel();
+    if (!provider) {
+      return model || "选择模型";
+    }
+    return model ? `${provider.name} · ${model}` : provider.name;
+  });
+  const canSend = createMemo(() => promptDraft().trim().length > 0 && activeProviderReady() && Boolean(activeChatModel()) && !sendingMessage());
 
   const sidebarSessions = createMemo(() => [
     {
@@ -585,9 +594,9 @@ function App() {
     if (!prompt || sendingMessage()) {
       return;
     }
-    if (!deepSeek().configured) {
-      setError("请先保存 DeepSeek API Key。");
-      openDrawer("settings");
+    if (!activeProviderReady() || !activeChatModel()) {
+      setError("请先在模型设置里完成当前供应商的密钥和模型配置。");
+      openSettings("models");
       return;
     }
 
@@ -755,12 +764,12 @@ function App() {
           </button>
           <button
             class="connection-pill"
-            classList={{ ok: deepSeek().lastCheckStatus === "ok", warn: !deepSeek().configured }}
+            classList={{ ok: activeProviderConnection().ok, warn: !activeProviderConnection().ready }}
             type="button"
-            onClick={() => openDrawer("settings")}
+            onClick={() => openSettings("models")}
           >
             <RefreshCw size={13} classList={{ spinning: loading() || testingDeepSeek() }} />
-            {deepSeek().configured ? statusLabel(deepSeek().lastCheckStatus) : "未连接"}
+            {activeProviderConnection().label}
           </button>
         </div>
 
@@ -3318,6 +3327,9 @@ function fallbackDeepSeekState() {
 function fallbackDeepSeekSession(): DeepSeekSessionState {
   return {
     active: false,
+    providerId: "",
+    providerName: "",
+    protocol: "",
     model: "",
     reasoning: defaultReasoningLevel,
     thinkingMode: "disabled",
@@ -3663,6 +3675,71 @@ function cacheStatusLabel(status: string) {
 
 function runtimeLabel(options: Array<{ value: string; label: string }>, value: string) {
   return options.find((option) => option.value === value)?.label ?? value;
+}
+
+function selectedModelProvider(settings: RuntimeSettings) {
+  return (
+    settings.model.providers.find((provider) => provider.id === settings.model.selectedProviderId) ??
+    settings.model.providers.find((provider) => provider.enabled) ??
+    settings.model.providers[0]
+  );
+}
+
+function selectedModelName(settings: RuntimeSettings, activeSessionModel?: string) {
+  if (activeSessionModel) {
+    return activeSessionModel;
+  }
+  const provider = selectedModelProvider(settings);
+  if (!provider) {
+    return "";
+  }
+  if (settings.model.selectedProviderId === provider.id && settings.model.selectedModelId) {
+    return settings.model.selectedModelId;
+  }
+  if (provider.defaultModelId) {
+    return provider.defaultModelId;
+  }
+  if (provider.models[0]?.id) {
+    return provider.models[0].id;
+  }
+  if (provider.id === "deepseek") {
+    return "deepseek-v4-flash";
+  }
+  return "";
+}
+
+function providerReadyForChat(provider: ModelProviderSetting | undefined) {
+  if (!provider) {
+    return false;
+  }
+  return provider.apiKeyConfigured || provider.protocol === "local" || isLocalProviderURL(provider.baseUrl);
+}
+
+function providerConnectionSummary(provider: ModelProviderSetting | undefined, deepSeek: WorkbenchState["deepSeek"]) {
+  if (!provider) {
+    return { label: "未连接", ok: false, ready: false };
+  }
+  const ready = providerReadyForChat(provider);
+  if (provider.id === "deepseek") {
+    return {
+      label: deepSeek.configured ? statusLabel(deepSeek.lastCheckStatus) : "未连接",
+      ok: deepSeek.lastCheckStatus === "ok",
+      ready: deepSeek.configured,
+    };
+  }
+  if (!ready) {
+    return { label: "未连接", ok: false, ready: false };
+  }
+  return {
+    label: provider.lastSyncStatus === "ok" ? "已连接" : provider.protocol === "local" ? "本地" : "已配置",
+    ok: provider.lastSyncStatus === "ok" || provider.protocol === "local",
+    ready: true,
+  };
+}
+
+function isLocalProviderURL(baseUrl: string) {
+  const value = baseUrl.toLowerCase();
+  return value.includes("localhost") || value.includes("127.0.0.1") || value.includes("[::1]") || value.includes("0.0.0.0");
 }
 
 function permissionLabel(value: string) {

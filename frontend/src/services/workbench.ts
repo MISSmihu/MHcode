@@ -7,6 +7,7 @@ type WailsAppBinding = {
   SaveDeepSeekAPIKey: (apiKey: string) => Promise<WorkbenchState>;
   ClearDeepSeekAPIKey: () => Promise<WorkbenchState>;
   TestDeepSeekConnection: () => Promise<WorkbenchState>;
+  SendChatMessage?: (prompt: string) => Promise<ChatResult>;
   SendDeepSeekMessage: (prompt: string) => Promise<ChatResult>;
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
@@ -91,6 +92,13 @@ export async function saveDeepSeekAPIKey(apiKey: string): Promise<WorkbenchState
       models: [],
     },
   };
+  fallbackState = updateFallbackProvider("deepseek", (provider) => ({
+    ...provider,
+    apiKeyConfigured: Boolean(apiKey.trim()),
+    lastSyncStatus: "idle",
+    lastSyncMessage: "DeepSeek API Key 已保存，等待连接测试。",
+    checkedAt: undefined,
+  }));
   return cloneState(fallbackState);
 }
 
@@ -109,6 +117,14 @@ export async function clearDeepSeekAPIKey(): Promise<WorkbenchState> {
       models: [],
     },
   };
+  fallbackState = updateFallbackProvider("deepseek", (provider) => ({
+    ...provider,
+    apiKeyConfigured: false,
+    models: [],
+    lastSyncStatus: "idle",
+    lastSyncMessage: "API Key 已清除。",
+    checkedAt: undefined,
+  }));
   return cloneState(fallbackState);
 }
 
@@ -137,7 +153,7 @@ export async function testDeepSeekConnection(): Promise<WorkbenchState> {
 export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
   const binding = wailsBinding();
   if (binding) {
-    return binding.SendDeepSeekMessage(prompt);
+    return binding.SendChatMessage ? binding.SendChatMessage(prompt) : binding.SendDeepSeekMessage(prompt);
   }
   const usage = {
     promptCacheHitTokens: 96,
@@ -146,18 +162,30 @@ export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
     outputTokens: 12,
     effectiveCost: 0,
   };
+  const routeProvider =
+    fallbackState.runtimeSettings.model.providers.find(
+      (provider) => provider.id === fallbackState.runtimeSettings.model.selectedProviderId,
+    ) ?? fallbackState.runtimeSettings.model.providers[0];
+  const routeModel =
+    fallbackState.runtimeSettings.model.selectedModelId ||
+    routeProvider?.defaultModelId ||
+    routeProvider?.models[0]?.id ||
+    (routeProvider?.id === "deepseek" ? "deepseek-v4-flash" : "preview-model");
   fallbackState = {
     ...fallbackState,
     deepSeek: {
       ...fallbackState.deepSeek,
       configured: true,
       lastCheckStatus: "ok",
-      lastCheckMessage: `预览模式试聊成功，${fallbackState.deepSeek.models[0]?.id ?? "deepseek-v4-flash"} 流式通道正常。`,
+      lastCheckMessage: `预览模式试聊成功，${routeProvider?.name ?? "模型服务"} / ${routeModel} 流式通道正常。`,
       checkedAt: new Date().toISOString(),
     },
     deepSeekSession: {
       active: true,
-      model: fallbackState.deepSeek.models[0]?.id ?? "deepseek-v4-flash",
+      providerId: routeProvider?.id ?? "deepseek",
+      providerName: routeProvider?.name ?? "DeepSeek 官方",
+      protocol: routeProvider?.protocol ?? "deepseek-official",
+      model: routeModel,
       reasoning: fallbackState.reasoning.id,
       thinkingMode: thinkingModeForReasoning(fallbackState.reasoning.id),
       reasoningEffort: reasoningEffortForReasoning(fallbackState.reasoning.id),
@@ -198,8 +226,8 @@ export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
     cacheDiagnostics: ["缓存命中率达到 96% 目标。"],
   };
   return cloneChatResult({
-    content: "预览模式返回：DeepSeek 试聊链路已接入，桌面环境会调用真实流式接口。",
-    model: fallbackState.deepSeek.models[0]?.id ?? "deepseek-v4-flash",
+    content: "预览模式返回：当前模型路由已接入，桌面环境会调用真实流式接口。",
+    model: routeModel,
     usage,
     state: fallbackState,
   });
@@ -223,6 +251,9 @@ export async function resetDeepSeekSession(): Promise<WorkbenchState> {
     cacheHealth: pendingCacheHealth(),
     deepSeekSession: {
       active: false,
+      providerId: "",
+      providerName: "",
+      protocol: "",
       model: "",
       reasoning: fallbackState.reasoning.id,
       thinkingMode: thinkingModeForReasoning(fallbackState.reasoning.id),
@@ -359,6 +390,9 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
     },
     deepSeekSession: {
       active: false,
+      providerId: "",
+      providerName: "",
+      protocol: "",
       model: "",
       reasoning: reasoning.id,
       thinkingMode: thinkingModeForReasoning(reasoning.id),

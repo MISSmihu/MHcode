@@ -215,6 +215,74 @@ func TestServiceRefreshOpenAICompatibleProviderModels(t *testing.T) {
 	}
 }
 
+func TestServiceSendsMessageThroughSelectedOpenAICompatibleProvider(t *testing.T) {
+	var receivedModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("path = %s, want /chat/completions", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-openai" {
+			t.Fatalf("authorization = %q", got)
+		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		receivedModel = payload.Model
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"from upstream\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	settings := service.WorkbenchState().RuntimeSettings
+	settings.Model.SelectedProviderID = "openai-compatible"
+	settings.Model.SelectedModelID = "upstream-chat"
+	for index, provider := range settings.Model.Providers {
+		if provider.ID == "openai-compatible" {
+			settings.Model.Providers[index].BaseURL = server.URL
+			settings.Model.Providers[index].Enabled = true
+			settings.Model.Providers[index].DefaultModelID = "upstream-chat"
+			settings.Model.Providers[index].Models = []ProviderModel{{
+				ID:          "upstream-chat",
+				DisplayName: "Upstream Chat",
+				Provider:    "openai-compatible",
+			}}
+		}
+	}
+	if _, err := service.SaveRuntimeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SaveModelProviderAPIKey("openai-compatible", "sk-openai"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.SendDeepSeekMessage(context.Background(), "ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "from upstream" {
+		t.Fatalf("content = %q, want upstream response", result.Content)
+	}
+	if receivedModel != "upstream-chat" || result.Model != "upstream-chat" {
+		t.Fatalf("model = request %q result %q, want upstream-chat", receivedModel, result.Model)
+	}
+	if result.State.DeepSeekSession.ProviderID != "openai-compatible" || result.State.DeepSeekSession.Protocol != "openai-compatible" {
+		t.Fatalf("session route = %#v, want openai-compatible", result.State.DeepSeekSession)
+	}
+	provider, _, ok := findModelProvider(result.State.RuntimeSettings.Model.Providers, "openai-compatible")
+	if !ok {
+		t.Fatal("openai-compatible provider missing")
+	}
+	if provider.LastSyncStatus != "ok" {
+		t.Fatalf("provider status = %q, want ok: %s", provider.LastSyncStatus, provider.LastSyncMessage)
+	}
+}
+
 func TestServiceMapsReasoningToDeepSeekThinking(t *testing.T) {
 	var mu sync.Mutex
 	type requestPayload struct {

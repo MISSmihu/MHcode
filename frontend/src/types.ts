@@ -53,6 +53,9 @@ export type DeepSeekState = {
 
 export type DeepSeekSessionState = {
   active: boolean;
+  providerId: string;
+  providerName: string;
+  protocol: string;
   model: string;
   reasoning: ReasoningLevel | "";
   thinkingMode: string;
