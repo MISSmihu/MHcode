@@ -7,7 +7,10 @@ import {
   BarChart3,
   Bot,
   Braces,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Command,
   Cpu,
   Database,
@@ -595,6 +598,43 @@ function App() {
     }
   };
 
+  const selectModelRoute = async (providerID: string, modelID: string) => {
+    const base = activeRuntimeDraft();
+    const provider = base.model.providers.find((item) => item.id === providerID);
+    if (!provider) {
+      setError("未找到模型供应商。");
+      return;
+    }
+    const nextSettings: RuntimeSettings = {
+      ...base,
+      model: {
+        ...base.model,
+        selectedProviderId: providerID,
+        selectedModelId: modelID,
+        providers: base.model.providers.map((item) =>
+          item.id === providerID
+            ? {
+                ...item,
+                enabled: true,
+                defaultModelId: modelID || item.defaultModelId,
+              }
+            : item,
+        ),
+      },
+    };
+    setSavingRuntime(true);
+    setError("");
+    try {
+      const next = await saveRuntimeSettings(nextSettings);
+      setState(next);
+      setRuntimeDraft(undefined);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSavingRuntime(false);
+    }
+  };
+
   const updateRuntimeDraft = (patch: Partial<RuntimeSettings>) => {
     setRuntimeDraft((current) => ({
       ...runtimeSettings(),
@@ -1049,10 +1089,12 @@ function App() {
                 </button>
               </div>
               <div>
-                <button type="button" onClick={() => openSettings("models")}>
-                  <Cpu size={15} />
-                  {modelName()}
-                </button>
+                <ModelRouteMenu
+                  settings={runtimeSettings()}
+                  saving={savingRuntime()}
+                  onManage={() => openSettings("models")}
+                  onSelect={(providerID, modelID) => void selectModelRoute(providerID, modelID)}
+                />
                 <ReasoningMenu
                   value={profile().id}
                   options={options()}
@@ -3059,6 +3101,145 @@ function RuntimeSaveActions(props: {
   );
 }
 
+function ModelRouteMenu(props: {
+  onManage: () => void;
+  onSelect: (providerID: string, modelID: string) => void;
+  saving: boolean;
+  settings: RuntimeSettings;
+}) {
+  const [open, setOpen] = createSignal(false);
+  const [hoverProviderID, setHoverProviderID] = createSignal("");
+  let menuRef: HTMLDivElement | undefined;
+
+  const selectedProvider = createMemo(() => selectedModelProvider(props.settings));
+  const selectedModel = createMemo(() => selectedModelName(props.settings));
+  const activeProviderID = createMemo(() => hoverProviderID() || selectedProvider()?.id || props.settings.model.providers[0]?.id || "");
+  const activeProvider = createMemo(
+    () => props.settings.model.providers.find((provider) => provider.id === activeProviderID()) ?? selectedProvider(),
+  );
+  const currentLabel = createMemo(() => {
+    const provider = selectedProvider();
+    const model = selectedModel();
+    if (!provider) {
+      return "选择模型";
+    }
+    return model ? `${provider.name} · ${shortModelName(model)}` : provider.name;
+  });
+
+  const close = () => {
+    setOpen(false);
+    setHoverProviderID("");
+  };
+  const selectModel = (providerID: string, modelID: string) => {
+    close();
+    props.onSelect(providerID, modelID);
+  };
+
+  onMount(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!open()) {
+        return;
+      }
+      const target = event.target;
+      if (target instanceof Node && menuRef?.contains(target)) {
+        return;
+      }
+      close();
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    onCleanup(() => window.removeEventListener("pointerdown", handlePointerDown));
+  });
+
+  return (
+    <div class="model-route-menu" ref={menuRef}>
+      <button
+        class="model-route-trigger"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open()}
+        title="选择模型"
+        disabled={props.saving}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Cpu size={15} />
+        <span>{currentLabel()}</span>
+        <ChevronDown size={14} aria-hidden="true" />
+      </button>
+      <Show when={open()}>
+        <div class="model-route-popover" role="menu">
+          <div class="model-provider-column">
+            <For each={props.settings.model.providers}>
+              {(provider) => (
+                <button
+                  class="model-provider-option"
+                  classList={{ active: activeProviderID() === provider.id }}
+                  type="button"
+                  onClick={() => setHoverProviderID(provider.id)}
+                  onPointerEnter={() => setHoverProviderID(provider.id)}
+                >
+                  <span>
+                    <strong>{provider.name}</strong>
+                    <small>{runtimeLabel(providerProtocolOptions, provider.protocol)}</small>
+                  </span>
+                  <Show when={selectedProvider()?.id === provider.id}>
+                    <Check size={14} aria-label="当前供应商" />
+                  </Show>
+                  <ChevronRight size={14} aria-hidden="true" />
+                </button>
+              )}
+            </For>
+          </div>
+          <div class="model-list-column">
+            <Show when={activeProvider()} keyed>
+              {(provider) => (
+                <>
+                  <div class="model-list-head">
+                    <strong>{provider.name}</strong>
+                    <span>{providerReadyForChat(provider) ? `${modelOptionsForProvider(provider).length} 个模型` : "未配置密钥"}</span>
+                  </div>
+                  <div class="model-list-scroll">
+                    <For each={modelOptionsForProvider(provider)} fallback={<p class="model-list-empty">暂无模型，先获取或手动添加。</p>}>
+                      {(model) => (
+                        <button
+                          class="model-option"
+                          classList={{ selected: selectedProvider()?.id === provider.id && selectedModel() === model.id }}
+                          type="button"
+                          onClick={() => selectModel(provider.id, model.id)}
+                        >
+                          <span>
+                            <strong>{model.displayName || model.id}</strong>
+                            <small>
+                              {model.id}
+                              <Show when={model.contextWindowTokens}> · {formatTokenWindow(model.contextWindowTokens)}</Show>
+                            </small>
+                          </span>
+                          <Show when={selectedProvider()?.id === provider.id && selectedModel() === model.id}>
+                            <Check size={15} aria-label="已选中" />
+                          </Show>
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </>
+              )}
+            </Show>
+          </div>
+          <button
+            class="model-manage-button"
+            type="button"
+            onClick={() => {
+              close();
+              props.onManage();
+            }}
+          >
+            管理模型
+          </button>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function SettingsSection(props: { action?: JSX.Element; children: JSX.Element; title?: string }) {
   return (
     <section class="settings-form-section">
@@ -3749,6 +3930,26 @@ function selectedModelName(settings: RuntimeSettings, activeSessionModel?: strin
     return "deepseek-v4-flash";
   }
   return "";
+}
+
+function modelOptionsForProvider(provider: ModelProviderSetting) {
+  if (provider.models.length > 0) {
+    return provider.models;
+  }
+  if (provider.id === "deepseek") {
+    return [
+      { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: provider.id, contextWindowTokens: provider.contextWindowTokens },
+      { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: provider.id, contextWindowTokens: provider.contextWindowTokens },
+    ];
+  }
+  return [];
+}
+
+function shortModelName(modelID: string) {
+  if (modelID.length <= 28) {
+    return modelID;
+  }
+  return `${modelID.slice(0, 14)}...${modelID.slice(-10)}`;
 }
 
 function providerReadyForChat(provider: ModelProviderSetting | undefined) {
