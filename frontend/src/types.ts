@@ -203,7 +203,7 @@ export type ModelProviderSetting = {
   id: string;
   name: string;
   protocol: "deepseek-official" | "openai-compatible" | "anthropic" | "anthropic-compatible" | "gemini" | "local" | string;
-  apiType: "chat-completions" | "responses" | "anthropic-messages" | string;
+  apiType: "chat-completions" | "responses" | "anthropic-messages" | "gemini-generate-content" | string;
   baseUrl: string;
   balanceUrl: string;
   enabled: boolean;
@@ -238,6 +238,13 @@ export type WorkbenchState = {
   contextPreview: RequestContext;
   cacheDiagnostics: string[];
   runtimeSettings: RuntimeSettings;
+  configFiles: ConfigFilesState;
+};
+
+export type ConfigFilesState = {
+  runtimeSettingsPath: string;
+  modelProvidersPath: string;
+  secretsStore: string;
 };
 
 export type ChatResult = {

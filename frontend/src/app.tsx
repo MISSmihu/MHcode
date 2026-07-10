@@ -189,6 +189,7 @@ const providerAPITypeOptions = [
   { value: "chat-completions", label: "Chat Completions" },
   { value: "responses", label: "Responses" },
   { value: "anthropic-messages", label: "Anthropic Messages" },
+  { value: "gemini-generate-content", label: "Gemini Generate Content" },
 ];
 
 type ProviderPreset = {
@@ -219,6 +220,22 @@ const providerPresets: ProviderPreset[] = [
     apiType: "chat-completions",
     baseUrl: "https://api.openai.com/v1",
     note: "标准 /v1/models 与 /chat/completions。",
+  },
+  {
+    id: "anthropic-official",
+    name: "Anthropic 官方",
+    protocol: "anthropic-compatible",
+    apiType: "anthropic-messages",
+    baseUrl: "https://api.anthropic.com",
+    note: "Claude Messages API 原生协议。",
+  },
+  {
+    id: "google-gemini",
+    name: "Google Gemini",
+    protocol: "gemini",
+    apiType: "gemini-generate-content",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    note: "Gemini generateContent 原生协议。",
   },
   {
     id: "glm-cn",
@@ -338,6 +355,7 @@ function App() {
   const skillsIndex = createMemo(() => state()?.skillsIndex ?? []);
   const contextPreview = createMemo(() => state()?.contextPreview);
   const runtimeSettings = createMemo(() => state()?.runtimeSettings ?? fallbackRuntimeSettings());
+  const configFiles = createMemo(() => state()?.configFiles ?? fallbackConfigFiles());
   const activeRuntimeDraft = createMemo(() => runtimeDraft() ?? runtimeSettings());
   const diagnostics = createMemo(() => state()?.cacheDiagnostics ?? []);
   const deepSeek = createMemo(() => state()?.deepSeek ?? fallbackDeepSeekState());
@@ -1082,6 +1100,7 @@ function App() {
             reasoningOptions={options()}
             runtimeDraft={activeRuntimeDraft()}
             runtimeDirty={Boolean(runtimeDraft())}
+            configFiles={configFiles()}
             clearProviderKey={clearProviderKey}
             saveKey={saveKey}
             saveProviderKey={saveProviderKey}
@@ -1122,6 +1141,7 @@ type SettingsCenterProps = {
   cacheHealth: WorkbenchState["cacheHealth"];
   cacheHitRate: number;
   cacheTarget: number;
+  configFiles: WorkbenchState["configFiles"];
   clearingKey: boolean;
   clearingProviderID: string;
   clearKey: () => void;
@@ -1225,6 +1245,7 @@ function SettingsCenter(props: SettingsCenterProps) {
           </Match>
           <Match when={props.activeCategory === "config"}>
             <ConfigSettingsPanel
+              configFiles={props.configFiles}
               resetRuntimeDraft={props.resetRuntimeDraft}
               runtimeDirty={props.runtimeDirty}
               runtimeDraft={props.runtimeDraft}
@@ -1464,6 +1485,7 @@ function AppearanceSettingsPanel(props: {
 }
 
 function ConfigSettingsPanel(props: {
+  configFiles: WorkbenchState["configFiles"];
   runtimeDraft: RuntimeSettings;
   runtimeDirty: boolean;
   saveRuntime: () => void;
@@ -1473,14 +1495,27 @@ function ConfigSettingsPanel(props: {
 }) {
   return (
     <div class="settings-page-body">
-      <SettingsSection
-        title="自定义 config.toml 设置"
-        action={
-          <button class="settings-link-button" type="button">
-            打开 config.toml
-          </button>
-        }
-      >
+      <SettingsSection title="配置文件">
+        <SettingsCard>
+          <SettingsRow
+            title="运行配置"
+            description="沙盒、权限、MCP、浏览器、环境和模型路由都会写入这个 JSON 文件"
+            control={<code class="settings-path-value">{props.configFiles.runtimeSettingsPath || "未设置"}</code>}
+          />
+          <SettingsRow
+            title="模型供应商配置"
+            description={`多自定义供应商、协议、API 地址、模型列表和上下文窗口保存在 model.providers；当前 ${props.runtimeDraft.model.providers.length} 个供应商`}
+            control={<code class="settings-path-value">{props.configFiles.modelProvidersPath || "未设置"}</code>}
+          />
+          <SettingsRow
+            title="密钥存储"
+            description="API Key 不写入 JSON 配置文件，只保存配置状态和本地密钥索引"
+            control={<code class="settings-path-value">{props.configFiles.secretsStore || "本地 vault"}</code>}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="运行策略">
         <div class="settings-toolbar-row">
           <SelectControl value="user" options={[{ value: "user", label: "用户配置" }]} onChange={() => undefined} />
         </div>
@@ -3486,6 +3521,14 @@ function fallbackRuntimeSettings(): RuntimeSettings {
   };
 }
 
+function fallbackConfigFiles(): WorkbenchState["configFiles"] {
+  return {
+    runtimeSettingsPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
+    modelProvidersPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
+    secretsStore: "系统凭据管理器 / 本地 vault",
+  };
+}
+
 function categoryForDrawerTab(tab: DrawerTab): SettingsCategory {
   switch (tab) {
     case "settings":
@@ -3755,9 +3798,9 @@ function providerBaseURLHint(protocol: string) {
     case "local":
       return "填写本机兼容 /v1 地址，例如 http://127.0.0.1:11434/v1";
     case "anthropic-compatible":
-      return "协议配置先保存，模型获取会在后续接入。";
+      return "填写 Anthropic API 根地址，例如 https://api.anthropic.com";
     case "gemini":
-      return "协议配置先保存，模型获取会在后续接入。";
+      return "填写 Gemini API 根地址，例如 https://generativelanguage.googleapis.com/v1beta";
     default:
       return "填写上游模型服务的根地址。";
   }
@@ -3831,11 +3874,24 @@ function uniqueProviderID(providers: ModelProviderSetting[], prefix: string) {
 }
 
 function defaultAPITypeForProtocol(protocol: string) {
-  return protocol === "anthropic-compatible" ? "anthropic-messages" : "chat-completions";
+  if (protocol === "anthropic-compatible" || protocol === "anthropic") {
+    return "anthropic-messages";
+  }
+  if (protocol === "gemini") {
+    return "gemini-generate-content";
+  }
+  return "chat-completions";
 }
 
 function supportsModelFetchForProtocol(protocol: string) {
-  return protocol === "deepseek-official" || protocol === "openai-compatible" || protocol === "local";
+  return (
+    protocol === "deepseek-official" ||
+    protocol === "openai-compatible" ||
+    protocol === "anthropic" ||
+    protocol === "anthropic-compatible" ||
+    protocol === "gemini" ||
+    protocol === "local"
+  );
 }
 
 function formatTokenWindow(value: number) {

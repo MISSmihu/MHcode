@@ -1362,6 +1362,15 @@ body[data-theme="light"],
   font-size: 12px;
 }
 
+.settings-path-value {
+  display: block;
+  max-width: min(360px, 36vw);
+  overflow-wrap: anywhere;
+  color: var(--code-text);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .settings-section-note {
   margin: -3px 0 0;
 }

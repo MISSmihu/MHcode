@@ -432,6 +432,11 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
     },
     cacheDiagnostics: ["等待首轮模型请求记录缓存命中数据。"],
     runtimeSettings: defaultRuntimeSettings(),
+    configFiles: {
+      runtimeSettingsPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
+      modelProvidersPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
+      secretsStore: "系统凭据管理器 / 本地 vault",
+    },
   };
 }
 
@@ -724,11 +729,24 @@ function normalizeTokenWindow(value: number) {
 }
 
 function defaultAPITypeForProtocol(protocol: string) {
-  return protocol === "anthropic" || protocol === "anthropic-compatible" ? "anthropic-messages" : "chat-completions";
+  if (protocol === "anthropic" || protocol === "anthropic-compatible") {
+    return "anthropic-messages";
+  }
+  if (protocol === "gemini") {
+    return "gemini-generate-content";
+  }
+  return "chat-completions";
 }
 
 function supportsProviderModelFetch(protocol: string) {
-  return protocol === "deepseek-official" || protocol === "openai-compatible" || protocol === "local";
+  return (
+    protocol === "deepseek-official" ||
+    protocol === "openai-compatible" ||
+    protocol === "anthropic" ||
+    protocol === "anthropic-compatible" ||
+    protocol === "gemini" ||
+    protocol === "local"
+  );
 }
 
 function thinkingModeForReasoning(level: ReasoningLevel) {

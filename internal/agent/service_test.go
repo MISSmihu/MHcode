@@ -117,6 +117,78 @@ func TestServiceRuntimeSettingsPersist(t *testing.T) {
 	}
 }
 
+func TestServicePersistsMultipleCustomModelProviders(t *testing.T) {
+	settingsPath := t.TempDir() + "/runtime-settings.json"
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath})
+
+	settings := service.WorkbenchState().RuntimeSettings
+	settings.Model.SelectedProviderID = "custom-anthropic"
+	settings.Model.SelectedModelID = "claude-custom"
+	settings.Model.Providers = []ModelProviderSetting{
+		{
+			ID:                  "custom-anthropic",
+			Name:                "Custom Anthropic",
+			Protocol:            "anthropic-compatible",
+			APIType:             "anthropic-messages",
+			BaseURL:             "https://anthropic.example",
+			BalanceURL:          "https://anthropic.example/balance",
+			Enabled:             true,
+			DefaultModelID:      "claude-custom",
+			ContextWindowTokens: 200000,
+			Models: []ProviderModel{{
+				ID:                  "claude-custom",
+				DisplayName:         "Claude Custom",
+				Provider:            "custom-anthropic",
+				ContextWindowTokens: 200000,
+			}},
+			LastSyncStatus: "idle",
+		},
+		{
+			ID:                  "custom-gemini",
+			Name:                "Custom Gemini",
+			Protocol:            "gemini",
+			APIType:             "gemini-generate-content",
+			BaseURL:             "https://gemini.example/v1beta",
+			Enabled:             true,
+			DefaultModelID:      "gemini-custom",
+			ContextWindowTokens: 1000000,
+			Models: []ProviderModel{{
+				ID:                  "gemini-custom",
+				DisplayName:         "Gemini Custom",
+				Provider:            "custom-gemini",
+				ContextWindowTokens: 1000000,
+			}},
+			LastSyncStatus: "idle",
+		},
+	}
+	if _, err := service.SaveRuntimeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath})
+	state := reloaded.WorkbenchState()
+	anthropic, _, ok := findModelProvider(state.RuntimeSettings.Model.Providers, "custom-anthropic")
+	if !ok {
+		t.Fatalf("custom-anthropic missing from providers: %#v", state.RuntimeSettings.Model.Providers)
+	}
+	if anthropic.Protocol != "anthropic-compatible" || anthropic.APIType != "anthropic-messages" || anthropic.BalanceURL == "" {
+		t.Fatalf("anthropic provider not persisted: %#v", anthropic)
+	}
+	if len(anthropic.Models) != 1 || anthropic.Models[0].ContextWindowTokens != 200000 {
+		t.Fatalf("anthropic models not persisted: %#v", anthropic.Models)
+	}
+	gemini, _, ok := findModelProvider(state.RuntimeSettings.Model.Providers, "custom-gemini")
+	if !ok {
+		t.Fatalf("custom-gemini missing from providers: %#v", state.RuntimeSettings.Model.Providers)
+	}
+	if gemini.Protocol != "gemini" || gemini.APIType != "gemini-generate-content" || gemini.ContextWindowTokens != 1000000 {
+		t.Fatalf("gemini provider not persisted: %#v", gemini)
+	}
+	if state.ConfigFiles.RuntimeSettingsPath != settingsPath || state.ConfigFiles.ModelProvidersPath != settingsPath {
+		t.Fatalf("config files = %#v, want runtime settings path", state.ConfigFiles)
+	}
+}
+
 func TestServiceSendDeepSeekMessageUpdatesUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {
@@ -280,6 +352,114 @@ func TestServiceSendsMessageThroughSelectedOpenAICompatibleProvider(t *testing.T
 	}
 	if provider.LastSyncStatus != "ok" {
 		t.Fatalf("provider status = %q, want ok: %s", provider.LastSyncStatus, provider.LastSyncMessage)
+	}
+}
+
+func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.T) {
+	tests := []struct {
+		name      string
+		provider  ModelProviderSetting
+		apiKey    string
+		handler   func(t *testing.T, w http.ResponseWriter, r *http.Request)
+		wantModel string
+	}{
+		{
+			name: "anthropic",
+			provider: ModelProviderSetting{
+				ID:             "custom-anthropic",
+				Name:           "Custom Anthropic",
+				Protocol:       "anthropic-compatible",
+				APIType:        "anthropic-messages",
+				Enabled:        true,
+				DefaultModelID: "claude-custom",
+				Models: []ProviderModel{{
+					ID:          "claude-custom",
+					DisplayName: "Claude Custom",
+					Provider:    "custom-anthropic",
+				}},
+			},
+			apiKey: "sk-ant",
+			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				t.Helper()
+				if r.URL.Path != "/v1/messages" {
+					t.Fatalf("path = %s, want /v1/messages", r.URL.Path)
+				}
+				if got := r.Header.Get("x-api-key"); got != "sk-ant" {
+					t.Fatalf("x-api-key = %q", got)
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatalf("decode payload: %v", err)
+				}
+				if payload["model"] != "claude-custom" {
+					t.Fatalf("model = %v, want claude-custom", payload["model"])
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"anthropic ok\"}}\n\n"))
+				_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+			},
+			wantModel: "claude-custom",
+		},
+		{
+			name: "gemini",
+			provider: ModelProviderSetting{
+				ID:             "custom-gemini",
+				Name:           "Custom Gemini",
+				Protocol:       "gemini",
+				APIType:        "gemini-generate-content",
+				Enabled:        true,
+				DefaultModelID: "gemini-custom",
+				Models: []ProviderModel{{
+					ID:          "gemini-custom",
+					DisplayName: "Gemini Custom",
+					Provider:    "custom-gemini",
+				}},
+			},
+			apiKey: "sk-gemini",
+			handler: func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+				t.Helper()
+				if r.URL.Path != "/models/gemini-custom:streamGenerateContent" {
+					t.Fatalf("path = %s, want gemini stream path", r.URL.Path)
+				}
+				if got := r.URL.Query().Get("key"); got != "sk-gemini" {
+					t.Fatalf("key = %q", got)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini ok\"}]}}]}\n\n"))
+			},
+			wantModel: "gemini-custom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tt.handler(t, w, r)
+			}))
+			defer server.Close()
+
+			service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+			settings := service.WorkbenchState().RuntimeSettings
+			tt.provider.BaseURL = server.URL
+			settings.Model.SelectedProviderID = tt.provider.ID
+			settings.Model.SelectedModelID = tt.wantModel
+			settings.Model.Providers = []ModelProviderSetting{tt.provider}
+			if _, err := service.SaveRuntimeSettings(settings); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.SaveModelProviderAPIKey(tt.provider.ID, tt.apiKey); err != nil {
+				t.Fatal(err)
+			}
+			result, err := service.SendDeepSeekMessage(context.Background(), "ping")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Model != tt.wantModel || result.State.DeepSeekSession.ProviderID != tt.provider.ID {
+				t.Fatalf("result route = model %q session %#v", result.Model, result.State.DeepSeekSession)
+			}
+			if result.Content == "" {
+				t.Fatalf("content = %q", result.Content)
+			}
+		})
 	}
 }
 

@@ -35,6 +35,13 @@ type WorkbenchState struct {
 	ContextPreview   RequestContext       `json:"contextPreview"`
 	CacheDiagnostics []string             `json:"cacheDiagnostics"`
 	RuntimeSettings  RuntimeSettings      `json:"runtimeSettings"`
+	ConfigFiles      ConfigFilesState     `json:"configFiles"`
+}
+
+type ConfigFilesState struct {
+	RuntimeSettingsPath string `json:"runtimeSettingsPath"`
+	ModelProvidersPath  string `json:"modelProvidersPath"`
+	SecretsStore        string `json:"secretsStore"`
 }
 
 type ChatResult struct {
@@ -440,6 +447,11 @@ func (s *Service) workbenchStateWithPreview(preview RequestContext) WorkbenchSta
 		ContextPreview:   preview,
 		CacheDiagnostics: cache.DiagnosticsHistory(s.metricsHistory),
 		RuntimeSettings:  runtimeSettings,
+		ConfigFiles: ConfigFilesState{
+			RuntimeSettingsPath: s.settingsPath,
+			ModelProvidersPath:  s.settingsPath,
+			SecretsStore:        "系统凭据管理器 / 本地 vault",
+		},
 	}
 }
 
@@ -674,6 +686,18 @@ func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, erro
 			DisplayName: route.Provider.Name,
 			AllowNoAuth: route.AllowNoAuth || route.Provider.Protocol == "local",
 		}, nil
+	case "anthropic", "anthropic-compatible":
+		return protocol.AnthropicProvider{
+			BaseURL:    route.Provider.BaseURL,
+			APIKey:     route.APIKey,
+			ProviderID: route.Provider.ID,
+		}, nil
+	case "gemini":
+		return protocol.GeminiProvider{
+			BaseURL:    route.Provider.BaseURL,
+			APIKey:     route.APIKey,
+			ProviderID: route.Provider.ID,
+		}, nil
 	default:
 		return nil, fmt.Errorf("当前协议暂未接入聊天发送：%s", route.Provider.Protocol)
 	}
@@ -881,6 +905,20 @@ func (s *Service) listProviderModels(ctx context.Context, provider ModelProvider
 			ProviderID:  provider.ID,
 			DisplayName: provider.Name,
 			AllowNoAuth: allowNoAuth || provider.Protocol == "local",
+		}
+		return client.ListModels(ctx)
+	case "anthropic", "anthropic-compatible":
+		client := protocol.AnthropicProvider{
+			BaseURL:    provider.BaseURL,
+			APIKey:     apiKey,
+			ProviderID: provider.ID,
+		}
+		return client.ListModels(ctx)
+	case "gemini":
+		client := protocol.GeminiProvider{
+			BaseURL:    provider.BaseURL,
+			APIKey:     apiKey,
+			ProviderID: provider.ID,
 		}
 		return client.ListModels(ctx)
 	default:

@@ -566,9 +566,10 @@ func defaultBaseURLForProtocol(protocol string) string {
 
 func normalizeAPIType(apiType string, protocol string) string {
 	return normalizeChoice(apiType, defaultAPITypeForProtocol(protocol), map[string]bool{
-		"chat-completions":   true,
-		"responses":          true,
-		"anthropic-messages": true,
+		"chat-completions":        true,
+		"responses":               true,
+		"anthropic-messages":      true,
+		"gemini-generate-content": true,
 	})
 }
 
@@ -576,13 +577,20 @@ func defaultAPITypeForProtocol(protocol string) string {
 	switch protocol {
 	case "anthropic", "anthropic-compatible":
 		return "anthropic-messages"
+	case "gemini":
+		return "gemini-generate-content"
 	default:
 		return "chat-completions"
 	}
 }
 
 func supportsModelFetch(protocol string) bool {
-	return protocol == "deepseek-official" || protocol == "openai-compatible" || protocol == "local"
+	return protocol == "deepseek-official" ||
+		protocol == "openai-compatible" ||
+		protocol == "anthropic" ||
+		protocol == "anthropic-compatible" ||
+		protocol == "gemini" ||
+		protocol == "local"
 }
 
 func normalizeProviderModels(models []ProviderModel, providerID string) []ProviderModel {
