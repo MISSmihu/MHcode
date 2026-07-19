@@ -10,8 +10,10 @@ describe("chat UI regressions", () => {
   });
 
   test("does not draw a line inside the rich composer", async () => {
-    const css = await Bun.file(new URL("../src/styles/polish.css", import.meta.url)).text();
-    const editorRule = css.slice(css.indexOf(".composer-text-editor,\n.composer-tail-editor"));
+    const css = (await Bun.file(new URL("../src/styles/polish.css", import.meta.url)).text()).replaceAll("\r\n", "\n");
+    const ruleStart = css.indexOf(".composer-text-editor,\n.composer-tail-editor");
+    expect(ruleStart).toBeGreaterThanOrEqual(0);
+    const editorRule = css.slice(ruleStart);
     expect(editorRule).toContain("border-bottom: 0;");
     expect(editorRule).toContain("box-shadow: none;");
     expect(editorRule).toContain("text-decoration: none;");
