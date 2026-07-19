@@ -11,6 +11,9 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
+//go:embed all:skills
+var bundledSkills embed.FS
+
 func main() {
 	app := NewApp()
 
@@ -23,6 +26,7 @@ func main() {
 		},
 		BackgroundColour: &options.RGBA{R: 247, G: 248, B: 245, A: 1},
 		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
 		Bind: []interface{}{
 			app,
 		},

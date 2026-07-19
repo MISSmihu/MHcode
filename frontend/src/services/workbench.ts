@@ -1,5 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
-import type { ChatResult, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, WorkbenchState } from "../types";
+import { defaultTeamSettings } from "../team-config";
+import type { ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, WorkbenchState } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -9,11 +10,89 @@ type WailsAppBinding = {
   TestDeepSeekConnection: () => Promise<WorkbenchState>;
   SendChatMessage?: (prompt: string) => Promise<ChatResult>;
   SendDeepSeekMessage: (prompt: string) => Promise<ChatResult>;
+  StartChatMessage?: (prompt: string) => Promise<string>;
+  StartChatMessageWithAttachments?: (prompt: string, attachments: ChatAttachment[]) => Promise<string>;
+  GuideChatMessage?: (taskID: string, guidanceID: string, prompt: string) => Promise<boolean>;
+  GuideChatMessageWithAttachments?: (taskID: string, guidanceID: string, prompt: string, attachments: ChatAttachment[]) => Promise<boolean>;
+  StopChatMessage?: (taskID: string) => Promise<boolean>;
+  GetActiveChatTask?: () => Promise<ChatTaskState | null>;
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
   SaveModelProviderAPIKey: (providerID: string, apiKey: string) => Promise<WorkbenchState>;
   ClearModelProviderAPIKey: (providerID: string) => Promise<WorkbenchState>;
+  DeleteModelProvider?: (providerID: string) => Promise<WorkbenchState>;
   RefreshModelProviderModels: (providerID: string) => Promise<WorkbenchState>;
+  RefreshMCPServer?: (serverID: string) => Promise<WorkbenchState>;
+  ListCheckpoints?: () => Promise<CheckpointInfo[]>;
+  RewindToCheckpoint?: (checkpointID: string) => Promise<WorkbenchState>;
+  ListBranches?: () => Promise<BranchInfo[]>;
+  SwitchBranch?: (leafID: string) => Promise<WorkbenchState>;
+  ForkFromMessage?: (messageEventID: string) => Promise<WorkbenchState>;
+  RespondApproval?: (id: string, tool: string, approved: boolean, scope: string) => Promise<void>;
+  SetPlanMode?: (enabled: boolean) => Promise<WorkbenchState>;
+  ListProjects?: () => Promise<ProjectInfo[]>;
+  ListSessions?: () => Promise<SessionInfo[]>;
+  GetProjectTree?: () => Promise<ProjectNode[]>;
+  GetSessionMessages?: () => Promise<SessionMessage[]>;
+  CreateProject?: (name: string, workspaceRoot: string) => Promise<WorkbenchState>;
+  SwitchProject?: (projectID: string) => Promise<WorkbenchState>;
+  SetProjectPinned?: (projectID: string, pinned: boolean) => Promise<WorkbenchState>;
+  RenameProject?: (projectID: string, name: string) => Promise<WorkbenchState>;
+  ArchiveProjectTasks?: (projectID: string) => Promise<WorkbenchState>;
+  RemoveProject?: (projectID: string) => Promise<WorkbenchState>;
+  OpenProjectInFileManager?: (projectID: string) => Promise<void>;
+  CreatePermanentWorktree?: (projectID: string, branchName: string, destination: string) => Promise<WorkbenchState>;
+  NewSession?: () => Promise<WorkbenchState>;
+  SwitchSession?: (sessionID: string) => Promise<WorkbenchState>;
+  ArchiveSession?: (sessionID: string, archived: boolean) => Promise<WorkbenchState>;
+  DeleteSession?: (sessionID: string) => Promise<WorkbenchState>;
+  SelectDirectory?: () => Promise<string>;
+  SelectWorktreeParentDirectory?: () => Promise<string>;
+  OpenWorkspaceFile?: (path: string) => Promise<void>;
+  PreviewWorkspaceFile?: (path: string) => Promise<BrowserPreview>;
+  RevealWorkspaceFile?: (path: string) => Promise<void>;
+  GetBrowserState?: () => Promise<BrowserState>;
+  OpenBrowserURL?: (url: string) => Promise<BrowserState>;
+  BrowserActivateTab?: (tabID: string) => Promise<BrowserState>;
+  BrowserCloseTab?: (tabID: string) => Promise<BrowserState>;
+  BrowserDismissError?: (tabID: string) => Promise<BrowserState>;
+  BrowserNavigate?: (tabID: string, url: string) => Promise<void>;
+  BrowserBack?: (tabID: string) => Promise<void>;
+  BrowserForward?: (tabID: string) => Promise<void>;
+  BrowserReload?: (tabID: string) => Promise<void>;
+  BrowserResize?: (tabID: string, width: number, height: number) => Promise<void>;
+  BrowserShowNativeSurface?: (tabID: string, x: number, y: number, width: number, height: number, viewportWidth: number, viewportHeight: number) => Promise<boolean>;
+  BrowserHideNativeSurface?: () => Promise<void>;
+  GetBrowserFrame?: (tabID: string, includeAnnotations: boolean) => Promise<BrowserFrame>;
+  GetBrowserFrameDelta?: (tabID: string, includeAnnotations: boolean, capturedAt: string) => Promise<BrowserFrame>;
+  BrowserClick?: (tabID: string, x: number, y: number, clickCount: number) => Promise<void>;
+  BrowserScroll?: (tabID: string, deltaX: number, deltaY: number) => Promise<void>;
+  BrowserType?: (tabID: string, text: string) => Promise<void>;
+  BrowserKey?: (tabID: string, key: string, ctrl: boolean, alt: boolean, shift: boolean, meta: boolean) => Promise<void>;
+  BrowserHandleDialog?: (tabID: string, accept: boolean, promptText: string) => Promise<void>;
+  GetBrowserInspector?: (tabID: string) => Promise<BrowserInspector>;
+  BrowserSaveScreenshot?: (tabID: string) => Promise<string>;
+  BrowserEvaluate?: (tabID: string, expression: string) => Promise<string>;
+  BrowserAutofill?: (tabID: string) => Promise<number>;
+  SaveBrowserCredential?: (credentialID: string, origin: string, username: string, password: string) => Promise<WorkbenchState>;
+  DeleteBrowserCredential?: (credentialID: string) => Promise<WorkbenchState>;
+  BrowserFillCredential?: (tabID: string, credentialID: string) => Promise<number>;
+  BrowserOpenDownload?: (downloadID: string) => Promise<void>;
+  BrowserRevealDownload?: (downloadID: string) => Promise<void>;
+  BrowserClearData?: () => Promise<BrowserState>;
+  OpenURLInSystemBrowser?: (url: string) => Promise<void>;
+  GetGitStatus?: () => Promise<GitStatus>;
+  GetGitDiff?: (path: string, staged: boolean) => Promise<GitDiff>;
+  GetGitReviewDiff?: (path: string, staged: boolean, ignoreWhitespace: boolean) => Promise<GitDiff>;
+  StageGitPaths?: (paths: string[]) => Promise<GitStatus>;
+  UnstageGitPaths?: (paths: string[]) => Promise<GitStatus>;
+  CommitGitChanges?: (message: string) => Promise<GitStatus>;
+  CreateGitBranch?: (name: string) => Promise<GitStatus>;
+  SwitchGitBranch?: (name: string) => Promise<GitStatus>;
+  StartTerminalSession?: () => Promise<TerminalSessionState>;
+  GetTerminalSession?: (sessionID: string) => Promise<TerminalSessionState>;
+  SendTerminalCommand?: (sessionID: string, command: string) => Promise<void>;
+  StopTerminalSession?: (sessionID: string) => Promise<void>;
 };
 
 type WailsWindow = Window & {
@@ -21,6 +100,9 @@ type WailsWindow = Window & {
     main?: {
       App?: WailsAppBinding;
     };
+  };
+  runtime?: {
+    EventsOn?: (event: string, callback: (data: unknown) => void) => () => void;
   };
 };
 
@@ -37,7 +119,7 @@ const fallbackSkillsIndex: SkillIndexEntry[] = [
 
 const fallbackSnapshots: ServerSnapshot[] = [
   {
-    server: "filesystem",
+    server: "builtin",
     toolsHash: "sha256:local-preview",
     tools: [
       {
@@ -46,15 +128,34 @@ const fallbackSnapshots: ServerSnapshot[] = [
         outputPolicy: "summary-first",
       },
       {
-        name: "list_directory",
+        name: "file_info",
         inputSchemaHash: "sha256:path-schema",
         outputPolicy: "summary-first",
       },
+      {
+        name: "list_dir",
+        inputSchemaHash: "sha256:path-schema",
+        outputPolicy: "summary-first",
+      },
+      { name: "search", inputSchemaHash: "sha256:search-schema", outputPolicy: "summary-first" },
+      { name: "write_file", inputSchemaHash: "sha256:write-schema", outputPolicy: "summary-first" },
+      { name: "apply_patch", inputSchemaHash: "sha256:patch-schema", outputPolicy: "summary-first" },
+      { name: "copy_file", inputSchemaHash: "sha256:copy-schema", outputPolicy: "summary-first" },
+      { name: "delete_file", inputSchemaHash: "sha256:delete-schema", outputPolicy: "summary-first" },
     ],
   },
 ];
 
 let fallbackState = createFallbackState(defaultReasoningLevel);
+const fallbackChatHandlers = new Set<(event: ChatTaskEvent) => void>();
+let fallbackActiveChatTaskID = "";
+let fallbackTerminal: TerminalSessionState | undefined;
+
+function emitFallbackChatTask(event: ChatTaskEvent) {
+  for (const handler of fallbackChatHandlers) {
+    handler(event);
+  }
+}
 
 export async function getWorkbenchState(): Promise<WorkbenchState> {
   const binding = wailsBinding();
@@ -142,8 +243,8 @@ export async function testDeepSeekConnection(): Promise<WorkbenchState> {
       lastCheckMessage: "预览模式连接模拟成功，发现 2 个模型。",
       checkedAt: new Date().toISOString(),
       models: [
-        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 64000 },
-        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 64000 },
+        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
       ],
     },
   };
@@ -225,12 +326,127 @@ export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
     },
     cacheDiagnostics: ["缓存命中率达到 96% 目标。"],
   };
+  const content = "预览模式返回：当前模型路由已接入，桌面环境会调用真实 Agent 接口。";
+  const parts = previewFileParts(prompt, content);
   return cloneChatResult({
-    content: "预览模式返回：当前模型路由已接入，桌面环境会调用真实流式接口。",
+    content,
     model: routeModel,
     usage,
     state: fallbackState,
+    parts,
   });
+}
+
+export async function startChatMessage(prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
+  const binding = wailsBinding();
+  if (binding?.StartChatMessageWithAttachments) {
+    return binding.StartChatMessageWithAttachments(prompt, attachments);
+  }
+  if (binding?.StartChatMessage) {
+    if (attachments.length > 0) {
+      throw new Error("当前桌面后端版本不支持图片附件，请重启 MHcode。");
+    }
+    return binding.StartChatMessage(prompt);
+  }
+  if (fallbackActiveChatTaskID) {
+    throw new Error("已有对话任务正在运行，请先停止当前任务");
+  }
+  const taskID = `preview-chat-${Date.now()}`;
+  fallbackActiveChatTaskID = taskID;
+  queueMicrotask(async () => {
+    emitFallbackChatTask({ taskId: taskID, type: "started", message: "正在准备上下文" });
+    try {
+      const result = await sendDeepSeekMessage(prompt);
+      if (fallbackActiveChatTaskID !== taskID) {
+        return;
+      }
+      emitFallbackChatTask({ taskId: taskID, type: "delta", delta: result.content, model: result.model });
+      emitFallbackChatTask({ taskId: taskID, type: "completed", model: result.model, result });
+    } catch (err) {
+      if (fallbackActiveChatTaskID === taskID) {
+        emitFallbackChatTask({ taskId: taskID, type: "failed", message: String(err) });
+      }
+    } finally {
+      if (fallbackActiveChatTaskID === taskID) {
+        fallbackActiveChatTaskID = "";
+      }
+    }
+  });
+  return taskID;
+}
+
+export async function stopChatMessage(taskID: string): Promise<boolean> {
+  const binding = wailsBinding();
+  if (binding?.StopChatMessage) {
+    return binding.StopChatMessage(taskID);
+  }
+  if (!fallbackActiveChatTaskID || (taskID && fallbackActiveChatTaskID !== taskID)) {
+    return false;
+  }
+  const cancelledID = fallbackActiveChatTaskID;
+  fallbackActiveChatTaskID = "";
+  emitFallbackChatTask({ taskId: cancelledID, type: "cancelled", message: "已停止生成" });
+  return true;
+}
+
+export async function guideChatMessage(
+  taskID: string,
+  guidanceID: string,
+  prompt: string,
+  attachments: ChatAttachment[] = [],
+): Promise<boolean> {
+  const binding = wailsBinding();
+  if (binding?.GuideChatMessageWithAttachments) {
+    return binding.GuideChatMessageWithAttachments(taskID, guidanceID, prompt, attachments);
+  }
+  if (binding?.GuideChatMessage && attachments.length === 0) {
+    return binding.GuideChatMessage(taskID, guidanceID, prompt);
+  }
+  // Browser preview finishes immediately and has no long-lived Agent turn to steer.
+  return false;
+}
+
+export async function getActiveChatTask(): Promise<ChatTaskState | null> {
+  const binding = wailsBinding();
+  if (binding?.GetActiveChatTask) {
+    return binding.GetActiveChatTask();
+  }
+  return fallbackActiveChatTaskID ? { taskId: fallbackActiveChatTaskID, startedAt: new Date().toISOString() } : null;
+}
+
+export function onChatTaskEvent(handler: (event: ChatTaskEvent) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("chat:task", (data) => handler(data as ChatTaskEvent));
+  }
+  fallbackChatHandlers.add(handler);
+  return () => fallbackChatHandlers.delete(handler);
+}
+
+export function onMCPState(handler: (state: WorkbenchState) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("mcp:state", (data) => handler(data as WorkbenchState));
+  }
+  return () => undefined;
+}
+
+function previewFileParts(prompt: string, content: string): MessagePart[] | undefined {
+  if (!/(创建|生成|create|generate)/i.test(prompt) || !/(html|文件|file)/i.test(prompt)) {
+    return undefined;
+  }
+  return [
+    { kind: "tool_call", name: "list_dir", status: "ok", input: ".", output: "frontend/\ninternal/\nREADME.md" },
+    {
+      kind: "diff",
+      path: "preview.html",
+      additions: 18,
+      deletions: 0,
+      patch: "diff --git a/preview.html b/preview.html\n--- a/preview.html\n+++ b/preview.html\n+<!doctype html>\n+<html lang=\"zh-CN\">\n+  <head><title>MHcode Preview</title></head>\n+  <body><main>Preview</main></body>\n+</html>",
+    },
+    { kind: "file", path: "preview.html", lineCount: 18, created: true },
+    { kind: "text", text: content },
+  ];
 }
 
 export async function resetDeepSeekSession(): Promise<WorkbenchState> {
@@ -321,6 +537,31 @@ export async function clearModelProviderAPIKey(providerID: string): Promise<Work
   return cloneState(fallbackState);
 }
 
+export async function deleteModelProvider(providerID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.DeleteModelProvider) {
+    return binding.DeleteModelProvider(providerID);
+  }
+  const providers = fallbackState.runtimeSettings.model.providers.filter((provider) => provider.id !== providerID);
+  const selectedProviderId = fallbackState.runtimeSettings.model.selectedProviderId === providerID
+    ? providers[0]?.id || ""
+    : fallbackState.runtimeSettings.model.selectedProviderId;
+  const selectedProvider = providers.find((provider) => provider.id === selectedProviderId) ?? providers[0];
+  fallbackState = {
+    ...fallbackState,
+    runtimeSettings: {
+      ...fallbackState.runtimeSettings,
+      model: {
+        ...fallbackState.runtimeSettings.model,
+        providers,
+        selectedProviderId,
+        selectedModelId: selectedProvider?.defaultModelId || selectedProvider?.models[0]?.id || "",
+      },
+    },
+  };
+  return cloneState(fallbackState);
+}
+
 export async function refreshModelProviderModels(providerID: string): Promise<WorkbenchState> {
   const binding = wailsBinding();
   if (binding) {
@@ -329,12 +570,12 @@ export async function refreshModelProviderModels(providerID: string): Promise<Wo
   const now = new Date().toISOString();
   const fallbackModels = providerID === "deepseek"
     ? [
-        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 64000 },
-        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 64000 },
+        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
       ]
     : [
-        { id: "upstream-chat", displayName: "upstream-chat", provider: providerID, contextWindowTokens: 128000 },
-        { id: "upstream-reasoner", displayName: "upstream-reasoner", provider: providerID, contextWindowTokens: 128000 },
+        { id: "upstream-chat", displayName: "upstream-chat", provider: providerID, contextWindowTokens: 128000, contextWindowSource: "upstream" },
+        { id: "upstream-reasoner", displayName: "upstream-reasoner", provider: providerID, contextWindowTokens: 128000, contextWindowSource: "upstream" },
       ];
   fallbackState = updateFallbackProvider(providerID, (provider) => ({
     ...provider,
@@ -362,8 +603,571 @@ export async function refreshModelProviderModels(providerID: string): Promise<Wo
   return cloneState(fallbackState);
 }
 
+export async function refreshMCPServer(serverID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.RefreshMCPServer) {
+    return binding.RefreshMCPServer(serverID);
+  }
+  const now = new Date().toISOString();
+  fallbackState = {
+    ...fallbackState,
+    mcpServers: fallbackState.runtimeSettings.mcp.servers.map((server) => ({
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      state: !server.enabled ? "disabled" : server.transport === "builtin" ? "ready" : "error",
+      message: !server.enabled
+        ? "服务器已停用"
+        : server.transport === "builtin"
+          ? "内置工具由 MHcode 运行时提供"
+          : "浏览器预览模式不会启动外部 MCP 服务器",
+      toolCount: server.transport === "builtin" ? 4 : 0,
+      checkedAt: now,
+    })),
+  };
+  return cloneState(fallbackState);
+}
+
 function wailsBinding(): WailsAppBinding | undefined {
   return (window as WailsWindow).go?.main?.App;
+}
+
+// 列出当前会话的可回退检查点。浏览器预览模式返回空列表。
+export async function listCheckpoints(): Promise<CheckpointInfo[]> {
+  const binding = wailsBinding();
+  if (binding?.ListCheckpoints) {
+    return binding.ListCheckpoints();
+  }
+  return [];
+}
+
+// 回退到指定检查点：对话与文件一起回退。预览模式下无操作，返回当前状态。
+export async function rewindToCheckpoint(checkpointID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.RewindToCheckpoint) {
+    return binding.RewindToCheckpoint(checkpointID);
+  }
+  return cloneState(fallbackState);
+}
+
+// 列出所有对话线（分支）。预览模式返回空列表。
+export async function listBranches(): Promise<BranchInfo[]> {
+  const binding = wailsBinding();
+  if (binding?.ListBranches) {
+    return binding.ListBranches();
+  }
+  return [];
+}
+
+// 切换到另一条对话线：文件与对话一起切换。预览模式无操作。
+export async function switchBranch(leafID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SwitchBranch) {
+    return binding.SwitchBranch(leafID);
+  }
+  return cloneState(fallbackState);
+}
+
+// 从历史消息创建新分支，旧分支仍保留在事件树中。
+export async function forkFromMessage(messageEventID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.ForkFromMessage) {
+    return binding.ForkFromMessage(messageEventID);
+  }
+  return cloneState(fallbackState);
+}
+
+// 监听后端审批请求事件。返回取消订阅函数。浏览器预览模式无事件。
+export function onApprovalRequest(handler: (req: ApprovalRequest) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("approval:request", (data) => handler(data as ApprovalRequest));
+  }
+  return () => undefined;
+}
+
+export function onBrowserPreviewOpen(handler: (preview: BrowserPreview) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("browser:open", (data) => handler(data as BrowserPreview));
+  }
+  return () => undefined;
+}
+
+export function onBrowserPreviewClose(handler: () => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("browser:close", handler);
+  }
+  return () => undefined;
+}
+
+export function onTerminalSessionUpdate(handler: (state: TerminalSessionState) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("terminal:update", (data) => handler(data as TerminalSessionState));
+  }
+  return () => undefined;
+}
+
+// 答复审批：approved=是否批准，scope="once"|"session"。
+export async function respondApproval(id: string, tool: string, approved: boolean, scope: "once" | "session"): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.RespondApproval) {
+    await binding.RespondApproval(id, tool, approved, scope);
+  }
+}
+
+// 开关 Plan 两段式（先规划后执行）。
+export async function setPlanMode(enabled: boolean): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SetPlanMode) {
+    return binding.SetPlanMode(enabled);
+  }
+  fallbackState = { ...fallbackState, planMode: enabled };
+  return cloneState(fallbackState);
+}
+
+// --- 多项目 / 多会话 ---
+
+export async function listProjects(): Promise<ProjectInfo[]> {
+  const binding = wailsBinding();
+  if (binding?.ListProjects) {
+    return binding.ListProjects();
+  }
+  return [];
+}
+
+export async function listSessions(): Promise<SessionInfo[]> {
+  const binding = wailsBinding();
+  if (binding?.ListSessions) {
+    return binding.ListSessions();
+  }
+  return [];
+}
+
+// 项目树（所有项目 + 各自会话），Codex 式侧边栏数据源。
+export async function getProjectTree(): Promise<ProjectNode[]> {
+  const binding = wailsBinding();
+  if (binding?.GetProjectTree) {
+    return binding.GetProjectTree();
+  }
+  return [];
+}
+
+// 读取当前活动会话的历史消息（启动/切换会话时恢复对话）。预览模式返回空。
+export async function getSessionMessages(): Promise<SessionMessage[]> {
+  const binding = wailsBinding();
+  if (binding?.GetSessionMessages) {
+    return binding.GetSessionMessages();
+  }
+  return [];
+}
+
+export async function createProject(name: string, workspaceRoot: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.CreateProject) {
+    return binding.CreateProject(name, workspaceRoot);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function switchProject(projectID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SwitchProject) {
+    return binding.SwitchProject(projectID);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function setProjectPinned(projectID: string, pinned: boolean): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SetProjectPinned) {
+    return binding.SetProjectPinned(projectID, pinned);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function renameProject(projectID: string, name: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.RenameProject) {
+    return binding.RenameProject(projectID, name);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function archiveProjectTasks(projectID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.ArchiveProjectTasks) {
+    return binding.ArchiveProjectTasks(projectID);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function removeProject(projectID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.RemoveProject) {
+    return binding.RemoveProject(projectID);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function openProjectInFileManager(projectID: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.OpenProjectInFileManager) {
+    await binding.OpenProjectInFileManager(projectID);
+    return;
+  }
+  throw new Error("项目目录打开功能仅在 MHcode 桌面应用中可用。");
+}
+
+export async function createPermanentWorktree(
+  projectID: string,
+  branchName: string,
+  destination: string,
+): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.CreatePermanentWorktree) {
+    return binding.CreatePermanentWorktree(projectID, branchName, destination);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function newSession(): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.NewSession) {
+    return binding.NewSession();
+  }
+  return resetDeepSeekSession();
+}
+
+export async function switchSession(sessionID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SwitchSession) {
+    return binding.SwitchSession(sessionID);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function archiveSession(sessionID: string, archived: boolean): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.ArchiveSession) {
+    return binding.ArchiveSession(sessionID, archived);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function deleteSession(sessionID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.DeleteSession) {
+    return binding.DeleteSession(sessionID);
+  }
+  return cloneState(fallbackState);
+}
+
+// 弹系统目录选择框，返回所选路径（取消返回空串）。
+export async function selectDirectory(): Promise<string> {
+  const binding = wailsBinding();
+  if (binding?.SelectDirectory) {
+    return binding.SelectDirectory();
+  }
+  return "";
+}
+
+export async function selectWorktreeParentDirectory(): Promise<string> {
+  const binding = wailsBinding();
+  if (binding?.SelectWorktreeParentDirectory) {
+    return binding.SelectWorktreeParentDirectory();
+  }
+  return "";
+}
+
+export async function openWorkspaceFile(path: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.OpenWorkspaceFile) {
+    await binding.OpenWorkspaceFile(path);
+    return;
+  }
+  throw new Error("文件打开功能仅在 MHcode 桌面应用中可用。");
+}
+
+export async function previewWorkspaceFile(path: string): Promise<BrowserPreview> {
+  const binding = wailsBinding();
+  if (binding?.PreviewWorkspaceFile) {
+    return binding.PreviewWorkspaceFile(path);
+  }
+  throw new Error("内置浏览器仅在 MHcode 桌面应用中可用。");
+}
+
+export async function revealWorkspaceFile(path: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.RevealWorkspaceFile) {
+    await binding.RevealWorkspaceFile(path);
+    return;
+  }
+  throw new Error("文件定位功能仅在 MHcode 桌面应用中可用。");
+}
+
+export async function getGitStatus(): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.GetGitStatus) {
+    return binding.GetGitStatus();
+  }
+  return emptyGitStatus();
+}
+
+export async function getGitDiff(path: string, staged: boolean): Promise<GitDiff> {
+  const binding = wailsBinding();
+  if (binding?.GetGitDiff) {
+    return binding.GetGitDiff(path, staged);
+  }
+  return { path, staged, patch: "", truncated: false };
+}
+
+export async function getGitReviewDiff(path: string, staged: boolean, ignoreWhitespace: boolean): Promise<GitDiff> {
+  const binding = wailsBinding();
+  if (binding?.GetGitReviewDiff) {
+    return binding.GetGitReviewDiff(path, staged, ignoreWhitespace);
+  }
+  return getGitDiff(path, staged);
+}
+
+export async function stageGitPaths(paths: string[]): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.StageGitPaths) {
+    return binding.StageGitPaths(paths);
+  }
+  return emptyGitStatus();
+}
+
+export async function unstageGitPaths(paths: string[]): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.UnstageGitPaths) {
+    return binding.UnstageGitPaths(paths);
+  }
+  return emptyGitStatus();
+}
+
+export async function commitGitChanges(message: string): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.CommitGitChanges) {
+    return binding.CommitGitChanges(message);
+  }
+  return emptyGitStatus();
+}
+
+export async function createGitBranch(name: string): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.CreateGitBranch) {
+    return binding.CreateGitBranch(name);
+  }
+  return { ...emptyGitStatus(), available: true, branch: name };
+}
+
+export async function switchGitBranch(name: string): Promise<GitStatus> {
+  const binding = wailsBinding();
+  if (binding?.SwitchGitBranch) {
+    return binding.SwitchGitBranch(name);
+  }
+  return { ...emptyGitStatus(), available: true, branch: name };
+}
+
+export async function startTerminalSession(): Promise<TerminalSessionState> {
+  const binding = wailsBinding();
+  if (binding?.StartTerminalSession) {
+    return binding.StartTerminalSession();
+  }
+  fallbackTerminal = {
+    id: `preview-${Date.now()}`,
+    shell: "Preview shell",
+    workdir: fallbackState.runtimeSettings.workspaceRoot,
+    running: true,
+    startedAt: new Date().toISOString(),
+    exitCode: -1,
+    output: "",
+    sandboxed: false,
+    sandboxBackend: "preview-only",
+    privilegeRestricted: false,
+  };
+  return { ...fallbackTerminal };
+}
+
+export async function getTerminalSession(sessionID: string): Promise<TerminalSessionState> {
+  const binding = wailsBinding();
+  if (binding?.GetTerminalSession) {
+    return binding.GetTerminalSession(sessionID);
+  }
+  if (!fallbackTerminal || fallbackTerminal.id !== sessionID) {
+    throw new Error("Terminal session was not found");
+  }
+  return { ...fallbackTerminal };
+}
+
+export async function sendTerminalCommand(sessionID: string, command: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.SendTerminalCommand) {
+    await binding.SendTerminalCommand(sessionID, command);
+    return;
+  }
+  if (!fallbackTerminal || fallbackTerminal.id !== sessionID || !fallbackTerminal.running) {
+    throw new Error("Terminal session is not running");
+  }
+  fallbackTerminal = { ...fallbackTerminal, output: `${fallbackTerminal.output}> ${command}\n` };
+}
+
+export async function stopTerminalSession(sessionID: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.StopTerminalSession) {
+    await binding.StopTerminalSession(sessionID);
+    return;
+  }
+  if (fallbackTerminal?.id === sessionID) {
+    fallbackTerminal = { ...fallbackTerminal, running: false, exitCode: 0 };
+  }
+}
+
+export async function getBrowserState(): Promise<BrowserState> {
+  const binding = wailsBinding();
+  if (binding?.GetBrowserState) {
+    return binding.GetBrowserState();
+  }
+  return emptyBrowserState("内置浏览器仅在 MHcode 桌面应用中可用。");
+}
+
+export async function openBrowserURL(url: string): Promise<BrowserState> {
+  const binding = requireBrowserBinding("OpenBrowserURL");
+  return binding.OpenBrowserURL!(url);
+}
+
+export async function browserActivateTab(tabID: string): Promise<BrowserState> {
+  return requireBrowserBinding("BrowserActivateTab").BrowserActivateTab!(tabID);
+}
+
+export async function browserCloseTab(tabID: string): Promise<BrowserState> {
+  return requireBrowserBinding("BrowserCloseTab").BrowserCloseTab!(tabID);
+}
+
+export async function browserDismissError(tabID: string): Promise<BrowserState> {
+  return requireBrowserBinding("BrowserDismissError").BrowserDismissError!(tabID);
+}
+
+export async function browserNavigate(tabID: string, url: string): Promise<void> {
+  await requireBrowserBinding("BrowserNavigate").BrowserNavigate!(tabID, url);
+}
+
+export async function browserBack(tabID: string): Promise<void> {
+  await requireBrowserBinding("BrowserBack").BrowserBack!(tabID);
+}
+
+export async function browserForward(tabID: string): Promise<void> {
+  await requireBrowserBinding("BrowserForward").BrowserForward!(tabID);
+}
+
+export async function browserReload(tabID: string): Promise<void> {
+  await requireBrowserBinding("BrowserReload").BrowserReload!(tabID);
+}
+
+export async function browserResize(tabID: string, width: number, height: number): Promise<void> {
+  await requireBrowserBinding("BrowserResize").BrowserResize!(tabID, width, height);
+}
+
+export async function browserShowNativeSurface(
+  tabID: string,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): Promise<boolean> {
+  const binding = requireBrowserBinding("BrowserShowNativeSurface");
+  return binding.BrowserShowNativeSurface!(tabID, x, y, width, height, viewportWidth, viewportHeight);
+}
+
+export async function browserHideNativeSurface(): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.BrowserHideNativeSurface) {
+    await binding.BrowserHideNativeSurface();
+  }
+}
+
+export async function getBrowserFrame(tabID: string, includeAnnotations: boolean, capturedAt = ""): Promise<BrowserFrame> {
+	const binding = requireBrowserBinding("GetBrowserFrame");
+	if (binding.GetBrowserFrameDelta) {
+		return binding.GetBrowserFrameDelta(tabID, includeAnnotations, capturedAt);
+	}
+	return binding.GetBrowserFrame!(tabID, includeAnnotations);
+}
+
+export async function browserClick(tabID: string, x: number, y: number, clickCount = 1): Promise<void> {
+  await requireBrowserBinding("BrowserClick").BrowserClick!(tabID, x, y, clickCount);
+}
+
+export async function browserScroll(tabID: string, deltaX: number, deltaY: number): Promise<void> {
+  await requireBrowserBinding("BrowserScroll").BrowserScroll!(tabID, deltaX, deltaY);
+}
+
+export async function browserType(tabID: string, text: string): Promise<void> {
+  await requireBrowserBinding("BrowserType").BrowserType!(tabID, text);
+}
+
+export async function browserKey(
+  tabID: string,
+  key: string,
+  ctrl = false,
+  alt = false,
+  shift = false,
+  meta = false,
+): Promise<void> {
+  await requireBrowserBinding("BrowserKey").BrowserKey!(tabID, key, ctrl, alt, shift, meta);
+}
+
+export async function browserHandleDialog(tabID: string, accept: boolean, promptText = ""): Promise<void> {
+  await requireBrowserBinding("BrowserHandleDialog").BrowserHandleDialog!(tabID, accept, promptText);
+}
+
+export async function getBrowserInspector(tabID: string): Promise<BrowserInspector> {
+  return requireBrowserBinding("GetBrowserInspector").GetBrowserInspector!(tabID);
+}
+
+export async function browserSaveScreenshot(tabID: string): Promise<string> {
+  return requireBrowserBinding("BrowserSaveScreenshot").BrowserSaveScreenshot!(tabID);
+}
+
+export async function browserEvaluate(tabID: string, expression: string): Promise<string> {
+  return requireBrowserBinding("BrowserEvaluate").BrowserEvaluate!(tabID, expression);
+}
+
+export async function browserAutofill(tabID: string): Promise<number> {
+  return requireBrowserBinding("BrowserAutofill").BrowserAutofill!(tabID);
+}
+
+export async function saveBrowserCredential(credentialID: string, origin: string, username: string, password: string): Promise<WorkbenchState> {
+  return requireBrowserBinding("SaveBrowserCredential").SaveBrowserCredential!(credentialID, origin, username, password);
+}
+
+export async function deleteBrowserCredential(credentialID: string): Promise<WorkbenchState> {
+  return requireBrowserBinding("DeleteBrowserCredential").DeleteBrowserCredential!(credentialID);
+}
+
+export async function browserFillCredential(tabID: string, credentialID: string): Promise<number> {
+  return requireBrowserBinding("BrowserFillCredential").BrowserFillCredential!(tabID, credentialID);
+}
+
+export async function browserOpenDownload(downloadID: string): Promise<void> {
+  await requireBrowserBinding("BrowserOpenDownload").BrowserOpenDownload!(downloadID);
+}
+
+export async function browserRevealDownload(downloadID: string): Promise<void> {
+  await requireBrowserBinding("BrowserRevealDownload").BrowserRevealDownload!(downloadID);
+}
+
+export async function browserClearData(): Promise<BrowserState> {
+  return requireBrowserBinding("BrowserClearData").BrowserClearData!();
+}
+
+export async function openURLInSystemBrowser(url: string): Promise<void> {
+  await requireBrowserBinding("OpenURLInSystemBrowser").OpenURLInSystemBrowser!(url);
 }
 
 function createFallbackState(level: ReasoningLevel): WorkbenchState {
@@ -412,6 +1216,16 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
     },
     skillsIndex: fallbackSkillsIndex,
     mcpSnapshots: fallbackSnapshots,
+    mcpServers: [
+      {
+        id: "filesystem",
+        name: "filesystem",
+        transport: "builtin",
+        state: "ready",
+        message: "内置工具由 MHcode 运行时提供",
+        toolCount: 4,
+      },
+    ],
     contextPreview: {
       stablePrefix: [
         { name: "product_identity", content: "MHcode 是面向开发者的 AI 协议交换台。" },
@@ -432,11 +1246,73 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
     },
     cacheDiagnostics: ["等待首轮模型请求记录缓存命中数据。"],
     runtimeSettings: defaultRuntimeSettings(),
+    sandboxCapabilities: {
+      platform: "browser",
+      backend: "preview-only",
+      processTree: false,
+      resourceLimits: false,
+      privilegeIsolation: false,
+      filesystemIsolation: false,
+      networkIsolation: false,
+      summary: "桌面运行时连接后显示系统沙箱能力。",
+    },
     configFiles: {
-      runtimeSettingsPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
-      modelProvidersPath: "C:\\Users\\Administrator\\AppData\\Roaming\\MHcode\\runtime-settings.json",
+      runtimeSettingsPath: "",
+      modelProvidersPath: "",
       secretsStore: "系统凭据管理器 / 本地 vault",
     },
+    team: {
+      enabled: false,
+      active: false,
+      status: "idle",
+      roles: [],
+    },
+    projectMemory: {
+      enabled: true,
+      projectName: "MHcode",
+      sessionCount: 0,
+      turnCount: 0,
+      snapshotHash: "sha256:local-preview",
+      summary: "Project: MHcode",
+    },
+  };
+}
+
+function requireBrowserBinding(method: keyof WailsAppBinding): WailsAppBinding {
+  const binding = wailsBinding();
+  if (!binding || typeof binding[method] !== "function") {
+    throw new Error("内置浏览器仅在 MHcode 桌面应用中可用。");
+  }
+  return binding;
+}
+
+function emptyGitStatus(): GitStatus {
+  return {
+    available: false,
+    ahead: 0,
+    behind: 0,
+    clean: true,
+    detached: false,
+    stagedCount: 0,
+    modifiedCount: 0,
+    untrackedCount: 0,
+    conflictCount: 0,
+    files: [],
+    branches: [],
+  };
+}
+
+function emptyBrowserState(message: string): BrowserState {
+  return {
+    available: false,
+    running: false,
+    engine: "",
+    renderMode: "stream",
+    activeTabId: "",
+    tabs: [],
+    downloads: [],
+    lastError: message,
+    cdpEnabled: false,
   };
 }
 
@@ -476,9 +1352,12 @@ function defaultRuntimeSettings(): RuntimeSettings {
     networkAccess: true,
     shellAccess: true,
     approvalPolicy: "on-request",
-    workspaceRoot: "C:\\Users\\Administrator\\Desktop\\MHcode",
+    workspaceRoot: "",
     extraWritableRoots: [],
     maxCommandSeconds: 120,
+    maxCommandMemoryMb: 4096,
+    maxCommandCpuPercent: 100,
+    maxCommandProcesses: 128,
     allowDestructiveOps: false,
     toolResultPolicy: "summary-first",
     stablePrefixPolicy: "strict-stable-prefix",
@@ -494,6 +1373,12 @@ function defaultRuntimeSettings(): RuntimeSettings {
       commitInstructions: "",
       pullRequestInstructions: "",
     },
+    memory: {
+      enabled: true,
+      maxSessions: 12,
+      maxCharacters: 6000,
+      includeArchived: true,
+    },
     browser: {
       enabled: true,
       defaultLocalUrlDestination: "mhcode",
@@ -501,6 +1386,18 @@ function defaultRuntimeSettings(): RuntimeSettings {
       screenshotAnnotations: "always",
       passwordManagerEnabled: false,
       autofillContactEnabled: false,
+      autofillProfile: {
+        fullName: "",
+        email: "",
+        phone: "",
+        organization: "",
+        streetAddress: "",
+        city: "",
+        region: "",
+        postalCode: "",
+        country: "",
+      },
+      credentials: [],
       sitePermissions: [],
       developerCdpAccess: false,
     },
@@ -514,11 +1411,14 @@ function defaultRuntimeSettings(): RuntimeSettings {
         {
           id: "filesystem",
           name: "filesystem",
+          transport: "builtin",
           command: "builtin:filesystem",
           args: [],
           env: [],
           passEnvironment: [],
           workingDirectory: "",
+          url: "",
+          headers: [],
           enabled: true,
           toolResultPolicy: "summary-first",
         },
@@ -540,7 +1440,7 @@ function defaultRuntimeSettings(): RuntimeSettings {
           enabled: true,
           apiKeyConfigured: false,
           defaultModelId: "",
-          contextWindowTokens: 64000,
+          contextWindowTokens: 128000,
           models: [],
           lastSyncStatus: "idle",
           lastSyncMessage: "等待保存 API Key 后刷新模型。",
@@ -584,6 +1484,7 @@ function defaultRuntimeSettings(): RuntimeSettings {
         },
       ],
     },
+    team: defaultTeamSettings(),
     workspace: {
       configured: true,
       dependenciesEnabled: true,
@@ -600,6 +1501,8 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
     browser: {
       ...defaults.browser,
       ...settings.browser,
+      autofillProfile: { ...defaults.browser.autofillProfile, ...settings.browser?.autofillProfile },
+      credentials: Array.isArray(settings.browser?.credentials) ? settings.browser.credentials : [],
       sitePermissions: Array.isArray(settings.browser?.sitePermissions) ? settings.browser.sitePermissions : [],
     },
     computerControl: {
@@ -614,12 +1517,18 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
       ...settings.mcp,
       servers: Array.isArray(settings.mcp?.servers) && settings.mcp.servers.length > 0 ? settings.mcp.servers : defaults.mcp.servers,
     },
+    team: {
+      ...defaults.team,
+      ...settings.team,
+      roles: Array.isArray(settings.team?.roles) && settings.team.roles.length > 0 ? settings.team.roles : defaults.team.roles,
+    },
     model: {
       ...defaults.model,
       ...settings.model,
-      providers: mergeProviders(defaults.model.providers, settings.model?.providers ?? []),
+      providers: Array.isArray(settings.model?.providers) ? settings.model.providers : defaults.model.providers,
     },
     workspace: { ...defaults.workspace, ...settings.workspace },
+    memory: { ...defaults.memory, ...settings.memory },
   };
   return {
     ...merged,
@@ -627,13 +1536,32 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
       ? merged.extraWritableRoots.map((item) => item.trim()).filter(Boolean)
       : [],
     maxCommandSeconds: clampNumber(Number(merged.maxCommandSeconds), 5, 3600),
+    maxCommandMemoryMb: clampNumber(Number(merged.maxCommandMemoryMb), 256, 65536),
+    maxCommandCpuPercent: clampNumber(Number(merged.maxCommandCpuPercent), 10, 100),
+    maxCommandProcesses: clampNumber(Number(merged.maxCommandProcesses), 4, 1024),
     cacheTargetPercent: clampNumber(Number(merged.cacheTargetPercent), 0, 100),
     git: {
       ...merged.git,
       worktreeCleanupLimit: clampNumber(Number(merged.git.worktreeCleanupLimit), 1, 99),
     },
+    memory: {
+      ...merged.memory,
+      maxSessions: clampNumber(Number(merged.memory.maxSessions), 1, 100),
+      maxCharacters: clampNumber(Number(merged.memory.maxCharacters), 1000, 20000),
+    },
     browser: {
       ...merged.browser,
+      autofillProfile: Object.fromEntries(
+        Object.entries(merged.browser.autofillProfile).map(([key, value]) => [key, String(value ?? "").trim()]),
+      ) as RuntimeSettings["browser"]["autofillProfile"],
+      credentials: merged.browser.credentials
+        .map((credential) => ({
+          ...credential,
+          id: credential.id.trim(),
+          origin: credential.origin.trim(),
+          username: credential.username.trim(),
+        }))
+        .filter((credential) => credential.id && credential.origin && credential.username),
       sitePermissions: merged.browser.sitePermissions
         .map((item) => ({
           origin: item.origin.trim(),
@@ -653,6 +1581,7 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
         ...server,
         id: server.id.trim() || server.name.trim() || server.command.trim(),
         name: server.name.trim() || server.id.trim() || "MCP Server",
+        transport: server.command?.startsWith("builtin:") ? "builtin" : server.transport || (server.url ? "streamable-http" : "stdio"),
         command: server.command.trim(),
         args: Array.isArray(server.args) ? server.args.map((item) => item.trim()).filter(Boolean) : [],
         env: Array.isArray(server.env)
@@ -660,12 +1589,16 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
           : [],
         passEnvironment: Array.isArray(server.passEnvironment) ? server.passEnvironment.map((item) => item.trim()).filter(Boolean) : [],
         workingDirectory: server.workingDirectory?.trim() ?? "",
+        url: server.url?.trim() ?? "",
+        headers: Array.isArray(server.headers)
+          ? server.headers.map((item) => ({ key: item.key.trim(), value: item.value.trim() })).filter((item) => item.key)
+          : [],
         toolResultPolicy: server.toolResultPolicy || "summary-first",
       })),
     },
     model: {
       ...merged.model,
-      selectedProviderId: merged.model.selectedProviderId || merged.model.providers[0]?.id || "deepseek",
+      selectedProviderId: merged.model.selectedProviderId || merged.model.providers[0]?.id || "",
       providers: merged.model.providers.map((provider) => ({
         ...provider,
         id: (provider.id ?? "").trim(),
@@ -684,6 +1617,7 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
               displayName: model.displayName?.trim() || model.id,
               provider: model.provider?.trim() || provider.id,
               contextWindowTokens: normalizeTokenWindow(model.contextWindowTokens),
+              contextWindowSource: normalizeContextWindowSource(model.contextWindowSource, model.contextWindowTokens),
             }))
           : [],
         supportsModelFetch: supportsProviderModelFetch(provider.protocol),
@@ -692,15 +1626,13 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
   };
 }
 
-function mergeProviders(defaults: RuntimeSettings["model"]["providers"], providers: RuntimeSettings["model"]["providers"]) {
-  const merged = [...providers];
-  const ids = new Set(merged.map((provider) => provider.id));
-  for (const provider of defaults) {
-    if (!ids.has(provider.id)) {
-      merged.push(provider);
-    }
+function normalizeContextWindowSource(source: string | undefined, tokens: number) {
+  const normalized = (source ?? "").trim().toLowerCase();
+  const allowed = new Set(["upstream", "catalog", "protocol-default", "provider-default", "manual", "safe-default"]);
+  if (tokens <= 0) {
+    return "";
   }
-  return merged;
+  return allowed.has(normalized) ? normalized : "manual";
 }
 
 function updateFallbackProvider(

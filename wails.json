@@ -9,5 +9,12 @@
   "author": {
     "name": "MISSmihu",
     "email": ""
+  },
+  "info": {
+    "companyName": "MISSmihu",
+    "productName": "MHcode",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright 2026 MISSmihu",
+    "comments": "MHcode AI coding agent"
   }
 }

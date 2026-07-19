@@ -23,6 +23,8 @@ type StableContext struct {
 
 type VolatileContext struct {
 	UserInput          string                  `json:"userInput"`
+	TriggeredSkills    []string                `json:"triggeredSkills,omitempty"`
+	ProjectContext     string                  `json:"projectContext,omitempty"`
 	RecentDiffSummary  string                  `json:"recentDiffSummary,omitempty"`
 	ToolCallSummaries  []mcp.ToolResultSummary `json:"toolCallSummaries,omitempty"`
 	OutputRequirements []string                `json:"outputRequirements"`
@@ -52,6 +54,8 @@ func (ContextBuilder) Build(stable StableContext, volatile VolatileContext) Requ
 	}
 	tail := []ContextSection{
 		{Name: "user_input", Content: volatile.UserInput},
+		{Name: "triggered_skills", Content: joinLines(volatile.TriggeredSkills)},
+		{Name: "project_context", Content: volatile.ProjectContext},
 		{Name: "recent_diff", Content: volatile.RecentDiffSummary},
 		{Name: "tool_results", Content: mcp.FormatToolResults(volatile.ToolCallSummaries)},
 		{Name: "output_requirements", Content: joinLines(volatile.OutputRequirements)},

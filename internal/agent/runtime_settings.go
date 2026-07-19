@@ -6,28 +6,38 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
 type RuntimeSettings struct {
-	SandboxMode         string                  `json:"sandboxMode"`
-	FilesystemAccess    string                  `json:"filesystemAccess"`
-	NetworkAccess       bool                    `json:"networkAccess"`
-	ShellAccess         bool                    `json:"shellAccess"`
-	ApprovalPolicy      string                  `json:"approvalPolicy"`
-	WorkspaceRoot       string                  `json:"workspaceRoot"`
-	ExtraWritableRoots  []string                `json:"extraWritableRoots"`
-	MaxCommandSeconds   int                     `json:"maxCommandSeconds"`
-	AllowDestructiveOps bool                    `json:"allowDestructiveOps"`
-	ToolResultPolicy    string                  `json:"toolResultPolicy"`
-	StablePrefixPolicy  string                  `json:"stablePrefixPolicy"`
-	CacheTargetPercent  float64                 `json:"cacheTargetPercent"`
-	Git                 GitSettings             `json:"git"`
-	Browser             BrowserSettings         `json:"browser"`
-	ComputerControl     ComputerControlSettings `json:"computerControl"`
-	MCP                 MCPSettings             `json:"mcp"`
-	Model               ModelSettings           `json:"model"`
-	Workspace           WorkspaceSettings       `json:"workspace"`
+	SchemaVersion        int                     `json:"schemaVersion"`
+	SandboxMode          string                  `json:"sandboxMode"`
+	FilesystemAccess     string                  `json:"filesystemAccess"`
+	NetworkAccess        bool                    `json:"networkAccess"`
+	ShellAccess          bool                    `json:"shellAccess"`
+	ApprovalPolicy       string                  `json:"approvalPolicy"`
+	WorkspaceRoot        string                  `json:"workspaceRoot"`
+	ExtraWritableRoots   []string                `json:"extraWritableRoots"`
+	MaxCommandSeconds    int                     `json:"maxCommandSeconds"`
+	MaxCommandMemoryMB   int                     `json:"maxCommandMemoryMb"`
+	MaxCommandCPUPercent int                     `json:"maxCommandCpuPercent"`
+	MaxCommandProcesses  int                     `json:"maxCommandProcesses"`
+	AllowDestructiveOps  bool                    `json:"allowDestructiveOps"`
+	ToolResultPolicy     string                  `json:"toolResultPolicy"`
+	StablePrefixPolicy   string                  `json:"stablePrefixPolicy"`
+	CacheTargetPercent   float64                 `json:"cacheTargetPercent"`
+	Git                  GitSettings             `json:"git"`
+	Browser              BrowserSettings         `json:"browser"`
+	ComputerControl      ComputerControlSettings `json:"computerControl"`
+	MCP                  MCPSettings             `json:"mcp"`
+	Model                ModelSettings           `json:"model"`
+	Team                 TeamSettings            `json:"team"`
+	Workspace            WorkspaceSettings       `json:"workspace"`
+	Memory               MemorySettings          `json:"memory"`
 }
+
+const runtimeSettingsSchemaVersion = 6
 
 type GitSettings struct {
 	BranchPrefix            string `json:"branchPrefix"`
@@ -41,6 +51,13 @@ type GitSettings struct {
 	PullRequestInstructions string `json:"pullRequestInstructions"`
 }
 
+type MemorySettings struct {
+	Enabled         bool `json:"enabled"`
+	MaxSessions     int  `json:"maxSessions"`
+	MaxCharacters   int  `json:"maxCharacters"`
+	IncludeArchived bool `json:"includeArchived"`
+}
+
 type BrowserSettings struct {
 	Enabled                    bool                    `json:"enabled"`
 	DefaultLocalURLDestination string                  `json:"defaultLocalUrlDestination"`
@@ -48,8 +65,29 @@ type BrowserSettings struct {
 	ScreenshotAnnotations      string                  `json:"screenshotAnnotations"`
 	PasswordManagerEnabled     bool                    `json:"passwordManagerEnabled"`
 	AutofillContactEnabled     bool                    `json:"autofillContactEnabled"`
+	AutofillProfile            BrowserAutofillProfile  `json:"autofillProfile"`
+	Credentials                []BrowserCredential     `json:"credentials"`
 	SitePermissions            []BrowserSitePermission `json:"sitePermissions"`
 	DeveloperCDPAccess         bool                    `json:"developerCdpAccess"`
+}
+
+type BrowserCredential struct {
+	ID                 string `json:"id"`
+	Origin             string `json:"origin"`
+	Username           string `json:"username"`
+	PasswordConfigured bool   `json:"passwordConfigured"`
+}
+
+type BrowserAutofillProfile struct {
+	FullName      string `json:"fullName"`
+	Email         string `json:"email"`
+	Phone         string `json:"phone"`
+	Organization  string `json:"organization"`
+	StreetAddress string `json:"streetAddress"`
+	City          string `json:"city"`
+	Region        string `json:"region"`
+	PostalCode    string `json:"postalCode"`
+	Country       string `json:"country"`
 }
 
 type BrowserSitePermission struct {
@@ -72,11 +110,14 @@ type MCPSettings struct {
 type MCPServerSetting struct {
 	ID                 string     `json:"id"`
 	Name               string     `json:"name"`
+	Transport          string     `json:"transport"`
 	Command            string     `json:"command"`
 	Args               []string   `json:"args"`
 	Env                []KeyValue `json:"env"`
 	PassEnvironment    []string   `json:"passEnvironment"`
 	WorkingDirectory   string     `json:"workingDirectory"`
+	URL                string     `json:"url"`
+	Headers            []KeyValue `json:"headers"`
 	Enabled            bool       `json:"enabled"`
 	ToolResultPolicy   string     `json:"toolResultPolicy"`
 	SchemaSnapshotHash string     `json:"schemaSnapshotHash,omitempty"`
@@ -94,24 +135,41 @@ type ModelSettings struct {
 	Providers          []ModelProviderSetting `json:"providers"`
 }
 
+type TeamSettings struct {
+	Enabled         bool              `json:"enabled"`
+	MaxReviewRounds int               `json:"maxReviewRounds"`
+	Roles           []TeamRoleSetting `json:"roles"`
+}
+
+type TeamRoleSetting struct {
+	Role       string `json:"role"`
+	Enabled    bool   `json:"enabled"`
+	ProviderID string `json:"providerId"`
+	ModelID    string `json:"modelId"`
+}
+
 type ModelProviderSetting struct {
-	ID                  string          `json:"id"`
-	Name                string          `json:"name"`
-	Protocol            string          `json:"protocol"`
-	APIType             string          `json:"apiType"`
-	BaseURL             string          `json:"baseUrl"`
-	BalanceURL          string          `json:"balanceUrl"`
-	ExtraHeaders        string          `json:"extraHeaders"`
-	ExtraBodyJSON       string          `json:"extraBodyJson"`
-	Enabled             bool            `json:"enabled"`
-	APIKeyConfigured    bool            `json:"apiKeyConfigured"`
-	DefaultModelID      string          `json:"defaultModelId"`
-	ContextWindowTokens int             `json:"contextWindowTokens"`
-	Models              []ProviderModel `json:"models"`
-	LastSyncStatus      string          `json:"lastSyncStatus"`
-	LastSyncMessage     string          `json:"lastSyncMessage"`
-	CheckedAt           string          `json:"checkedAt,omitempty"`
-	SupportsModelFetch  bool            `json:"supportsModelFetch"`
+	ID                       string          `json:"id"`
+	Name                     string          `json:"name"`
+	Protocol                 string          `json:"protocol"`
+	APIType                  string          `json:"apiType"`
+	BaseURL                  string          `json:"baseUrl"`
+	BalanceURL               string          `json:"balanceUrl"`
+	ExtraHeaders             string          `json:"extraHeaders"`
+	ExtraBodyJSON            string          `json:"extraBodyJson"`
+	Enabled                  bool            `json:"enabled"`
+	APIKeyConfigured         bool            `json:"apiKeyConfigured"`
+	DefaultModelID           string          `json:"defaultModelId"`
+	ContextWindowTokens      int             `json:"contextWindowTokens"`
+	InputPricePerMillion     float64         `json:"inputPricePerMillion"`
+	OutputPricePerMillion    float64         `json:"outputPricePerMillion"`
+	CacheHitPricePerMillion  float64         `json:"cacheHitPricePerMillion"`
+	CacheMissPricePerMillion float64         `json:"cacheMissPricePerMillion"`
+	Models                   []ProviderModel `json:"models"`
+	LastSyncStatus           string          `json:"lastSyncStatus"`
+	LastSyncMessage          string          `json:"lastSyncMessage"`
+	CheckedAt                string          `json:"checkedAt,omitempty"`
+	SupportsModelFetch       bool            `json:"supportsModelFetch"`
 }
 
 type ProviderModel struct {
@@ -119,6 +177,7 @@ type ProviderModel struct {
 	DisplayName         string `json:"displayName"`
 	Provider            string `json:"provider"`
 	ContextWindowTokens int    `json:"contextWindowTokens"`
+	ContextWindowSource string `json:"contextWindowSource,omitempty"`
 }
 
 type WorkspaceSettings struct {
@@ -129,23 +188,24 @@ type WorkspaceSettings struct {
 }
 
 func DefaultRuntimeSettings() RuntimeSettings {
-	workspaceRoot, err := os.Getwd()
-	if err != nil || strings.TrimSpace(workspaceRoot) == "" {
-		workspaceRoot = "."
-	}
+	workspaceRoot := defaultWorkspaceRoot()
 	return RuntimeSettings{
-		SandboxMode:         "workspace-write",
-		FilesystemAccess:    "workspace-write",
-		NetworkAccess:       true,
-		ShellAccess:         true,
-		ApprovalPolicy:      "on-request",
-		WorkspaceRoot:       workspaceRoot,
-		ExtraWritableRoots:  []string{},
-		MaxCommandSeconds:   120,
-		AllowDestructiveOps: false,
-		ToolResultPolicy:    "summary-first",
-		StablePrefixPolicy:  "strict-stable-prefix",
-		CacheTargetPercent:  96,
+		SchemaVersion:        runtimeSettingsSchemaVersion,
+		SandboxMode:          "workspace-write",
+		FilesystemAccess:     "workspace-write",
+		NetworkAccess:        true,
+		ShellAccess:          true,
+		ApprovalPolicy:       "on-request",
+		WorkspaceRoot:        workspaceRoot,
+		ExtraWritableRoots:   []string{},
+		MaxCommandSeconds:    120,
+		MaxCommandMemoryMB:   4096,
+		MaxCommandCPUPercent: 100,
+		MaxCommandProcesses:  128,
+		AllowDestructiveOps:  false,
+		ToolResultPolicy:     "summary-first",
+		StablePrefixPolicy:   "strict-stable-prefix",
+		CacheTargetPercent:   96,
 		Git: GitSettings{
 			BranchPrefix:           "mhcode/",
 			MergeMethod:            "merge",
@@ -155,11 +215,17 @@ func DefaultRuntimeSettings() RuntimeSettings {
 			AutoDeleteOldWorktrees: true,
 			WorktreeCleanupLimit:   15,
 		},
+		Memory: MemorySettings{
+			Enabled:         true,
+			MaxSessions:     12,
+			MaxCharacters:   6000,
+			IncludeArchived: true,
+		},
 		Browser: BrowserSettings{
 			Enabled:                    true,
 			DefaultLocalURLDestination: "mhcode",
 			ClearDataPolicy:            "ask",
-			ScreenshotAnnotations:      "always",
+			ScreenshotAnnotations:      "never",
 			PasswordManagerEnabled:     false,
 			AutofillContactEnabled:     false,
 			SitePermissions:            []BrowserSitePermission{},
@@ -175,6 +241,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 				{
 					ID:               "filesystem",
 					Name:             "filesystem",
+					Transport:        "builtin",
 					Command:          "builtin:filesystem",
 					Args:             []string{},
 					Env:              []KeyValue{},
@@ -223,6 +290,17 @@ func DefaultRuntimeSettings() RuntimeSettings {
 				},
 			},
 		},
+		Team: TeamSettings{
+			Enabled:         false,
+			MaxReviewRounds: 1,
+			Roles: []TeamRoleSetting{
+				{Role: TeamRolePlanner, Enabled: true},
+				{Role: TeamRoleImplementer, Enabled: true},
+				{Role: TeamRoleTester, Enabled: true},
+				{Role: TeamRoleReviewer, Enabled: true},
+				{Role: TeamRoleSynthesizer, Enabled: true},
+			},
+		},
 		Workspace: WorkspaceSettings{
 			Configured:          true,
 			DependenciesEnabled: true,
@@ -230,8 +308,69 @@ func DefaultRuntimeSettings() RuntimeSettings {
 	}
 }
 
+func defaultWorkspaceRoot() string {
+	cwd, _ := os.Getwd()
+	executable, _ := os.Executable()
+	home, _ := os.UserHomeDir()
+	return resolveDefaultWorkspaceRoot(cwd, executable, home)
+}
+
+func resolveDefaultWorkspaceRoot(cwd, executable, home string) string {
+	cwd = strings.TrimSpace(cwd)
+	executable = strings.TrimSpace(executable)
+	home = strings.TrimSpace(home)
+	if cwd == "" {
+		cwd = home
+	}
+	if cwd == "" {
+		return "."
+	}
+
+	executableDir := ""
+	if executable != "" {
+		executableDir = filepath.Dir(executable)
+	}
+	if executableDir != "" && sameWorkspacePath(cwd, executableDir) {
+		for candidate, depth := filepath.Dir(executableDir), 0; depth < 4; candidate, depth = filepath.Dir(candidate), depth+1 {
+			if hasWorkspaceMarker(candidate) {
+				return candidate
+			}
+			if filepath.Dir(candidate) == candidate {
+				break
+			}
+		}
+		if home != "" {
+			return home
+		}
+	}
+
+	if windowsDir := strings.TrimSpace(os.Getenv("WINDIR")); windowsDir != "" && sameWorkspacePath(cwd, filepath.Join(windowsDir, "System32")) && home != "" {
+		return home
+	}
+	return cwd
+}
+
+func hasWorkspaceMarker(path string) bool {
+	for _, marker := range []string{".git", "go.mod", "package.json", "wails.json", "Cargo.toml", "pyproject.toml"} {
+		if _, err := os.Stat(filepath.Join(path, marker)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func sameWorkspacePath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if os.PathSeparator == '\\' {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
 func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	defaults := DefaultRuntimeSettings()
+	settings.SchemaVersion = runtimeSettingsSchemaVersion
 
 	settings.SandboxMode = normalizeChoice(settings.SandboxMode, defaults.SandboxMode, map[string]bool{
 		"read-only":          true,
@@ -271,6 +410,24 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	if settings.MaxCommandSeconds > 3600 {
 		settings.MaxCommandSeconds = 3600
 	}
+	if settings.MaxCommandMemoryMB < 256 {
+		settings.MaxCommandMemoryMB = defaults.MaxCommandMemoryMB
+	}
+	if settings.MaxCommandMemoryMB > 65536 {
+		settings.MaxCommandMemoryMB = 65536
+	}
+	if settings.MaxCommandCPUPercent < 10 {
+		settings.MaxCommandCPUPercent = defaults.MaxCommandCPUPercent
+	}
+	if settings.MaxCommandCPUPercent > 100 {
+		settings.MaxCommandCPUPercent = 100
+	}
+	if settings.MaxCommandProcesses < 4 {
+		settings.MaxCommandProcesses = defaults.MaxCommandProcesses
+	}
+	if settings.MaxCommandProcesses > 1024 {
+		settings.MaxCommandProcesses = 1024
+	}
 	if settings.CacheTargetPercent < 0 {
 		settings.CacheTargetPercent = 0
 	}
@@ -278,10 +435,12 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 		settings.CacheTargetPercent = 100
 	}
 	settings.Git = normalizeGitSettings(settings.Git, defaults.Git)
+	settings.Memory = normalizeMemorySettings(settings.Memory, defaults.Memory)
 	settings.Browser = normalizeBrowserSettings(settings.Browser, defaults.Browser)
 	settings.ComputerControl = normalizeComputerControlSettings(settings.ComputerControl, defaults.ComputerControl)
 	settings.MCP = normalizeMCPSettings(settings.MCP, defaults.MCP)
 	settings.Model = normalizeModelSettings(settings.Model, defaults.Model)
+	settings.Team = normalizeTeamSettings(settings.Team, defaults.Team, settings.Model)
 	settings.Workspace = normalizeWorkspaceSettings(settings.Workspace, defaults.Workspace)
 	return settings
 }
@@ -297,20 +456,53 @@ func (settings RuntimeSettings) Validate() error {
 	return nil
 }
 
-func loadRuntimeSettings(path string) RuntimeSettings {
+func loadRuntimeSettings(path string) (RuntimeSettings, bool) {
 	settings := DefaultRuntimeSettings()
 	if strings.TrimSpace(path) == "" {
-		return settings
+		return settings, false
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return settings
+		return settings, false
 	}
 	var stored RuntimeSettings
 	if err := json.Unmarshal(data, &stored); err != nil {
-		return settings
+		return settings, false
 	}
-	return stored.Normalized()
+	if stored.SchemaVersion < 2 && stored.ApprovalPolicy == "never" && !stored.AllowDestructiveOps {
+		stored.ApprovalPolicy = "on-request"
+	}
+	stored = migrateRuntimeSettings(stored)
+	return stored.Normalized(), true
+}
+
+func migrateRuntimeSettings(stored RuntimeSettings) RuntimeSettings {
+	if stored.SchemaVersion >= 6 {
+		return stored
+	}
+	for providerIndex := range stored.Model.Providers {
+		provider := &stored.Model.Providers[providerIndex]
+		for modelIndex := range provider.Models {
+			model := &provider.Models[modelIndex]
+			id := strings.ToLower(strings.TrimSpace(model.ID))
+			if !strings.HasPrefix(id, "grok-") {
+				continue
+			}
+			expected, known := exactModelContextWindows[id]
+			if !known || expected == 1_000_000 || model.ContextWindowTokens != 1_000_000 {
+				continue
+			}
+			source := normalizeContextWindowSource(model.ContextWindowSource)
+			if source == ContextWindowSourceUpstream {
+				continue
+			}
+			// Intermediate builds could persist the old broad xAI 1M guess under
+			// several inferred/manual sources. Clear only that known stale shape.
+			model.ContextWindowTokens = 0
+			model.ContextWindowSource = ""
+		}
+	}
+	return stored
 }
 
 func saveRuntimeSettings(path string, settings RuntimeSettings) error {
@@ -324,7 +516,7 @@ func saveRuntimeSettings(path string, settings RuntimeSettings) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return tools.WriteBytesAtomic(path, data, 0o600)
 }
 
 func normalizeChoice(value string, fallback string, allowed map[string]bool) string {
@@ -345,6 +537,17 @@ func cleanStringList(values []string) []string {
 		}
 		seen[value] = true
 		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func cleanOrderedStrings(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
 	}
 	return cleaned
 }
@@ -373,6 +576,25 @@ func normalizeGitSettings(settings GitSettings, defaults GitSettings) GitSetting
 	return settings
 }
 
+func normalizeMemorySettings(settings MemorySettings, defaults MemorySettings) MemorySettings {
+	if settings == (MemorySettings{}) {
+		return defaults
+	}
+	if settings.MaxSessions < 1 {
+		settings.MaxSessions = defaults.MaxSessions
+	}
+	if settings.MaxSessions > 100 {
+		settings.MaxSessions = 100
+	}
+	if settings.MaxCharacters < 1000 {
+		settings.MaxCharacters = 1000
+	}
+	if settings.MaxCharacters > 20000 {
+		settings.MaxCharacters = 20000
+	}
+	return settings
+}
+
 func normalizeBrowserSettings(settings BrowserSettings, defaults BrowserSettings) BrowserSettings {
 	if isZeroBrowserSettings(settings) {
 		return defaults
@@ -394,6 +616,20 @@ func normalizeBrowserSettings(settings BrowserSettings, defaults BrowserSettings
 		"ask":    true,
 		"never":  true,
 	})
+	settings.AutofillProfile = normalizeBrowserAutofillProfile(settings.AutofillProfile)
+	credentials := make([]BrowserCredential, 0, len(settings.Credentials))
+	credentialIDs := map[string]bool{}
+	for _, credential := range settings.Credentials {
+		credential.ID = strings.TrimSpace(credential.ID)
+		credential.Origin = strings.TrimSpace(credential.Origin)
+		credential.Username = strings.TrimSpace(credential.Username)
+		if credential.ID == "" || credential.Origin == "" || credential.Username == "" || credentialIDs[credential.ID] {
+			continue
+		}
+		credentialIDs[credential.ID] = true
+		credentials = append(credentials, credential)
+	}
+	settings.Credentials = credentials
 	cleaned := make([]BrowserSitePermission, 0, len(settings.SitePermissions))
 	seen := map[string]bool{}
 	for _, permission := range settings.SitePermissions {
@@ -409,6 +645,19 @@ func normalizeBrowserSettings(settings BrowserSettings, defaults BrowserSettings
 	}
 	settings.SitePermissions = cleaned
 	return settings
+}
+
+func normalizeBrowserAutofillProfile(profile BrowserAutofillProfile) BrowserAutofillProfile {
+	profile.FullName = strings.TrimSpace(profile.FullName)
+	profile.Email = strings.TrimSpace(profile.Email)
+	profile.Phone = strings.TrimSpace(profile.Phone)
+	profile.Organization = strings.TrimSpace(profile.Organization)
+	profile.StreetAddress = strings.TrimSpace(profile.StreetAddress)
+	profile.City = strings.TrimSpace(profile.City)
+	profile.Region = strings.TrimSpace(profile.Region)
+	profile.PostalCode = strings.TrimSpace(profile.PostalCode)
+	profile.Country = strings.TrimSpace(profile.Country)
+	return profile
 }
 
 func permissionChoices() map[string]bool {
@@ -445,9 +694,22 @@ func normalizeMCPSettings(settings MCPSettings, defaults MCPSettings) MCPSetting
 		}
 		server.Command = strings.TrimSpace(server.Command)
 		server.WorkingDirectory = strings.TrimSpace(server.WorkingDirectory)
-		server.Args = cleanStringList(server.Args)
+		server.URL = strings.TrimSpace(server.URL)
+		server.Args = cleanOrderedStrings(server.Args)
 		server.PassEnvironment = cleanStringList(server.PassEnvironment)
 		server.Env = cleanKeyValues(server.Env)
+		server.Headers = cleanKeyValues(server.Headers)
+		if strings.HasPrefix(server.Command, "builtin:") {
+			server.Transport = "builtin"
+		} else if strings.TrimSpace(server.Transport) == "" && server.URL != "" {
+			server.Transport = "streamable-http"
+		}
+		server.Transport = normalizeChoice(server.Transport, "stdio", map[string]bool{
+			"builtin":         true,
+			"stdio":           true,
+			"streamable-http": true,
+			"sse":             true,
+		})
 		server.ToolResultPolicy = normalizeChoice(server.ToolResultPolicy, defaults.Servers[0].ToolResultPolicy, map[string]bool{
 			"summary-first": true,
 			"balanced":      true,
@@ -459,12 +721,9 @@ func normalizeMCPSettings(settings MCPSettings, defaults MCPSettings) MCPSetting
 	return settings
 }
 
-func normalizeModelSettings(settings ModelSettings, defaults ModelSettings) ModelSettings {
+func normalizeModelSettings(settings ModelSettings, _ ModelSettings) ModelSettings {
 	settings.SelectedProviderID = strings.TrimSpace(settings.SelectedProviderID)
 	settings.SelectedModelID = strings.TrimSpace(settings.SelectedModelID)
-	if len(settings.Providers) == 0 {
-		settings.Providers = defaults.Providers
-	}
 	cleaned := make([]ModelProviderSetting, 0, len(settings.Providers))
 	seen := map[string]bool{}
 	for _, provider := range settings.Providers {
@@ -497,6 +756,10 @@ func normalizeModelSettings(settings ModelSettings, defaults ModelSettings) Mode
 		if provider.ContextWindowTokens < 0 {
 			provider.ContextWindowTokens = 0
 		}
+		provider.InputPricePerMillion = normalizeTokenPrice(provider.InputPricePerMillion)
+		provider.OutputPricePerMillion = normalizeTokenPrice(provider.OutputPricePerMillion)
+		provider.CacheHitPricePerMillion = normalizeTokenPrice(provider.CacheHitPricePerMillion)
+		provider.CacheMissPricePerMillion = normalizeTokenPrice(provider.CacheMissPricePerMillion)
 		provider.LastSyncStatus = normalizeChoice(provider.LastSyncStatus, "idle", map[string]bool{
 			"idle":  true,
 			"ok":    true,
@@ -504,13 +767,93 @@ func normalizeModelSettings(settings ModelSettings, defaults ModelSettings) Mode
 		})
 		provider.LastSyncMessage = strings.TrimSpace(provider.LastSyncMessage)
 		provider.Models = normalizeProviderModels(provider.Models, provider.ID)
+		if len(provider.Models) > 0 {
+			provider.Models = providerModelsFromProtocolModels(resolveProviderModelContexts(provider, providerProtocolModels(provider.Models)))
+		}
 		provider.SupportsModelFetch = supportsModelFetch(provider.Protocol)
 		cleaned = append(cleaned, provider)
 	}
-	settings.Providers = ensureDefaultProviders(cleaned, defaults.Providers)
+	settings.Providers = cleaned
+	if len(settings.Providers) == 0 {
+		settings.SelectedProviderID = ""
+		settings.SelectedModelID = ""
+		return settings
+	}
 	if settings.SelectedProviderID == "" || !hasProvider(settings.Providers, settings.SelectedProviderID) {
 		settings.SelectedProviderID = settings.Providers[0].ID
 	}
+	for _, provider := range settings.Providers {
+		if provider.ID != settings.SelectedProviderID || len(provider.Models) == 0 {
+			continue
+		}
+		if !hasProviderModel(provider.Models, settings.SelectedModelID) {
+			settings.SelectedModelID = provider.DefaultModelID
+			if settings.SelectedModelID == "" || !hasProviderModel(provider.Models, settings.SelectedModelID) {
+				settings.SelectedModelID = provider.Models[0].ID
+			}
+		}
+		break
+	}
+	return settings
+}
+
+func normalizeTokenPrice(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 1_000_000 {
+		return 1_000_000
+	}
+	return value
+}
+
+func normalizeTeamSettings(settings TeamSettings, defaults TeamSettings, models ModelSettings) TeamSettings {
+	if len(settings.Roles) == 0 {
+		enabled := settings.Enabled
+		settings = defaults
+		settings.Enabled = enabled
+	}
+	if settings.MaxReviewRounds < 0 {
+		settings.MaxReviewRounds = 0
+	}
+	if settings.MaxReviewRounds > 2 {
+		settings.MaxReviewRounds = 2
+	}
+
+	configured := make(map[string]TeamRoleSetting, len(settings.Roles))
+	for _, role := range settings.Roles {
+		role.Role = strings.ToLower(strings.TrimSpace(role.Role))
+		if !isTeamRole(role.Role) {
+			continue
+		}
+		role.ProviderID = strings.TrimSpace(role.ProviderID)
+		role.ModelID = strings.TrimSpace(role.ModelID)
+		configured[role.Role] = role
+	}
+
+	roles := make([]TeamRoleSetting, 0, len(defaults.Roles))
+	for _, fallback := range defaults.Roles {
+		role, ok := configured[fallback.Role]
+		if !ok {
+			role = fallback
+		}
+		if role.Role == TeamRoleImplementer || role.Role == TeamRoleSynthesizer {
+			role.Enabled = true
+		}
+		if role.ProviderID == "" {
+			role.ModelID = ""
+		} else {
+			provider, _, found := findModelProvider(models.Providers, role.ProviderID)
+			if !found {
+				role.ProviderID = ""
+				role.ModelID = ""
+			} else if role.ModelID != "" && len(provider.Models) > 0 && !hasProviderModel(provider.Models, role.ModelID) {
+				role.ModelID = ""
+			}
+		}
+		roles = append(roles, role)
+	}
+	settings.Roles = roles
 	return settings
 }
 
@@ -617,28 +960,46 @@ func normalizeProviderModels(models []ProviderModel, providerID string) []Provid
 		if model.ContextWindowTokens < 0 {
 			model.ContextWindowTokens = 0
 		}
+		model.ContextWindowSource = normalizeContextWindowSource(model.ContextWindowSource)
+		if model.ContextWindowTokens == 0 {
+			model.ContextWindowSource = ""
+		} else if model.ContextWindowSource == "" {
+			// Values stored before source tracking existed were user-editable values.
+			model.ContextWindowSource = ContextWindowSourceManual
+		}
 		cleaned = append(cleaned, model)
 	}
 	return cleaned
 }
 
-func ensureDefaultProviders(providers []ModelProviderSetting, defaults []ModelProviderSetting) []ModelProviderSetting {
-	seen := map[string]bool{}
-	for _, provider := range providers {
-		seen[provider.ID] = true
+func normalizeContextWindowSource(source string) string {
+	source = strings.TrimSpace(strings.ToLower(source))
+	switch source {
+	case ContextWindowSourceUpstream,
+		ContextWindowSourceCatalog,
+		ContextWindowSourceProtocol,
+		ContextWindowSourceProvider,
+		ContextWindowSourceManual,
+		ContextWindowSourceFallback:
+		return source
+	default:
+		return ""
 	}
-	for _, provider := range defaults {
-		if seen[provider.ID] {
-			continue
-		}
-		providers = append(providers, provider)
-	}
-	return providers
 }
 
 func hasProvider(providers []ModelProviderSetting, id string) bool {
 	for _, provider := range providers {
 		if provider.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProviderModel(models []ProviderModel, id string) bool {
+	id = strings.TrimSpace(id)
+	for _, model := range models {
+		if model.ID == id {
 			return true
 		}
 	}
@@ -652,6 +1013,8 @@ func isZeroBrowserSettings(settings BrowserSettings) bool {
 		settings.ScreenshotAnnotations == "" &&
 		!settings.PasswordManagerEnabled &&
 		!settings.AutofillContactEnabled &&
+		settings.AutofillProfile == (BrowserAutofillProfile{}) &&
+		len(settings.Credentials) == 0 &&
 		len(settings.SitePermissions) == 0 &&
 		!settings.DeveloperCDPAccess
 }

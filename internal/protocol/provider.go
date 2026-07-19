@@ -1,12 +1,16 @@
 package protocol
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 type Model struct {
 	ID                  string `json:"id"`
 	DisplayName         string `json:"displayName"`
 	Provider            string `json:"provider"`
 	ContextWindowTokens int    `json:"contextWindowTokens"`
+	ContextWindowSource string `json:"contextWindowSource,omitempty"`
 }
 
 type ChatRequest struct {
@@ -16,11 +20,70 @@ type ChatRequest struct {
 	ThinkingMode    string            `json:"thinkingMode,omitempty"`
 	ReasoningEffort string            `json:"reasoningEffort,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
+	// Tools 为空时表示普通对话；非空时启用 function-calling（仅支持 ToolCaller 的 provider 生效）。
+	Tools []ToolDefinition `json:"tools,omitempty"`
+	// Internal context budget hints. Providers never serialize these fields.
+	MaxInputTokens    int `json:"-"`
+	TargetInputTokens int `json:"-"`
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role        string       `json:"role"`
+	Content     string       `json:"content"`
+	Attachments []Attachment `json:"-"`
+	// 以下字段用于 function-calling 多轮：
+	// assistant 轮携带 ToolCalls；tool 轮携带 ToolCallID + Name + Content(结果)。
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID   string     `json:"tool_call_id,omitempty"`
+	Name         string     `json:"name,omitempty"`
+	InternalKind string     `json:"-"`
+}
+
+type Attachment struct {
+	Name     string `json:"name"`
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+func chatRequestHasAttachments(request ChatRequest) bool {
+	for _, message := range request.Messages {
+		if len(message.Attachments) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// ToolDefinition 是传给模型的工具声明（OpenAI function-calling 格式）。
+type ToolDefinition struct {
+	Type     string             `json:"type"` // 恒为 "function"
+	Function ToolDefinitionFunc `json:"function"`
+}
+
+type ToolDefinitionFunc struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+// ToolCall 是模型返回的一次工具调用请求。
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// CompletionResult 是一次非流式补全结果：要么带文本，要么带工具调用。
+type CompletionResult struct {
+	Content   string
+	Reasoning string
+	ToolCalls []ToolCall
+	Usage     *TokenUsage
 }
 
 type TokenUsage struct {
@@ -32,14 +95,22 @@ type TokenUsage struct {
 }
 
 type StreamEvent struct {
-	Type  string      `json:"type"`
-	Delta string      `json:"delta,omitempty"`
-	Error string      `json:"error,omitempty"`
-	Usage *TokenUsage `json:"usage,omitempty"`
+	Type         string      `json:"type"`
+	Delta        string      `json:"delta,omitempty"`
+	Error        string      `json:"error,omitempty"`
+	Usage        *TokenUsage `json:"usage,omitempty"`
+	ToolCalls    []ToolCall  `json:"toolCalls,omitempty"`
+	FinishReason string      `json:"finishReason,omitempty"`
 }
 
 type Provider interface {
 	Name() string
 	ListModels(ctx context.Context) ([]Model, error)
 	Stream(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error)
+}
+
+// ToolCaller 是可选能力接口：支持 function-calling 的 provider 额外实现 Complete()。
+// agent 的工具循环用它做非流式补全以可靠解析 tool_calls；不支持的 provider 走纯流式文本路径。
+type ToolCaller interface {
+	Complete(ctx context.Context, request ChatRequest) (CompletionResult, error)
 }

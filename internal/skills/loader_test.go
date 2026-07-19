@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 )
 
 func TestLoaderIndexesSkillsInStableOrder(t *testing.T) {
@@ -23,6 +24,24 @@ func TestLoaderIndexesSkillsInStableOrder(t *testing.T) {
 	}
 	if index[0].SHA256 == "" {
 		t.Fatal("expected sha256 to be recorded")
+	}
+}
+
+func TestFSLoaderLoadsFullSkillBody(t *testing.T) {
+	content := "---\nname: embedded-skill\ndescription: embedded trigger\n---\n# Full instructions\nDo the work.\n"
+	loader := NewFSLoader(fstest.MapFS{
+		"skills/embedded/SKILL.md": &fstest.MapFile{Data: []byte(content)},
+	}, "skills")
+	index, err := loader.Index()
+	if err != nil || len(index) != 1 {
+		t.Fatalf("index = %#v, err = %v", index, err)
+	}
+	loaded, err := loader.Load("embedded-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Content != content || loaded.SHA256 == "" {
+		t.Fatalf("loaded = %#v", loaded)
 	}
 }
 

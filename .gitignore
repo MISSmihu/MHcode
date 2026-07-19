@@ -1,5 +1,11 @@
 # Binaries and build output
-/build/
+/build/*
+!/build/windows/
+/build/windows/*
+!/build/windows/icon.ico
+!/build/windows/icon.svg
+!/build/windows/info.json
+!/build/windows/wails.exe.manifest
 /dist/
 /bin/
 *.exe
@@ -8,11 +14,12 @@
 *.dylib
 
 # Wails and frontend output
-/frontend/node_modules/
+**/node_modules/
 /frontend/dist/*
 !/frontend/dist/.gitkeep
 /frontend/wailsjs/
 /frontend/package.json.md5
+/frontend/package-lock.json
 
 # Go
 /coverage.out
@@ -23,8 +30,20 @@ Thumbs.db
 .idea/
 .vscode/
 /.vite-*.log
+.env
+.env.*
+!.env.example
+
+# Local MHcode state
+/mhcode.db*
+/runtime-settings.json
+/projects.json
+/sessions/
 
 # Temporary scaffolding
 /.wails-template/
 /.wails-*.log
 /.cache-experiments/
+/docs/chat-prototype.html
+/electron-prototype/
+/frontend/prototypes/

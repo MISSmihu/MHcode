@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
-	"time"
 )
 
 const DefaultAnthropicBaseURL = "https://api.anthropic.com"
@@ -37,43 +37,51 @@ func (p AnthropicProvider) ListModels(ctx context.Context) ([]Model, error) {
 	if strings.TrimSpace(p.APIKey) == "" {
 		return nil, errors.New("Anthropic API Key is required")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint("/v1/models"), nil)
-	if err != nil {
-		return nil, err
-	}
-	p.applyHeaders(req, "")
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return nil, err
-	}
-
-	resp, err := p.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Anthropic models request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, anthropicAPIError(resp)
-	}
-
-	var payload anthropicModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode Anthropic models: %w", err)
-	}
-	models := make([]Model, 0, len(payload.Data))
-	for _, item := range payload.Data {
-		id := strings.TrimSpace(item.ID)
-		if id == "" {
-			continue
+	models := make([]Model, 0, 32)
+	afterID := ""
+	for page := 0; page < 20; page++ {
+		endpoint := p.endpoint("/v1/models") + "?limit=100"
+		if afterID != "" {
+			endpoint += "&after_id=" + url.QueryEscape(afterID)
 		}
-		displayName := strings.TrimSpace(item.DisplayName)
-		if displayName == "" {
-			displayName = id
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
 		}
-		models = append(models, Model{
-			ID:          id,
-			DisplayName: displayName,
-			Provider:    p.Name(),
-		})
+		p.applyHeaders(req, "")
+		if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+			return nil, err
+		}
+		resp, err := p.client().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("Anthropic models request failed: %w", err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			err := anthropicAPIError(resp)
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		var payload anthropicModelsResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode Anthropic models: %w", decodeErr)
+		}
+		for _, item := range payload.Data {
+			id := strings.TrimSpace(item.ID)
+			if id == "" {
+				continue
+			}
+			displayName := strings.TrimSpace(item.DisplayName)
+			if displayName == "" {
+				displayName = id
+			}
+			models = append(models, Model{ID: id, DisplayName: displayName, Provider: p.Name()})
+		}
+		if !payload.HasMore || strings.TrimSpace(payload.LastID) == "" || payload.LastID == afterID {
+			break
+		}
+		afterID = payload.LastID
 	}
 	return models, nil
 }
@@ -96,12 +104,13 @@ func (p AnthropicProvider) Stream(ctx context.Context, request ChatRequest) (<-c
 		Messages:    messages,
 		Stream:      true,
 		Temperature: request.Temperature,
+		Tools:       anthropicToolsFromProtocol(request.Tools),
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +141,63 @@ func (p AnthropicProvider) Stream(ctx context.Context, request ChatRequest) (<-c
 	return events, nil
 }
 
+// Complete implements Anthropic's native tool_use response contract.
+func (p AnthropicProvider) Complete(ctx context.Context, request ChatRequest) (CompletionResult, error) {
+	if strings.TrimSpace(p.APIKey) == "" {
+		return CompletionResult{}, errors.New("Anthropic API Key is required")
+	}
+	if strings.TrimSpace(request.Model) == "" {
+		return CompletionResult{}, errors.New("Anthropic model is required")
+	}
+	system, messages := anthropicMessagesFromProtocol(request.Messages)
+	if len(messages) == 0 {
+		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
+	}
+	body := anthropicMessagesRequest{
+		Model:       request.Model,
+		MaxTokens:   4096,
+		System:      system,
+		Messages:    messages,
+		Stream:      false,
+		Temperature: request.Temperature,
+		Tools:       anthropicToolsFromProtocol(request.Tools),
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream", "tools"))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/v1/messages"), bytes.NewReader(encoded))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	p.applyHeaders(req, "application/json")
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return CompletionResult{}, err
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return CompletionResult{}, fmt.Errorf("Anthropic chat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return CompletionResult{}, anthropicAPIError(resp)
+	}
+
+	var payload anthropicMessagesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return CompletionResult{}, fmt.Errorf("decode Anthropic completion: %w", err)
+	}
+	result := anthropicCompletionFromBlocks(payload.Content)
+	if payload.Usage != nil {
+		result.Usage = payload.Usage.toTokenUsage()
+	}
+	return result, nil
+}
+
 func (p AnthropicProvider) endpoint(path string) string {
 	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 	if baseURL == "" {
@@ -147,7 +213,7 @@ func (p AnthropicProvider) client() *http.Client {
 	if p.HTTPClient != nil {
 		return p.HTTPClient
 	}
-	return &http.Client{Timeout: 45 * time.Second}
+	return defaultOpenAICompatibleHTTPClient
 }
 
 func (p AnthropicProvider) applyHeaders(req *http.Request, accept string) {
@@ -164,30 +230,101 @@ func anthropicMessagesFromProtocol(messages []Message) (string, []anthropicMessa
 	converted := make([]anthropicMessage, 0, len(messages))
 	for _, message := range messages {
 		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
 		switch message.Role {
 		case "system":
-			systemParts = append(systemParts, content)
+			if content != "" {
+				systemParts = append(systemParts, content)
+			}
 		case "assistant":
-			converted = append(converted, anthropicMessage{
-				Role:    "assistant",
-				Content: []anthropicContentBlock{{Type: "text", Text: content}},
-			})
+			blocks := make([]anthropicContentBlock, 0, len(message.ToolCalls)+1)
+			if content != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: content})
+			}
+			for _, call := range message.ToolCalls {
+				blocks = append(blocks, anthropicContentBlock{
+					Type:  "tool_use",
+					ID:    call.ID,
+					Name:  call.Function.Name,
+					Input: normalizedJSONObject(call.Function.Arguments),
+				})
+			}
+			if len(blocks) > 0 {
+				converted = append(converted, anthropicMessage{Role: "assistant", Content: blocks})
+			}
+		case "tool":
+			toolContent := any(content)
+			if len(message.Attachments) > 0 {
+				blocks := make([]anthropicContentBlock, 0, len(message.Attachments)+1)
+				if content != "" {
+					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: content})
+				}
+				for _, attachment := range message.Attachments {
+					blocks = append(blocks, anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: attachment.MIMEType, Data: attachment.Data}})
+				}
+				toolContent = blocks
+			}
+			converted = append(converted, anthropicMessage{Role: "user", Content: []anthropicContentBlock{{
+				Type:      "tool_result",
+				ToolUseID: message.ToolCallID,
+				Content:   toolContent,
+			}}})
 		default:
-			converted = append(converted, anthropicMessage{
-				Role:    "user",
-				Content: []anthropicContentBlock{{Type: "text", Text: content}},
-			})
+			if content != "" || len(message.Attachments) > 0 {
+				blocks := make([]anthropicContentBlock, 0, len(message.Attachments)+1)
+				for _, attachment := range message.Attachments {
+					blocks = append(blocks, anthropicContentBlock{
+						Type: "image",
+						Source: &anthropicImageSource{
+							Type:      "base64",
+							MediaType: attachment.MIMEType,
+							Data:      attachment.Data,
+						},
+					})
+				}
+				if content != "" {
+					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: content})
+				}
+				converted = append(converted, anthropicMessage{
+					Role:    "user",
+					Content: blocks,
+				})
+			}
 		}
 	}
 	return strings.Join(systemParts, "\n\n"), converted
 }
 
+func anthropicToolsFromProtocol(tools []ToolDefinition) []anthropicTool {
+	converted := make([]anthropicTool, 0, len(tools))
+	for _, tool := range tools {
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			continue
+		}
+		converted = append(converted, anthropicTool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			InputSchema: tool.Function.Parameters,
+		})
+	}
+	return converted
+}
+
+func normalizedJSONObject(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	var object map[string]any
+	if json.Unmarshal(raw, &object) != nil {
+		return json.RawMessage(`{}`)
+	}
+	encoded, _ := json.Marshal(object)
+	return encoded
+}
+
 func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	toolUses := map[int]*anthropicToolUseAccumulator{}
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -211,12 +348,45 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 			return
 		}
 		switch chunk.Type {
+		case "content_block_start":
+			if chunk.ContentBlock.Type == "tool_use" {
+				toolUses[chunk.Index] = &anthropicToolUseAccumulator{
+					ID:    chunk.ContentBlock.ID,
+					Name:  chunk.ContentBlock.Name,
+					Input: append(json.RawMessage(nil), chunk.ContentBlock.Input...),
+				}
+			}
 		case "content_block_delta":
 			if chunk.Delta.Text != "" {
 				events <- StreamEvent{Type: "delta", Delta: chunk.Delta.Text}
 			}
 			if chunk.Delta.Thinking != "" {
 				events <- StreamEvent{Type: "reasoning", Delta: chunk.Delta.Thinking}
+			}
+			if chunk.Delta.PartialJSON != "" {
+				if accumulator := toolUses[chunk.Index]; accumulator != nil {
+					accumulator.PartialJSON.WriteString(chunk.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			if accumulator := toolUses[chunk.Index]; accumulator != nil {
+				arguments := normalizedJSONObject(accumulator.Input)
+				if partial := strings.TrimSpace(accumulator.PartialJSON.String()); partial != "" {
+					arguments = normalizedJSONObject(json.RawMessage(partial))
+				}
+				id := strings.TrimSpace(accumulator.ID)
+				if id == "" {
+					id = fmt.Sprintf("anthropic-tool-%d", chunk.Index)
+				}
+				events <- StreamEvent{Type: "tool_calls", ToolCalls: []ToolCall{{
+					ID:   id,
+					Type: "function",
+					Function: ToolCallFunction{
+						Name:      accumulator.Name,
+						Arguments: arguments,
+					},
+				}}}
+				delete(toolUses, chunk.Index)
 			}
 		case "message_start":
 			if chunk.Message != nil && chunk.Message.Usage != nil {
@@ -262,6 +432,8 @@ type anthropicModelsResponse struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
 	} `json:"data"`
+	HasMore bool   `json:"has_more"`
+	LastID  string `json:"last_id"`
 }
 
 type anthropicMessagesRequest struct {
@@ -271,6 +443,7 @@ type anthropicMessagesRequest struct {
 	Messages    []anthropicMessage `json:"messages"`
 	Stream      bool               `json:"stream"`
 	Temperature float64            `json:"temperature,omitempty"`
+	Tools       []anthropicTool    `json:"tools,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -279,16 +452,81 @@ type anthropicMessage struct {
 }
 
 type anthropicContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type      string                `json:"type"`
+	Text      string                `json:"text,omitempty"`
+	Thinking  string                `json:"thinking,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Input     json.RawMessage       `json:"input,omitempty"`
+	ToolUseID string                `json:"tool_use_id,omitempty"`
+	Content   any                   `json:"content,omitempty"`
+	Source    *anthropicImageSource `json:"source,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+type anthropicTool struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema"`
+}
+
+type anthropicMessagesResponse struct {
+	Content []anthropicContentBlock `json:"content"`
+	Usage   *anthropicUsage         `json:"usage"`
+}
+
+func anthropicCompletionFromBlocks(blocks []anthropicContentBlock) CompletionResult {
+	var content strings.Builder
+	var reasoning strings.Builder
+	result := CompletionResult{}
+	for index, block := range blocks {
+		switch block.Type {
+		case "text":
+			content.WriteString(block.Text)
+		case "thinking":
+			reasoning.WriteString(block.Thinking)
+		case "tool_use":
+			arguments := normalizedJSONObject(block.Input)
+			id := strings.TrimSpace(block.ID)
+			if id == "" {
+				id = fmt.Sprintf("anthropic-tool-%d", index)
+			}
+			result.ToolCalls = append(result.ToolCalls, ToolCall{
+				ID:   id,
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      block.Name,
+					Arguments: arguments,
+				},
+			})
+		}
+	}
+	result.Content = content.String()
+	result.Reasoning = reasoning.String()
+	return result
+}
+
+type anthropicToolUseAccumulator struct {
+	ID          string
+	Name        string
+	Input       json.RawMessage
+	PartialJSON strings.Builder
 }
 
 type anthropicStreamEvent struct {
-	Type  string `json:"type"`
-	Delta struct {
-		Type     string `json:"type"`
-		Text     string `json:"text"`
-		Thinking string `json:"thinking"`
+	Type         string                `json:"type"`
+	Index        int                   `json:"index"`
+	ContentBlock anthropicContentBlock `json:"content_block"`
+	Delta        struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		Thinking    string `json:"thinking"`
+		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	Message *struct {
 		Usage *anthropicUsage `json:"usage"`

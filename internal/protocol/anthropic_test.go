@@ -9,6 +9,26 @@ import (
 	"testing"
 )
 
+func TestAnthropicMessagesFromProtocolSerializesImageAttachments(t *testing.T) {
+	system, messages := anthropicMessagesFromProtocol([]Message{{
+		Role:    "user",
+		Content: "分析图片",
+		Attachments: []Attachment{{
+			Name: "screen.webp", MIMEType: "image/webp", Data: "aGVsbG8=",
+		}},
+	}})
+	if system != "" || len(messages) != 1 || len(messages[0].Content) != 2 {
+		t.Fatalf("system=%q messages=%#v", system, messages)
+	}
+	image := messages[0].Content[0]
+	if image.Type != "image" || image.Source == nil || image.Source.Type != "base64" || image.Source.MediaType != "image/webp" || image.Source.Data != "aGVsbG8=" {
+		t.Fatalf("image block = %#v", image)
+	}
+	if messages[0].Content[1].Type != "text" || messages[0].Content[1].Text != "分析图片" {
+		t.Fatalf("text block = %#v", messages[0].Content[1])
+	}
+}
+
 func TestAnthropicListModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -102,6 +122,20 @@ func TestAnthropicStreamParsesDeltaReasoningAndUsage(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesJoinStablePromptAndCompressedMemory(t *testing.T) {
+	system, messages := anthropicMessagesFromProtocol([]Message{
+		{Role: "system", Content: "stable prompt"},
+		{Role: "system", Content: "compressed memory"},
+		{Role: "user", Content: "continue"},
+	})
+	if system != "stable prompt\n\ncompressed memory" {
+		t.Fatalf("system = %q", system)
+	}
+	if len(messages) != 1 || messages[0].Role != "user" {
+		t.Fatalf("messages = %#v", messages)
+	}
+}
+
 func TestAnthropicErrorIncludesMessage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -113,5 +147,79 @@ func TestAnthropicErrorIncludesMessage(t *testing.T) {
 	_, err := provider.ListModels(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "bad key") {
 		t.Fatalf("error = %v, want bad key", err)
+	}
+}
+
+func TestAnthropicCompleteUsesNativeToolBlocks(t *testing.T) {
+	var payload anthropicMessagesRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{
+				{"type": "text", "text": "checking"},
+				{"type": "tool_use", "id": "toolu_2", "name": "read_file", "input": map[string]any{"path": "README.md"}},
+			},
+			"usage": map[string]any{"input_tokens": 20, "output_tokens": 4},
+		})
+	}))
+	defer server.Close()
+
+	provider := AnthropicProvider{BaseURL: server.URL, APIKey: "test-key"}
+	result, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "claude-sonnet-4",
+		Messages: []Message{
+			{Role: "system", Content: "system"},
+			{Role: "user", Content: "inspect"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "toolu_1", Type: "function", Function: ToolCallFunction{Name: "list_dir", Arguments: json.RawMessage(`{"path":"."}`)}}}},
+			{Role: "tool", Name: "list_dir", ToolCallID: "toolu_1", Content: "README.md"},
+		},
+		Tools: []ToolDefinition{{Type: "function", Function: ToolDefinitionFunc{
+			Name: "read_file", Description: "Read a file", Parameters: map[string]any{"type": "object"},
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Tools) != 1 || payload.Tools[0].Name != "read_file" {
+		t.Fatalf("tools = %#v", payload.Tools)
+	}
+	if len(payload.Messages) != 3 || payload.Messages[1].Content[0].Type != "tool_use" || payload.Messages[2].Content[0].Type != "tool_result" {
+		t.Fatalf("messages = %#v", payload.Messages)
+	}
+	if result.Content != "checking" || len(result.ToolCalls) != 1 || result.ToolCalls[0].Function.Name != "read_file" {
+		t.Fatalf("result = %#v", result)
+	}
+	if string(result.ToolCalls[0].Function.Arguments) != `{"path":"README.md"}` || result.Usage == nil || result.Usage.PromptTokens != 20 {
+		t.Fatalf("result details = %#v", result)
+	}
+}
+
+func TestAnthropicStreamReassemblesToolUseJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"README.md\\\"}\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	provider := AnthropicProvider{BaseURL: server.URL, APIKey: "test-key"}
+	events, err := provider.Stream(context.Background(), ChatRequest{Model: "claude-sonnet-4", Messages: []Message{{Role: "user", Content: "read"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []StreamEvent
+	for event := range events {
+		got = append(got, event)
+	}
+	if len(got) != 2 || got[0].Type != "tool_calls" || got[1].Type != "done" {
+		t.Fatalf("events = %#v", got)
+	}
+	if len(got[0].ToolCalls) != 1 || string(got[0].ToolCalls[0].Function.Arguments) != `{"path":"README.md"}` {
+		t.Fatalf("tool call = %#v", got[0].ToolCalls)
 	}
 }

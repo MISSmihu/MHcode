@@ -10,6 +10,22 @@ import (
 	"testing"
 )
 
+func TestDeepSeekRejectsImageAttachmentsBeforeRequest(t *testing.T) {
+	provider := NewDeepSeekProvider("test-key")
+	_, err := provider.Stream(context.Background(), ChatRequest{
+		Model: "deepseek-chat",
+		Messages: []Message{{
+			Role: "user",
+			Attachments: []Attachment{{
+				Name: "capture.png", MIMEType: "image/png", Data: "aGVsbG8=",
+			}},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "不支持图片输入") {
+		t.Fatalf("attachment error = %v", err)
+	}
+}
+
 func TestDeepSeekListModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {

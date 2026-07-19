@@ -13,26 +13,41 @@ import (
 )
 
 type Loader struct {
-	root string
+	root   string
+	source fs.FS
 }
 
 func NewLoader(root string) Loader {
-	return Loader{root: root}
+	if strings.TrimSpace(root) == "" {
+		root = "."
+	}
+	return Loader{root: ".", source: os.DirFS(root)}
+}
+
+func NewFSLoader(source fs.FS, root string) Loader {
+	if strings.TrimSpace(root) == "" {
+		root = "."
+	}
+	return Loader{root: filepath.ToSlash(root), source: source}
 }
 
 func (l Loader) Index() ([]IndexEntry, error) {
 	entries := []IndexEntry{}
-	err := filepath.WalkDir(l.root, func(path string, d fs.DirEntry, err error) error {
+	if l.source == nil {
+		return entries, nil
+	}
+	err := fs.WalkDir(l.source, l.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() || d.Name() != "SKILL.md" {
 			return nil
 		}
-		entry, err := parseSkillFile(path)
+		data, err := fs.ReadFile(l.source, path)
 		if err != nil {
 			return err
 		}
+		entry := parseSkillData(path, data)
 		entries = append(entries, entry)
 		return nil
 	})
@@ -48,11 +63,49 @@ func (l Loader) Index() ([]IndexEntry, error) {
 	return entries, nil
 }
 
-func parseSkillFile(path string) (IndexEntry, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return IndexEntry{}, err
+type LoadedSkill struct {
+	Name    string
+	SHA256  string
+	Content string
+}
+
+func (l Loader) Load(name string) (LoadedSkill, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || l.source == nil {
+		return LoadedSkill{}, fs.ErrNotExist
 	}
+	var loaded LoadedSkill
+	err := fs.WalkDir(l.source, l.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "SKILL.md" {
+			return nil
+		}
+		data, err := fs.ReadFile(l.source, path)
+		if err != nil {
+			return err
+		}
+		entry := parseSkillData(path, data)
+		if entry.Name != name {
+			return nil
+		}
+		if len(data) > 256*1024 {
+			return errors.New("skill file exceeds 256 KiB")
+		}
+		loaded = LoadedSkill{Name: entry.Name, SHA256: entry.SHA256, Content: string(data)}
+		return fs.SkipAll
+	})
+	if err != nil && !errors.Is(err, fs.SkipAll) {
+		return LoadedSkill{}, err
+	}
+	if loaded.Name == "" {
+		return LoadedSkill{}, fs.ErrNotExist
+	}
+	return loaded, nil
+}
+
+func parseSkillData(path string, data []byte) IndexEntry {
 	sum := sha256.Sum256(data)
 	meta := parseFrontmatter(string(data))
 	name := meta["name"]
@@ -67,7 +120,7 @@ func parseSkillFile(path string) (IndexEntry, error) {
 		Summary:     summarizeSkill(name),
 		SHA256:      "sha256:" + hex.EncodeToString(sum[:]),
 		Description: description,
-	}, nil
+	}
 }
 
 func parseFrontmatter(content string) map[string]string {

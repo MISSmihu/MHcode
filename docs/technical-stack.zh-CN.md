@@ -1,340 +1,178 @@
-# MHcode 技术栈与开发工具链
+# MHcode 当前架构与开发工具链
 
-本文档记录 MHcode 的技术选型、项目结构、开发命令和第一阶段落地路线。结论：使用 **Go 核心引擎 + Wails 桌面壳 + SolidJS 前端 + SQLite 本地存储**。
+本文档以当前源码为准，描述 MHcode 的真实运行边界。早期文档把 Anthropic、Gemini、Git、浏览器和 Agent 团队写成未来计划；这些能力现在已经进入代码，但其中一部分仍需要真实供应商和 Windows 长时间运行验证。
 
-## 选型结论
+## 总体结构
 
-### Go
+\`\`\`text
+MHcode/
+├── app*.go, *_bridge.go           Wails 应用边界与前端事件桥
+├── internal/
+│   ├── agent/                     Agent 状态、路由、Plan、团队、记忆、rewind
+│   ├── browserengine/             Chromium/CDP 浏览器服务与原生窗口表面
+│   ├── cache/                     稳定前缀与用量命中指标
+│   ├── computercontrol/           Windows 窗口与输入控制
+│   ├── config/                    默认配置结构
+│   ├── eventlog/                  append-only 会话事件树与快照
+│   ├── mcp/                       MCP server、schema 快照和远程工具
+│   ├── project/                   项目/会话清单与临时工作区迁移
+│   ├── protocol/                  DeepSeek、OpenAI、Anthropic、Gemini 等协议
+│   ├── sandboxexec/                子进程 containment 与资源限制
+│   ├── skills/                    Skill 索引、frontmatter 和按需加载
+│   ├── storage/                   SQLite 迁移和用量持久化
+│   ├── terminal/                  持久终端会话
+│   ├── tools/                     Agent 结构化工具和权限策略
+│   ├── vault/                     系统密钥库适配
+│   └── workspacegit/              Git status/diff/stage/commit/branch/worktree
+├── frontend/src/
+│   ├── app.tsx                    工作台状态和页面组合
+│   ├── components/                对话、浏览器、审阅、时间线、设置组件
+│   ├── services/workbench.ts      Wails 调用和事件订阅
+│   ├── types.ts                   前端状态与后端 JSON 合约
+│   └── styles*.css                工作台视觉层
+├── skills/                        随仓库分发的运行时 Skills
+├── docs/                          面向开发者的说明
+└── wails.json                     Wails 构建配置
+\`\`\`
 
-Go 负责 MHcode 的核心能力：
+## 请求执行流
 
-- Agent 调度。
-- Skills 加载。
-- MCP 工具目录和工具调用。
-- AI 协议适配器。
-- DeepSeek 官方接入。
-- 流式响应处理。
-- 稳定前缀和易变尾部组装。
-- 缓存命中率和费用统计。
-- SQLite 本地存储。
-- 本地密钥和配置管理。
+一次普通任务大致按以下顺序运行：
 
-Go 的优势是单文件分发、并发稳定、跨平台简单、适合长驻本地核心进程。
+\`\`\`text
+用户输入
+  → 选择供应商/模型与推理档位
+  → 读取项目摘要、Skill 索引、MCP schema 快照
+  → 按模型上下文窗口计算输入预算
+  → 必要时自动压缩旧会话
+  → Plan（显式开启时）或直接进入工具循环
+  → 权限检查与审批
+  → 结构化工具执行
+  → provider 原生流式响应 / tool call
+  → 记录用量、事件、文件快照和分支状态
+  → 前端消费文本、工具、计划、团队和压缩事件
+\`\`\`
 
-### Wails
+\`internal/agent.Service\` 是流程编排者；Wails \`App\` 方法只负责桌面边界、状态查询和事件转发，不应把协议或文件业务重新写进前端。
 
-桌面壳首版使用 Wails v2 稳定线。Wails 的价值是把 Go 后端和 Web 前端打包成桌面应用，比 Electron 更轻，同时保留前端开发效率。
+## Agent 与工具边界
 
-Wails v3 官方文档目前仍标注 Alpha，可持续观察。等 v3 稳定或 MHcode 需要多窗口、系统托盘等能力时再评估升级。
+\`internal/tools\` 中的工具通过 \`Tool\` 接口注册：
 
-### SolidJS
-
-前端使用 SolidJS + TypeScript + Vite。
-
-适合 MHcode 的原因：
-
-- 响应式细粒度，适合高频状态面板。
-- 体积小。
-- 与 Vite 组合开发速度快。
-- UI 可以从当前 HTML 原型平滑迁移。
-
-### SQLite
-
-本地存储使用 SQLite。
-
-建议存储：
-
-- 模型供应商配置。
-- API Key 引用和密钥元数据。
-- 会话记录。
-- tokens 用量。
-- `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`。
-- 工具调用摘要。
-- MCP schema 快照。
-- Skills 索引和版本。
-
-Go SQLite 驱动优先选择免 CGO 方案，方便 Windows/macOS/Linux 分发。
-
-## 推荐项目结构
-
-```text
-MHcode
-├── cmd
-│   └── mhcode
-│       └── main.go
-├── internal
-│   ├── agent
-│   │   ├── runner.go
-│   │   ├── context_builder.go
-│   │   └── reasoning.go
-│   ├── cache
-│   │   ├── prefix.go
-│   │   └── metrics.go
-│   ├── config
-│   │   └── config.go
-│   ├── mcp
-│   │   ├── registry.go
-│   │   ├── schema_snapshot.go
-│   │   └── tool_result.go
-│   ├── protocol
-│   │   ├── provider.go
-│   │   ├── deepseek.go
-│   │   ├── openai_compatible.go
-│   │   └── local.go
-│   ├── skills
-│   │   ├── loader.go
-│   │   └── index.go
-│   ├── storage
-│   │   ├── db.go
-│   │   └── migrations.go
-│   └── vault
-│       └── keyring.go
-├── frontend
-│   ├── src
-│   │   ├── app.tsx
-│   │   ├── components
-│   │   ├── pages
-│   │   └── state
-│   ├── package.json
-│   └── vite.config.ts
-├── skills
-├── docs
-└── wails.json
-```
-
-## 核心模块边界
-
-### `internal/protocol`
-
-定义统一模型协议接口。
-
-```go
-type Provider interface {
-  Name() string
-  ListModels(ctx context.Context) ([]Model, error)
-  Stream(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error)
+\`\`\`go
+type Tool interface {
+    Name() string
+    Description() string
+    InputSchema() map[string]any
+    Execute(ctx context.Context, rawArgs json.RawMessage) (Result, error)
 }
-```
+\`\`\`
 
-首发实现：
+当前内置工具包括：
 
-- `DeepSeekProvider`
-- `OpenAICompatibleProvider`
-- `LocalProvider`
+- \`update_plan\`
+- \`read_file\`、\`file_info\`、\`list_dir\`、\`search\`
+- \`write_file\`、\`apply_patch\`、\`copy_file\`、\`delete_file\`
+- \`open_file\`
+- \`read_repository\`、\`web_search\`
+- \`browser\`、\`computer\`
+- \`run_command\`、\`terminal\`
+- Git 工具及启用的 MCP 远程工具
 
-后续扩展：
+注册顺序是稳定前缀的一部分。新增工具时应在固定位置注册、为 schema 加测试，并确认只读 Plan 注册表不会意外得到写权限。
 
-- Anthropic
-- Gemini
-- Azure OpenAI
-- Ollama
-- LM Studio
-- vLLM
-- 国内模型平台
-- 自定义 HTTP / SSE / WebSocket
+文件操作默认走结构化工具。\`run_command\` 只用于构建、测试、编译器和确实需要执行的程序；Agent 不应使用 Shell 代替文件读取、搜索、写入、复制或删除。
 
-### `internal/agent`
+## 权限、审批与沙箱
 
-负责 Agent 执行流程。
+\`RuntimeSettings\` 是权限策略的入口，当前包含：
 
-职责：
+- \`SandboxMode\`、\`FilesystemAccess\`、\`WorkspaceRoot\`、额外可写目录。
+- \`NetworkAccess\`、\`ShellAccess\`、破坏性操作开关。
+- 命令超时、内存、CPU 和进程数上限。
+- \`ApprovalPolicy\`：工具按请求、失败或策略自动审批。
+- Git、浏览器、电脑操控、MCP、团队和记忆设置。
 
-- 接收用户任务。
-- 选择推理强度。
-- 调用 Skills。
-- 查询 MCP 工具。
-- 构建上下文。
-- 发起模型请求。
-- 消费工具调用。
-- 写入会话和成本记录。
+Windows 使用 Job Object 管理命令进程树，可施加资源限制并尝试降低子进程权限。当前 \`Capabilities\` 明确报告：文件系统隔离和网络隔离为 \`false\`。因此这不是虚拟机或容器沙箱；任何危险操作仍必须依赖策略、路径校验和审批。
 
-### `internal/cache`
+## 协议层
 
-负责缓存命中策略。
+\`internal/protocol.Provider\` 统一模型列表和流式请求，具体协议负责自己的认证、请求体、SSE/JSON 解码和工具调用格式。当前实现/适配包括：
 
-职责：
+- DeepSeek 官方协议。
+- OpenAI Chat Completions 与兼容供应商。
+- OpenAI Responses 风格事件。
+- Anthropic Messages 原生协议。
+- Gemini \`generateContent\`/流式协议。
+- Local provider 测试与本地兜底路径。
 
-- 稳定前缀组装。
-- 易变尾部组装。
-- 前缀 hash。
-- tokens 命中率统计。
-- 费用估算。
-- 命中率低于 96% 时给出诊断。
+供应商配置保存在运行设置中，API Key 只保存到系统密钥库。模型列表返回的上下文窗口优先级为：上游返回值、手动值、精确目录、协议默认、供应商默认、安全兜底。新增或修正模型目录时必须同步 \`internal/agent/model_context.go\`、\`frontend/src/model-context.ts\` 和对应测试。
 
-### `internal/skills`
+## 上下文、缓存和压缩
 
-负责 Skills 发现和加载。
+请求被拆成稳定前缀与易变尾部：
 
-职责：
+- 稳定前缀：系统身份、Agent 规则、推理档位、Skill 索引、MCP schema hash、项目摘要、路由策略。
+- 易变尾部：本轮用户输入、最近 diff、工具参数、工具结果摘要、错误和重试信息。
 
-- 扫描 `skills/*/SKILL.md`。
-- 解析 frontmatter。
-- 生成稳定 Skills 索引。
-- 只在触发时加载完整 Skill。
-- 记录 Skill 版本和 hash。
+工具结果默认摘要优先，原文留在本地引用。每轮记录输入/输出 tokens、缓存命中/未命中 tokens、命中率和估算费用。
 
-### `internal/mcp`
+上下文预算根据实际模型窗口扣除输出、工具和安全预留；达到当前推理策略阈值后触发自动压缩。压缩保留稳定 system 前缀、当前请求、完整的 tool call/result 对和最近对话组；原始事件日志不会被压缩破坏，Rewind 仍针对完整历史分支工作。
 
-负责 MCP 工具接入。
+## 状态与持久化
 
-职责：
+- \`internal/project\` 保存项目、会话、活动分支和移除项目后的临时工作区迁移。
+- \`internal/eventlog\` 使用 append-only JSONL 事件树；\`HEAD\` 指向当前对话线，rewind 后自然形成新分支。
+- checkpoint 保存文件快照，支持回退和从消息分叉。
+- SQLite 保存模型状态、用量和相关持久数据。
+- 长期记忆按项目保存，可在设置中开关并限制会话数和字符数。
 
-- 管理 MCP server。
-- 生成工具 schema 快照。
-- 计算 schema hash。
-- 规范化工具调用参数。
-- 压缩工具结果。
-- 保存原始工具结果引用。
+不要直接修改事件日志或 SQLite 作为功能实现方式；新增状态应先定义迁移、事件和恢复行为。
 
-### `internal/vault`
+## Git、终端、浏览器和电脑操控
 
-负责密钥。
+- \`workspacegit\` 只接受工作区相对路径，提供状态、diff、审阅 diff、暂存/取消暂存、提交、分支和 worktree 操作。
+- \`terminal\` 管理最多 8 个持久会话，实时推送输出，支持停止和进程树清理。
+- \`browserengine\` 通过 chromedp/CDP 驱动 Edge/Chrome，支持标签页、导航、点击、滚动、输入、对话框、快照、截图、下载和原生窗口表面。
+- \`computercontrol\` 是 Windows 专用的窗口/鼠标/键盘控制层，必须受设置和审批限制。
 
-职责：
+浏览器不是截图假面：页面读取和交互由 Chromium/CDP 执行；原生窗口表面只是把真实浏览器窗口嵌入工作台的显示层。浏览器依赖本机 Edge/Chrome 和 WebView2，启动失败时 UI 应保留诊断信息。
 
-- API Key 不直接写入普通配置文件。
-- Windows 使用 Credential Manager。
-- macOS 使用 Keychain。
-- Linux 使用 Secret Service 或加密文件兜底。
+## 前端与 Wails 合约
 
-## 推理强度
+后端导出的 \`App\` 方法和 Wails 事件是前后端合约。新增字段时：
 
-MHcode 必须支持四档推理强度：
+1. 先修改 Go 类型和服务测试。
+2. 再同步 \`frontend/src/types.ts\` 与状态适配。
+3. 为流式事件增加前端回归测试。
+4. 运行 Wails 构建以验证绑定生成。
 
-```ts
-type ReasoningLevel = "low" | "medium" | "high" | "ultra"
-```
-
-中文菜单：
-
-```text
-推理
-低
-中
-高
-超高  ✓
-```
-
-默认值：
-
-```ts
-const defaultReasoningLevel = "ultra"
-```
-
-后端映射：
-
-```go
-type ReasoningLevel string
-
-const (
-  ReasoningLow    ReasoningLevel = "low"
-  ReasoningMedium ReasoningLevel = "medium"
-  ReasoningHigh   ReasoningLevel = "high"
-  ReasoningUltra  ReasoningLevel = "ultra"
-)
-```
-
-四档不只影响模型，也影响工具调用上限、上下文大小、是否启用规划器和缓存策略。
-
-## 缓存命中率
-
-缓存命中率是 MHcode 的核心指标。
-
-目标：
-
-```text
-cache_hit_rate >= 96%
-```
-
-公式：
-
-```go
-cacheHitRate := promptCacheHitTokens / (promptCacheHitTokens + promptCacheMissTokens)
-```
-
-请求上下文必须分成：
-
-- 稳定前缀：系统提示、Agent 规则、推理强度、Skills 索引、MCP schema 快照、项目摘要、路由策略。
-- 易变尾部：用户输入、工具参数、工具结果摘要、最近 diff、错误和重试信息。
-
-禁止为了“超高推理”破坏稳定前缀。
-
-## DeepSeek 首发接入
-
-第一阶段只把 DeepSeek 做深，不急着铺满所有供应商。
-
-必须完成：
-
-- API Key 保存和连接测试。
-- 官方模型探测。
-- 流式请求。
-- JSON 输出。
-- 工具调用兼容。
-- tokens 统计。
-- `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 统计。
-- 费用估算。
-- 错误翻译。
-
-## 前端页面
-
-首批页面：
-
-- 协议总览。
-- DeepSeek 官方接入。
-- 模型路由。
-- 推理强度菜单。
-- Skills 管理。
-- MCP 工具管理。
-- 上下文窗口。
-- 缓存命中面板。
-- tokens 与费用面板。
-- 设置和密钥库。
+\`task_progress\`、\`context_compression\`、\`team\` 等运行事件不应直接混进助手正文；它们由前端作为独立活动状态或结构化卡片渲染。
 
 ## 开发命令
 
-建议命令：
+\`\`\`powershell
+# 根目录
+go mod download
+go test ./... -count=1
+go vet ./...
 
-```powershell
-# 安装前端依赖
-cd C:\Users\Administrator\Desktop\MHcode\frontend
-bun install
+# 前端
+cd frontend
+bun.cmd install --frozen-lockfile
+bun.cmd run check
+cd ..
 
-# 前端开发
-bun run dev
-
-# Go 测试
-cd C:\Users\Administrator\Desktop\MHcode
-go test ./...
-
-# Wails 开发
+# 桌面
 wails dev
+wails build -clean
+\`\`\`
 
-# Wails 打包
-wails build
-```
+Windows 下优先使用 \`bun.cmd\`。Go 代码变更后至少运行 \`go test ./... -count=1\`；涉及 Wails 或平台代码时追加 \`go vet ./...\` 和 \`wails build -clean\`。
 
-Windows 上调用 Bun 时，优先使用 `bun.cmd`。
+## 已知边界
 
-## 第一阶段路线
-
-1. 初始化 Wails + SolidJS 项目。
-2. 建立 Go 模块和目录结构。
-3. 实现 `ReasoningLevel` 前后端类型。
-4. 实现推理菜单 UI。
-5. 实现 Skills 扫描和索引。
-6. 实现 MCP schema 快照。
-7. 实现 DeepSeek provider。
-8. 实现流式输出。
-9. 实现缓存命中率统计。
-10. 实现费用面板。
-
-## 取舍
-
-不建议一开始全量重写复杂 Agent 系统。先打穿最小闭环：
-
-```text
-DeepSeek API Key → 模型探测 → 推理强度 → 上下文组装 → 流式输出 → 缓存命中统计 → 费用展示
-```
-
-闭环稳定后，再扩展更多供应商和插件市场。
-
+- 没有真实供应商密钥时只能运行协议 mock、单元测试和本地 provider，不能把 mock 结果当成上游 E2E 结论。
+- Windows Job Object 不是文件系统/网络隔离；生产环境仍需外部 OS 沙箱或容器方案才能提供更强边界。
+- 非 Windows 的浏览器原生表面、电脑操控和进程限制覆盖较少。
+- 模型上下文目录目前由 Go 和前端各维护一份，修改必须双写并测试；后续应改为单一生成源.

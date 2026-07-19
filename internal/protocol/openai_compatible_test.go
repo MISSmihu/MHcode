@@ -5,8 +5,33 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func TestOpenAIMessagesFromProtocolSerializesImageAttachments(t *testing.T) {
+	messages := openAIMessagesFromProtocol([]Message{{
+		Role:    "user",
+		Content: "分析图片",
+		Attachments: []Attachment{{
+			Name: "screen.png", MIMEType: "image/png", Data: "aGVsbG8=",
+		}},
+	}})
+	if len(messages) != 1 {
+		t.Fatalf("messages = %d, want 1", len(messages))
+	}
+	parts, ok := messages[0].Content.([]openAIContentPart)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %#v, want text + image parts", messages[0].Content)
+	}
+	if parts[0].Type != "text" || parts[0].Text != "分析图片" {
+		t.Fatalf("text part = %#v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/png;base64,aGVsbG8=" {
+		t.Fatalf("image part = %#v", parts[1])
+	}
+}
 
 func TestOpenAICompatibleListModels(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -116,5 +141,51 @@ func TestOpenAICompatibleStreamUsesCompatibilityOptions(t *testing.T) {
 	}
 	if got != "ok" {
 		t.Fatalf("stream content = %q, want ok", got)
+	}
+}
+
+func TestOpenAICompatibleStreamRetriesTransientGatewayFailure(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "temporary gateway failure", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	provider := OpenAICompatibleProvider{BaseURL: server.URL, APIKey: "test-key"}
+	events, err := provider.Stream(context.Background(), ChatRequest{
+		Model:    "test-model",
+		Messages: []Message{{Role: "user", Content: "ping"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var content string
+	for event := range events {
+		if event.Type == "delta" {
+			content += event.Delta
+		}
+	}
+	if attempts.Load() != 2 || content != "recovered" {
+		t.Fatalf("attempts=%d content=%q", attempts.Load(), content)
+	}
+}
+
+func TestOpenAICompatibleDefaultClientDoesNotCapStreamDuration(t *testing.T) {
+	provider := OpenAICompatibleProvider{}
+	if provider.client().Timeout != 0 {
+		t.Fatalf("streaming client total timeout = %s, want 0", provider.client().Timeout)
+	}
+}
+
+func TestCompactOpenAICompatibleHTMLError(t *testing.T) {
+	detail := compactOpenAICompatibleError(`<!DOCTYPE html><html><head><title>502 Bad gateway</title></head><body><h1>Host error</h1>` + strings.Repeat(" noisy", 200) + `</body></html>`)
+	if !strings.Contains(detail, "502 Bad gateway") || !strings.Contains(detail, "Host error") || len([]rune(detail)) > 221 || strings.Contains(detail, "<!DOCTYPE") {
+		t.Fatalf("detail=%q", detail)
 	}
 }

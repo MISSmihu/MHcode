@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const DefaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
@@ -36,47 +35,55 @@ func (p GeminiProvider) ListModels(ctx context.Context) ([]Model, error) {
 	if strings.TrimSpace(p.APIKey) == "" {
 		return nil, errors.New("Gemini API Key is required")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint("/models", true), nil)
-	if err != nil {
-		return nil, err
-	}
-	p.applyHeaders(req)
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return nil, err
-	}
-
-	resp, err := p.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Gemini models request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, geminiAPIError(resp)
-	}
-
-	var payload geminiModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode Gemini models: %w", err)
-	}
-	models := make([]Model, 0, len(payload.Models))
-	for _, item := range payload.Models {
-		if !geminiSupportsGenerateContent(item.SupportedGenerationMethods) {
-			continue
+	models := make([]Model, 0, 32)
+	pageToken := ""
+	for page := 0; page < 20; page++ {
+		values := url.Values{"pageSize": []string{"1000"}}
+		if pageToken != "" {
+			values.Set("pageToken", pageToken)
 		}
-		id := strings.TrimPrefix(strings.TrimSpace(item.Name), "models/")
-		if id == "" {
-			continue
+		endpoint := p.endpoint("/models") + "?" + values.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
 		}
-		displayName := strings.TrimSpace(item.DisplayName)
-		if displayName == "" {
-			displayName = id
+		p.applyHeaders(req)
+		if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+			return nil, err
 		}
-		models = append(models, Model{
-			ID:                  id,
-			DisplayName:         displayName,
-			Provider:            p.Name(),
-			ContextWindowTokens: item.InputTokenLimit,
-		})
+		resp, err := p.client().Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("Gemini models request failed: %w", err)
+		}
+		if resp.StatusCode >= http.StatusBadRequest {
+			err := geminiAPIError(resp)
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		var payload geminiModelsResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode Gemini models: %w", decodeErr)
+		}
+		for _, item := range payload.Models {
+			if !geminiSupportsGenerateContent(item.SupportedGenerationMethods) {
+				continue
+			}
+			id := strings.TrimPrefix(strings.TrimSpace(item.Name), "models/")
+			if id == "" {
+				continue
+			}
+			displayName := strings.TrimSpace(item.DisplayName)
+			if displayName == "" {
+				displayName = id
+			}
+			models = append(models, Model{ID: id, DisplayName: displayName, Provider: p.Name(), ContextWindowTokens: item.InputTokenLimit, ContextWindowSource: "upstream"})
+		}
+		if strings.TrimSpace(payload.NextPageToken) == "" || payload.NextPageToken == pageToken {
+			break
+		}
+		pageToken = payload.NextPageToken
 	}
 	return models, nil
 }
@@ -97,6 +104,7 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 		GenerationConfig: geminiGenerationConfig{
 			Temperature: request.Temperature,
 		},
+		Tools: geminiToolsFromProtocol(request.Tools),
 	}
 	if strings.TrimSpace(system) != "" {
 		body.SystemInstruction = &geminiContent{
@@ -107,12 +115,12 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction", "tools"))
 	if err != nil {
 		return nil, err
 	}
 	path := "/" + normalizeGeminiModelName(request.Model) + ":streamGenerateContent"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(path, true)+"&alt=sse", bytes.NewReader(encoded))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(path)+"?alt=sse", bytes.NewReader(encoded))
 	if err != nil {
 		return nil, err
 	}
@@ -140,27 +148,78 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	return events, nil
 }
 
-func (p GeminiProvider) endpoint(path string, includeKey bool) string {
+// Complete implements Gemini's native functionCall response contract.
+func (p GeminiProvider) Complete(ctx context.Context, request ChatRequest) (CompletionResult, error) {
+	if strings.TrimSpace(p.APIKey) == "" {
+		return CompletionResult{}, errors.New("Gemini API Key is required")
+	}
+	if strings.TrimSpace(request.Model) == "" {
+		return CompletionResult{}, errors.New("Gemini model is required")
+	}
+	system, contents := geminiContentsFromProtocol(request.Messages)
+	if len(contents) == 0 {
+		contents = []geminiContent{{Role: "user", Parts: []geminiPart{{Text: ""}}}}
+	}
+	body := geminiGenerateContentRequest{
+		Contents: contents,
+		GenerationConfig: geminiGenerationConfig{
+			Temperature: request.Temperature,
+		},
+		Tools: geminiToolsFromProtocol(request.Tools),
+	}
+	if strings.TrimSpace(system) != "" {
+		body.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: system}}}
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction", "tools"))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	path := "/" + normalizeGeminiModelName(request.Model) + ":generateContent"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint(path), bytes.NewReader(encoded))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	p.applyHeaders(req)
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return CompletionResult{}, err
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return CompletionResult{}, fmt.Errorf("Gemini chat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return CompletionResult{}, geminiAPIError(resp)
+	}
+
+	var payload geminiGenerateContentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return CompletionResult{}, fmt.Errorf("decode Gemini completion: %w", err)
+	}
+	result := geminiCompletionFromCandidates(payload.Candidates)
+	if payload.UsageMetadata != nil {
+		result.Usage = payload.UsageMetadata.toTokenUsage()
+	}
+	return result, nil
+}
+
+func (p GeminiProvider) endpoint(path string) string {
 	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 	if baseURL == "" {
 		baseURL = DefaultGeminiBaseURL
 	}
-	endpoint := baseURL + path
-	if includeKey {
-		separator := "?"
-		if strings.Contains(endpoint, "?") {
-			separator = "&"
-		}
-		endpoint += separator + "key=" + url.QueryEscape(strings.TrimSpace(p.APIKey))
-	}
-	return endpoint
+	return baseURL + path
 }
 
 func (p GeminiProvider) client() *http.Client {
 	if p.HTTPClient != nil {
 		return p.HTTPClient
 	}
-	return &http.Client{Timeout: 45 * time.Second}
+	return defaultOpenAICompatibleHTTPClient
 }
 
 func (p GeminiProvider) applyHeaders(req *http.Request) {
@@ -173,24 +232,96 @@ func geminiContentsFromProtocol(messages []Message) (string, []geminiContent) {
 	contents := make([]geminiContent, 0, len(messages))
 	for _, message := range messages {
 		content := strings.TrimSpace(message.Content)
-		if content == "" {
-			continue
-		}
 		switch message.Role {
 		case "system":
-			systemParts = append(systemParts, content)
+			if content != "" {
+				systemParts = append(systemParts, content)
+			}
 		case "assistant":
-			contents = append(contents, geminiContent{Role: "model", Parts: []geminiPart{{Text: content}}})
+			parts := make([]geminiPart, 0, len(message.ToolCalls)+1)
+			if content != "" {
+				parts = append(parts, geminiPart{Text: content})
+			}
+			for _, call := range message.ToolCalls {
+				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{
+					ID:   call.ID,
+					Name: call.Function.Name,
+					Args: rawJSONObjectMap(call.Function.Arguments),
+				}})
+			}
+			if len(parts) > 0 {
+				contents = append(contents, geminiContent{Role: "model", Parts: parts})
+			}
+		case "tool":
+			parts := []geminiPart{{
+				FunctionResponse: &geminiFunctionResponse{
+					ID:       message.ToolCallID,
+					Name:     message.Name,
+					Response: geminiFunctionResponsePayload(content),
+				},
+			}}
+			for _, attachment := range message.Attachments {
+				parts = append(parts, geminiPart{InlineData: &geminiInlineData{MIMEType: attachment.MIMEType, Data: attachment.Data}})
+			}
+			contents = append(contents, geminiContent{Role: "user", Parts: parts})
 		default:
-			contents = append(contents, geminiContent{Role: "user", Parts: []geminiPart{{Text: content}}})
+			if content != "" || len(message.Attachments) > 0 {
+				parts := make([]geminiPart, 0, len(message.Attachments)+1)
+				if content != "" {
+					parts = append(parts, geminiPart{Text: content})
+				}
+				for _, attachment := range message.Attachments {
+					parts = append(parts, geminiPart{InlineData: &geminiInlineData{
+						MIMEType: attachment.MIMEType,
+						Data:     attachment.Data,
+					}})
+				}
+				contents = append(contents, geminiContent{Role: "user", Parts: parts})
+			}
 		}
 	}
 	return strings.Join(systemParts, "\n\n"), contents
 }
 
+func geminiToolsFromProtocol(tools []ToolDefinition) []geminiTool {
+	declarations := make([]geminiFunctionDeclaration, 0, len(tools))
+	for _, tool := range tools {
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			continue
+		}
+		declarations = append(declarations, geminiFunctionDeclaration{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+		})
+	}
+	if len(declarations) == 0 {
+		return nil
+	}
+	return []geminiTool{{FunctionDeclarations: declarations}}
+}
+
+func rawJSONObjectMap(raw json.RawMessage) map[string]any {
+	object := map[string]any{}
+	_ = json.Unmarshal(normalizedJSONObject(raw), &object)
+	return object
+}
+
+func geminiFunctionResponsePayload(content string) map[string]any {
+	var value any
+	if json.Unmarshal([]byte(content), &value) == nil {
+		if object, ok := value.(map[string]any); ok {
+			return object
+		}
+		return map[string]any{"result": value}
+	}
+	return map[string]any{"result": content}
+}
+
 func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	toolIndex := 0
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -216,6 +347,22 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 			for _, part := range candidate.Content.Parts {
 				if part.Text != "" {
 					events <- StreamEvent{Type: "delta", Delta: part.Text}
+				}
+				if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.Name) != "" {
+					id := strings.TrimSpace(part.FunctionCall.ID)
+					if id == "" {
+						id = fmt.Sprintf("gemini-tool-%d", toolIndex)
+					}
+					toolIndex++
+					arguments, _ := json.Marshal(part.FunctionCall.Args)
+					events <- StreamEvent{Type: "tool_calls", ToolCalls: []ToolCall{{
+						ID:   id,
+						Type: "function",
+						Function: ToolCallFunction{
+							Name:      part.FunctionCall.Name,
+							Arguments: normalizedJSONObject(arguments),
+						},
+					}}}
 				}
 			}
 		}
@@ -272,12 +419,14 @@ type geminiModelsResponse struct {
 		OutputTokenLimit           int      `json:"outputTokenLimit"`
 		SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
 	} `json:"models"`
+	NextPageToken string `json:"nextPageToken"`
 }
 
 type geminiGenerateContentRequest struct {
 	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
 	Contents          []geminiContent        `json:"contents"`
 	GenerationConfig  geminiGenerationConfig `json:"generationConfig,omitempty"`
+	Tools             []geminiTool           `json:"tools,omitempty"`
 }
 
 type geminiGenerationConfig struct {
@@ -290,14 +439,82 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text string `json:"text"`
+	Text             string                  `json:"text,omitempty"`
+	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
+	InlineData       *geminiInlineData       `json:"inlineData,omitempty"`
+}
+
+type geminiInlineData struct {
+	MIMEType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+type geminiTool struct {
+	FunctionDeclarations []geminiFunctionDeclaration `json:"functionDeclarations"`
+}
+
+type geminiFunctionDeclaration struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type geminiFunctionCall struct {
+	ID   string         `json:"id,omitempty"`
+	Name string         `json:"name"`
+	Args map[string]any `json:"args"`
+}
+
+type geminiFunctionResponse struct {
+	ID       string         `json:"id,omitempty"`
+	Name     string         `json:"name"`
+	Response map[string]any `json:"response"`
 }
 
 type geminiStreamChunk struct {
-	Candidates []struct {
-		Content geminiContent `json:"content"`
-	} `json:"candidates"`
+	Candidates    []geminiCandidate    `json:"candidates"`
 	UsageMetadata *geminiUsageMetadata `json:"usageMetadata"`
+}
+
+type geminiGenerateContentResponse struct {
+	Candidates    []geminiCandidate    `json:"candidates"`
+	UsageMetadata *geminiUsageMetadata `json:"usageMetadata"`
+}
+
+type geminiCandidate struct {
+	Content      geminiContent `json:"content"`
+	FinishReason string        `json:"finishReason"`
+}
+
+func geminiCompletionFromCandidates(candidates []geminiCandidate) CompletionResult {
+	result := CompletionResult{}
+	if len(candidates) == 0 {
+		return result
+	}
+	var content strings.Builder
+	for index, part := range candidates[0].Content.Parts {
+		if part.Text != "" {
+			content.WriteString(part.Text)
+		}
+		if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.Name) != "" {
+			id := strings.TrimSpace(part.FunctionCall.ID)
+			if id == "" {
+				id = fmt.Sprintf("gemini-tool-%d", index)
+			}
+			arguments, _ := json.Marshal(part.FunctionCall.Args)
+			result.ToolCalls = append(result.ToolCalls, ToolCall{
+				ID:   id,
+				Type: "function",
+				Function: ToolCallFunction{
+					Name:      part.FunctionCall.Name,
+					Arguments: normalizedJSONObject(arguments),
+				},
+			})
+		}
+	}
+	result.Content = content.String()
+	return result
 }
 
 type geminiUsageMetadata struct {

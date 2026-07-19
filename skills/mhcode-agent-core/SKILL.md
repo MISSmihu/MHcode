@@ -1,115 +1,101 @@
 ---
 name: mhcode-agent-core
-description: 统一管理 MHcode Agent 的推理强度、Skills 加载、MCP schema 快照、工具调用、上下文组装、DeepSeek 前缀缓存命中率、tokens 成本和模型路由。用于设计或修改 MHcode Agent 执行流程、实现“推理：低/中/高/超高”菜单、优化 prompt_cache_hit_tokens、压缩工具结果、降低 tokens 费用、规划 96% 以上缓存命中率、接入 DeepSeek 官方或其他 AI 协议时。
+description: 统一管理 MHcode Agent 的推理强度、权限审批、结构化文件工具、Plan、AI 团队、Skills、MCP、上下文压缩、模型路由、项目记忆、rewind、DeepSeek 前缀缓存和多协议工具循环。用于修改 MHcode Agent 执行流程、工具注册、上下文组装、供应商协议、团队审阅或成本观测时。
 ---
 
 # MHcode Agent 核心
 
 ## 目标
 
-把 MHcode 的 Agent 执行组织成“可路由、可缓存、可观测、可控成本”的统一流程。默认目标是：
+把 MHcode Agent 组织成可路由、可缓存、可观测、可恢复、可审批的执行流程：
 
 - 推理强度支持 `低 / 中 / 高 / 超高`。
-- DeepSeek 等前缀缓存模型的命中率达到 `96%+`。
-- Skills、MCP 和工具调用不破坏稳定前缀。
-- 工具结果默认摘要化，原文用本地引用保存。
+- Skills、MCP schema 和工具注册不破坏稳定前缀。
+- 文件操作默认使用结构化工具，不把 Shell 当文件 API。
+- Plan、团队、记忆、rewind 和会话事件在重启与分支中保持一致。
+- DeepSeek 等前缀缓存模型记录命中率、tokens 和费用。
+- 权限边界先于工具调用，失败和取消必须进入明确终态。
+
+## 执行顺序
+
+保持以下顺序；第 1-7 项应尽量可复现，第 8-10 项才允许高频变化：
+
+1. MHcode 系统身份。
+2. 稳定 Agent 规则和权限边界。
+3. 当前推理强度与预算。
+4. Skills 索引；只按需加载完整 Skill。
+5. MCP schema 快照。
+6. 项目摘要和长期记忆摘要。
+7. 模型路由、上下文预算和故障转移策略。
+8. 当前用户输入。
+9. 工具调用参数和摘要结果。
+10. 输出要求、错误和重试信息。
+
+不要把用户输入、工具结果或临时判断插入稳定前缀中间。
 
 ## 推理强度
 
-UI 菜单必须支持四档：
-
-```text
-推理
-低
-中
-高
-超高  ✓
-```
-
 使用稳定枚举：
 
-```ts
+``ts
 type ReasoningLevel = "low" | "medium" | "high" | "ultra"
-```
+``
 
-中文展示：
+中文展示为：`低 / 中 / 高 / 超高`。四档同时影响工具调用上限、上下文策略、缓存策略和规划器：
 
-```ts
-const reasoningLabels = {
-  low: "低",
-  medium: "中",
-  high: "高",
-  ultra: "超高",
-} as const
-```
-
-默认值建议为 `ultra`。切换强度后只影响后续模型请求；如果任务正在运行，显示“下一轮生效”。
-
-### 四档策略
-
-`低`：简单问答、轻量改文案、格式化、小范围查询。限制工具调用，优先便宜模型。
-
-`中`：普通代码修改、单文件排查、小型重构。加载必要 Skills，使用标准上下文摘要。
-
-`高`：跨文件修改、架构判断、复杂 bug、测试修复。允许更多 MCP 工具调用和更强模型。
-
-`超高`：协议设计、Agent 架构、缓存策略、发布级检查。允许规划器 + 主模型组合，必须开启成本与缓存命中观测。
-
-执行预算参考：
-
-```json
+``json
 {
   "low": { "maxToolCalls": 3, "contextPolicy": "minimal", "cachePolicy": "reuse-prefix", "planner": false },
   "medium": { "maxToolCalls": 8, "contextPolicy": "task-summary", "cachePolicy": "reuse-prefix", "planner": false },
   "high": { "maxToolCalls": 16, "contextPolicy": "expanded", "cachePolicy": "stable-prefix", "planner": true },
   "ultra": { "maxToolCalls": 32, "contextPolicy": "full-relevant", "cachePolicy": "strict-stable-prefix", "planner": true }
 }
-```
+``
 
-## 上下文分层
+运行中切换只影响下一轮请求，并显示“下一轮生效”。不要让菜单成为没有执行效果的装饰。
 
-把请求拆成稳定前缀和易变尾部。
+## 权限与结构化工具
 
-稳定前缀必须保持顺序、文本和 schema 哈希稳定：
+所有工具先经过 `SandboxPolicy`、路径校验和 `ApprovalPolicy`：
 
-- 产品身份：MHcode、协议交换台、当前工作区策略。
-- 系统提示：Agent 行为边界、权限规则、输出格式。
-- 当前推理强度。
-- Skills 索引：只放 skill 名称、版本、触发条件和能力摘要。
-- MCP 工具目录：只放工具名、输入 schema 哈希、输出摘要格式。
-- 项目摘要：仓库结构、关键模块、最近稳定结论。
-- 路由规则：模型选择、预算墙、故障转移策略。
+- 检查工作区根目录和额外可写目录。
+- 检查只读/工作区写入权限、网络、Shell 和破坏性操作开关。
+- 应用超时、内存、CPU 和进程数限制。
+- 处理用户审批、取消和失败回滚。
+- Plan 阶段只使用只读工具；测试者和审阅者默认只读。
 
-易变尾部必须尽量短：
+文件读取、搜索、写入、补丁、复制和删除必须使用：
 
-- 用户本轮输入。
-- 最近 diff 或文件片段。
-- 工具调用参数。
-- 工具结果摘要。
-- 错误、重试和临时判断。
+``text
+read_file, file_info, list_dir, search,
+write_file, apply_patch, copy_file, delete_file
+``
 
-不要把用户输入、工具结果或临时判断插入稳定前缀中间。
+`run_command` 只用于构建、测试、编译器和确实需要执行的程序。不要通过 Shell 读取、枚举、搜索、写入、复制、移动或删除工作区文本文件。这样会绕过编码检测、路径策略、文件快照和 rewind。
 
-## Skills 加载
+Windows 文本规则：
 
-默认只注入 Skills 索引，不注入所有 Skills 正文。
+- 保留 UTF-8/BOM、UTF-16LE/BE、GB18030 和 CRLF/LF。
+- 新建 PowerShell 文件默认 UTF-8 BOM。
+- 新建 CMD/BAT 文件默认 GB18030 + CRLF。
+- 持久终端显式处理 UTF-8 输入输出，并检测 UTF-16/GB18030 输出。
 
-索引格式：
+## Skills 与 MCP
 
-```text
-skill: mhcode-agent-core
-version: 1
-trigger: 推理强度、缓存命中、MCP、工具调用、tokens 成本
-summary: 统一规划推理预算、稳定前缀、MCP schema 快照和工具结果摘要
-```
+常规上下文只放 Skill 索引：
 
-只有当任务真正触发某个 Skill 时，才加载完整 `SKILL.md`。加载后记录 `name + version + sha256`，同会话优先复用摘要，不重复注入大段正文。
+``text
+skill: name
+version: version
+trigger: 触发条件
+summary: 能力摘要
+``
 
-## MCP 策略
+触发后才加载完整 `SKILL.md`，并记录 `name + version + sha256`。同会话复用摘要，不重复注入长正文。
 
-MCP 工具不要每轮完整展开。生成稳定工具快照：
+MCP 只生成稳定 schema 快照：
 
-```json
+``json
 {
   "server": "filesystem",
   "tools_hash": "sha256:...",
@@ -121,81 +107,113 @@ MCP 工具不要每轮完整展开。生成稳定工具快照：
     }
   ]
 }
-```
+``
 
-只有当工具列表或 schema 变化时，才刷新快照。普通工具调用只放参数和结构化结果摘要。
+工具列表或 schema 改变时才刷新快照。工具结果先给结论、影响范围和下一步；保留文件路径/行号/对象 ID 等引用，长原文放本地引用。
 
-## 工具结果压缩
+## Plan 模式
 
-工具结果默认按以下顺序处理：
+Plan 是显式能力，不默认给每轮请求增加一次规划调用。
 
-1. 提取结论：成功/失败、影响范围、下一步。
-2. 保留索引：文件路径、行号、对象 ID、命令名。
-3. 压缩明细：长日志、长 JSON、长 diff 只保留关键片段。
-4. 存储原文：原始结果放本地引用，不重复进入模型上下文。
+当用户开启 Plan、当前档位允许规划、且工作区已配置时：
 
-摘要格式：
+1. 用只读工具探索工作区。
+2. 生成结构化计划。
+3. 请求用户批准。
+4. 批准后执行，按步骤更新状态。
+5. 拒绝、取消、失败和成功都写入明确终态。
 
-```json
-{
-  "tool": "shell_command",
-  "status": "success",
-  "summary": "typecheck 通过，但有 2 个 lint warning",
-  "refs": [
-    { "kind": "file", "path": "packages/app/src/main.ts", "line": 42 }
-  ],
-  "raw_result_id": "tool-result:2026-07-07-001"
-}
-```
+`task_progress` 是运行事件，必须在输入框上方作为独立状态渲染，不能混入助手正文或历史消息文本。
 
-## 缓存命中观测
+## AI 团队模式
 
-每次模型响应后记录：
+团队模式按角色协作，不把多个角色的长原文全部塞进主上下文：
+
+``text
+planner → implementer → tester / reviewer → synthesizer
+``
+
+- Planner 只读探索和拆分任务。
+- Implementer 执行批准后的修改。
+- Tester 运行检查并报告可复现结果。
+- Reviewer 默认只读，指出风险和缺失测试。
+- Synthesizer 汇总结果，不伪造未执行的检查。
+- 审阅反馈触发有限轮次修订。
+- 任一角色取消、超时或失败都必须更新团队和计划终态。
+- 每个角色可以使用独立供应商/模型，但共享结构化 artifact 摘要，不重复注入完整对话。
+
+## 上下文压缩
+
+根据当前模型真实上下文窗口扣除输出、工具和安全预留，得到输入预算。达到推理策略阈值时自动压缩：
+
+- 先发 `context_compression/running`。
+- 保留稳定 system 前缀、当前用户请求、最近完整对话组和未拆分的 tool call/result 对。
+- 把旧历史合并为一条压缩记忆。
+- 完成事件包含 before/after tokens、移除消息数和目标预算。
+- 失败时回滚本轮，不能静默丢消息。
+- 压缩只影响发给模型的上下文；事件日志、checkpoint、rewind 和分支保留完整原始历史。
+
+模型上下文来源优先级是：上游返回、手动设置、精确模型目录、协议默认、供应商默认、安全兜底。不要把未知模型直接显示为虚假的大窗口。
+
+## 缓存命中与路由
+
+请求稳定前缀包含系统身份、Agent 规则、推理强度、Skill 索引、MCP schema、项目摘要和路由策略。易变尾部包含用户输入、diff、工具参数、工具摘要、错误和重试。
+
+每次模型响应记录：
 
 - `prompt_cache_hit_tokens`
 - `prompt_cache_miss_tokens`
 - `input_tokens`
 - `output_tokens`
-- `cache_hit_rate = hit / (hit + miss)`
+- `cache_hit_rate`
 - `effective_cost`
 
-如果 `cache_hit_rate < 0.96`，优先检查：
+命中率低于目标时先检查上下文顺序、schema 稳定性、Skill 重复注入和工具结果长度，再考虑换模型或改价格策略。
 
-- 是否每轮重复注入完整 Skills 正文。
-- MCP schema 是否顺序不稳定。
-- 工具结果是否直接塞入原文。
-- 项目摘要是否频繁重写。
-- 推理强度切换是否重排了稳定前缀。
-- 用户尾部内容是否被插入到前缀中间。
+## 协议与工具循环
 
-达不到 96% 命中率时，先优化上下文结构，再讨论模型单价。
+协议差异必须留在 `internal/protocol`。新增协议至少测试：
 
-## 模型路由
+- 认证、模型列表和上下文窗口。
+- 流式文本、结束事件和空响应。
+- 原生工具调用参数的累积、归一化和错误。
+- usage/cache 字段映射。
+- EOF、超时、限流、余额不足和部分工具成功。
+- 失败转移不重复追加用户消息、不破坏会话状态。
 
-推理强度、预算墙、缓存命中率和任务风险共同决定模型路由。
+Agent 工具循环应返回结构化 `Summary`、`Parts`、变更快照和必要附件；模型失败但工具已经成功时，保留可用结果并明确告知用户，不伪造最终答案。
 
-默认顺序：
+## 记忆、事件和 rewind
 
-1. DeepSeek 官方通道。
-2. OpenAI 兼容通道。
-3. 聚合路由。
-4. 本地模型兜底。
+项目长期记忆是项目级摘要，不是把所有历史重新注入每轮上下文。遵守：
 
-`超高` 可以启用规划器 + 主模型组合，但不得破坏稳定前缀。
+- 按设置限制会话数和字符数。
+- 会话内冻结的摘要在当前分支复用。
+- Rewind 移动当前 head，不删除旧事件。
+- 从旧消息继续时自然形成新分支。
+- 文件写入立即记录前后快照、编码和行尾。
+- 删除项目不删除用户源工作区；必要时迁移到临时 `MHcodeProject`。
 
-## 执行顺序
+## 修改与验证
 
-推荐请求组装顺序：
+修改 Agent 流程时同步检查：
 
-1. MHcode 系统身份。
-2. 稳定 Agent 规则。
-3. 当前推理强度。
-4. Skills 索引。
-5. MCP schema 快照。
-6. 项目摘要。
-7. 路由和预算策略。
-8. 用户本轮输入。
-9. 工具调用摘要。
-10. 输出要求。
+1. Go 类型、权限和持久化迁移。
+2. 工具 schema 与注册顺序。
+3. 协议 mock 和流式错误测试。
+4. 前端事件类型、加载态、失败态和空态。
+5. 稳定前缀和上下文预算。
+6. Plan/团队取消、失败和恢复。
+7. 事件日志、rewind 和重启恢复。
 
-保持 1-7 项可复现，8-10 项才允许高频变化。
+至少运行：
+
+``powershell
+cd frontend
+bun.cmd run check
+cd ..
+go test ./... -count=1
+go vet ./...
+``
+
+涉及 Wails API、浏览器原生表面、Windows 进程控制或打包时追加 `wails build -clean`。

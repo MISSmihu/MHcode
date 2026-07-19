@@ -8,16 +8,42 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	xhtml "golang.org/x/net/html"
 )
+
+const (
+	openAICompatibleMaxAttempts = 3
+	openAICompatibleRetryDelay  = 300 * time.Millisecond
+)
+
+var defaultOpenAICompatibleHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   12 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
 
 type OpenAICompatibleProvider struct {
 	BaseURL       string
 	APIKey        string
 	ProviderID    string
 	DisplayName   string
+	APIType       string
 	HTTPClient    *http.Client
 	AllowNoAuth   bool
 	ExtraHeaders  string
@@ -39,15 +65,7 @@ func (p OpenAICompatibleProvider) ListModels(ctx context.Context) ([]Model, erro
 		return nil, errors.New("OpenAI-compatible API Key is required")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint("/models"), nil)
-	if err != nil {
-		return nil, err
-	}
-	p.applyHeaders(req, "")
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return nil, err
-	}
-	resp, err := p.client().Do(req)
+	resp, err := p.doRequestWithRetry(ctx, http.MethodGet, "/models", nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI-compatible models request failed: %w", err)
 	}
@@ -74,6 +92,9 @@ func (p OpenAICompatibleProvider) ListModels(ctx context.Context) ([]Model, erro
 }
 
 func (p OpenAICompatibleProvider) Stream(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error) {
+	if strings.EqualFold(strings.TrimSpace(p.APIType), "responses") {
+		return p.streamResponses(ctx, request)
+	}
 	if strings.TrimSpace(p.BaseURL) == "" {
 		return nil, errors.New("OpenAI-compatible base url is required")
 	}
@@ -86,29 +107,21 @@ func (p OpenAICompatibleProvider) Stream(ctx context.Context, request ChatReques
 
 	body := openAIChatRequest{
 		Model:         request.Model,
-		Messages:      request.Messages,
+		Messages:      openAIMessagesFromProtocol(request.Messages),
 		Temperature:   request.Temperature,
 		Stream:        true,
-		StreamOptions: openAIStreamOptions{IncludeUsage: true},
+		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
+		Tools:         request.Tools,
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options", "tools"))
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/chat/completions"), bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
-	}
-	p.applyHeaders(req, "text/event-stream")
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return nil, err
-	}
-
-	resp, err := p.client().Do(req)
+	resp, err := p.doRequestWithRetry(ctx, http.MethodPost, "/chat/completions", encoded, "text/event-stream")
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI-compatible chat request failed: %w", err)
 	}
@@ -126,6 +139,63 @@ func (p OpenAICompatibleProvider) Stream(ctx context.Context, request ChatReques
 	return events, nil
 }
 
+// Complete 实现 ToolCaller：非流式补全以可靠解析 tool_calls。
+func (p OpenAICompatibleProvider) Complete(ctx context.Context, request ChatRequest) (CompletionResult, error) {
+	if strings.EqualFold(strings.TrimSpace(p.APIType), "responses") {
+		return p.completeResponses(ctx, request)
+	}
+	if strings.TrimSpace(p.BaseURL) == "" {
+		return CompletionResult{}, errors.New("OpenAI-compatible base url is required")
+	}
+	if strings.TrimSpace(p.APIKey) == "" && !p.AllowNoAuth {
+		return CompletionResult{}, errors.New("OpenAI-compatible API Key is required")
+	}
+	if strings.TrimSpace(request.Model) == "" {
+		return CompletionResult{}, errors.New("OpenAI-compatible model is required")
+	}
+
+	body := openAIChatRequest{
+		Model:       request.Model,
+		Messages:    openAIMessagesFromProtocol(request.Messages),
+		Temperature: request.Temperature,
+		Stream:      false,
+		Tools:       request.Tools,
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "tools"))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	resp, err := p.doRequestWithRetry(ctx, http.MethodPost, "/chat/completions", encoded, "application/json")
+	if err != nil {
+		return CompletionResult{}, fmt.Errorf("OpenAI-compatible chat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return CompletionResult{}, openAICompatibleAPIError(resp)
+	}
+
+	var payload openAICompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return CompletionResult{}, fmt.Errorf("decode OpenAI-compatible completion: %w", err)
+	}
+	if len(payload.Choices) == 0 {
+		return CompletionResult{}, errors.New("OpenAI-compatible 返回空 choices")
+	}
+	msg := payload.Choices[0].Message
+	result := CompletionResult{
+		Content:   msg.Content,
+		ToolCalls: msg.ToolCalls,
+	}
+	if payload.Usage != nil {
+		result.Usage = payload.Usage.toTokenUsage()
+	}
+	return result, nil
+}
+
 func (p OpenAICompatibleProvider) endpoint(path string) string {
 	return strings.TrimRight(strings.TrimSpace(p.BaseURL), "/") + path
 }
@@ -134,7 +204,90 @@ func (p OpenAICompatibleProvider) client() *http.Client {
 	if p.HTTPClient != nil {
 		return p.HTTPClient
 	}
-	return &http.Client{Timeout: 45 * time.Second}
+	return defaultOpenAICompatibleHTTPClient
+}
+
+func (p OpenAICompatibleProvider) doRequestWithRetry(
+	ctx context.Context,
+	method string,
+	path string,
+	body []byte,
+	accept string,
+) (*http.Response, error) {
+	client := p.client()
+	var lastErr error
+	for attempt := 1; attempt <= openAICompatibleMaxAttempts; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, p.endpoint(path), reader)
+		if err != nil {
+			return nil, err
+		}
+		p.applyHeaders(req, accept)
+		if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+			return nil, err
+		}
+
+		resp, err := client.Do(req)
+		if err == nil {
+			if shouldRetryOpenAICompatibleStatus(resp.StatusCode) && attempt < openAICompatibleMaxAttempts {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+				_ = resp.Body.Close()
+				if err := sleepBeforeOpenAICompatibleRetry(ctx, attempt); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return resp, nil
+		}
+
+		lastErr = err
+		if !isRetryableOpenAICompatibleError(err) || attempt == openAICompatibleMaxAttempts {
+			return nil, err
+		}
+		if err := sleepBeforeOpenAICompatibleRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func shouldRetryOpenAICompatibleStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusInternalServerError ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func isRetryableOpenAICompatibleError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "server closed idle connection") ||
+		strings.Contains(message, "unexpected eof")
+}
+
+func sleepBeforeOpenAICompatibleRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(time.Duration(attempt) * openAICompatibleRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (p OpenAICompatibleProvider) applyHeaders(req *http.Request, accept string) {
@@ -150,6 +303,8 @@ func (p OpenAICompatibleProvider) applyHeaders(req *http.Request, accept string)
 func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	toolCalls := map[int]*streamToolCallAccumulator{}
+	toolCallsEmitted := false
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -167,6 +322,9 @@ func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events cha
 			continue
 		}
 		if payload == "[DONE]" {
+			if !toolCallsEmitted {
+				emitAccumulatedToolCalls(events, toolCalls)
+			}
 			events <- StreamEvent{Type: "done"}
 			return
 		}
@@ -180,6 +338,14 @@ func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events cha
 			if choice.Delta.Content != "" {
 				events <- StreamEvent{Type: "delta", Delta: choice.Delta.Content}
 			}
+			accumulateToolCallDeltas(toolCalls, choice.Delta.ToolCalls)
+			if choice.FinishReason != "" {
+				if len(toolCalls) > 0 && !toolCallsEmitted {
+					emitAccumulatedToolCalls(events, toolCalls)
+					toolCallsEmitted = true
+				}
+				events <- StreamEvent{Type: "finish", FinishReason: choice.FinishReason}
+			}
 		}
 		if chunk.Usage != nil {
 			events <- StreamEvent{Type: "usage", Usage: chunk.Usage.toTokenUsage()}
@@ -189,6 +355,9 @@ func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events cha
 		events <- StreamEvent{Type: "error", Error: "读取 OpenAI-compatible 流式响应失败: " + err.Error()}
 		return
 	}
+	if !toolCallsEmitted {
+		emitAccumulatedToolCalls(events, toolCalls)
+	}
 	events <- StreamEvent{Type: "done"}
 }
 
@@ -197,14 +366,74 @@ func openAICompatibleAPIError(resp *http.Response) error {
 	var envelope openAIErrorEnvelope
 	_ = json.Unmarshal(body, &envelope)
 
-	detail := strings.TrimSpace(envelope.Error.Message)
+	detail := compactOpenAICompatibleError(envelope.Error.Message)
 	if detail == "" {
-		detail = strings.TrimSpace(string(body))
+		detail = compactOpenAICompatibleError(string(body))
 	}
 	if detail == "" {
 		return fmt.Errorf("OpenAI-compatible request failed (HTTP %d)", resp.StatusCode)
 	}
 	return fmt.Errorf("OpenAI-compatible request failed: %s (HTTP %d)", detail, resp.StatusCode)
+}
+
+func compactOpenAICompatibleError(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "<!doctype html") || strings.HasPrefix(lower, "<html") {
+		if document, err := xhtml.Parse(strings.NewReader(value)); err == nil {
+			fragments := make([]string, 0, 2)
+			seen := map[string]bool{}
+			var walk func(*xhtml.Node)
+			walk = func(node *xhtml.Node) {
+				if node.Type == xhtml.ElementNode && (node.Data == "title" || node.Data == "h1") {
+					text := compactHTMLNodeText(node)
+					if text != "" && !seen[text] {
+						seen[text] = true
+						fragments = append(fragments, text)
+					}
+				}
+				for child := node.FirstChild; child != nil; child = child.NextSibling {
+					walk(child)
+				}
+			}
+			walk(document)
+			if len(fragments) > 0 {
+				value = strings.Join(fragments, " · ")
+			} else {
+				value = compactHTMLNodeText(document)
+			}
+		}
+	} else {
+		value = strings.Join(strings.Fields(value), " ")
+	}
+	const maxRunes = 220
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "…"
+	}
+	return value
+}
+
+func compactHTMLNodeText(root *xhtml.Node) string {
+	if root == nil {
+		return ""
+	}
+	var text strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(node *xhtml.Node) {
+		if node.Type == xhtml.TextNode {
+			text.WriteByte(' ')
+			text.WriteString(node.Data)
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	return strings.Join(strings.Fields(text.String()), " ")
 }
 
 func openAICompatibleDisplayName(id string) string {
@@ -229,12 +458,17 @@ func openAICompatibleModelFromPayload(payload json.RawMessage, providerID string
 	if id == "" {
 		return Model{}
 	}
-	return Model{
+	contextWindowTokens := openAICompatibleContextWindow(item)
+	model := Model{
 		ID:                  id,
 		DisplayName:         openAICompatibleDisplayName(id),
 		Provider:            providerID,
-		ContextWindowTokens: openAICompatibleContextWindow(item),
+		ContextWindowTokens: contextWindowTokens,
 	}
+	if contextWindowTokens > 0 {
+		model.ContextWindowSource = "upstream"
+	}
+	return model
 }
 
 func openAICompatibleContextWindow(item map[string]any) int {
@@ -290,11 +524,60 @@ func positiveIntFromAny(value any) int {
 }
 
 type openAIChatRequest struct {
-	Model         string              `json:"model"`
-	Messages      []Message           `json:"messages"`
-	Temperature   float64             `json:"temperature,omitempty"`
-	Stream        bool                `json:"stream"`
-	StreamOptions openAIStreamOptions `json:"stream_options,omitempty"`
+	Model         string               `json:"model"`
+	Messages      []openAIMessage      `json:"messages"`
+	Temperature   float64              `json:"temperature,omitempty"`
+	Stream        bool                 `json:"stream"`
+	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
+	Tools         []ToolDefinition     `json:"tools,omitempty"`
+}
+
+type openAIMessage struct {
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+type openAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+}
+
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
+func openAIMessagesFromProtocol(messages []Message) []openAIMessage {
+	converted := make([]openAIMessage, 0, len(messages))
+	for _, message := range messages {
+		content := any(message.Content)
+		if len(message.Attachments) > 0 {
+			parts := make([]openAIContentPart, 0, len(message.Attachments)+1)
+			if message.Content != "" {
+				parts = append(parts, openAIContentPart{Type: "text", Text: message.Content})
+			}
+			for _, attachment := range message.Attachments {
+				parts = append(parts, openAIContentPart{
+					Type: "image_url",
+					ImageURL: &openAIImageURL{
+						URL: "data:" + attachment.MIMEType + ";base64," + attachment.Data,
+					},
+				})
+			}
+			content = parts
+		}
+		converted = append(converted, openAIMessage{
+			Role:       message.Role,
+			Content:    content,
+			ToolCalls:  message.ToolCalls,
+			ToolCallID: message.ToolCallID,
+			Name:       message.Name,
+		})
+	}
+	return converted
 }
 
 type openAIStreamOptions struct {
@@ -304,8 +587,22 @@ type openAIStreamOptions struct {
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string                `json:"content"`
+			ToolCalls []streamToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *openAIUsage `json:"usage"`
+}
+
+// openAICompletionResponse 是非流式补全响应（含 tool_calls）。
+type openAICompletionResponse struct {
+	Choices []struct {
+		Message struct {
+			Content   string     `json:"content"`
+			ToolCalls []ToolCall `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *openAIUsage `json:"usage"`
 }

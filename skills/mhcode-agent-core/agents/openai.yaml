@@ -1,4 +1,4 @@
 interface:
-  display_name: "MHcode Agent 核心"
-  short_description: "统一管理推理强度、Skills、MCP、工具调用、缓存命中和成本控制。"
-  default_prompt: "请使用 MHcode Agent 核心 Skill 设计一次低成本、高缓存命中的 Agent 执行流程。"
+display_name: "MHcode Agent 核心"
+short_description: "统一管理权限、结构化工具、Plan、团队、记忆、上下文和多协议工具循环。"
+default_prompt: "请按 MHcode Agent 核心规则完成任务：先检查权限和上下文预算，再使用结构化工具；需要时采用 Plan 或团队模式，并保留可恢复的事件状态。"

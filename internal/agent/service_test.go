@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +13,37 @@ import (
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
+	"github.com/MISSmihu/MHcode/internal/vault"
 )
+
+// requestIsStream 探测 OpenAI 风格请求体的 stream 字段，用于测试 mock 双模式应答。
+func requestIsStream(body []byte) bool {
+	var probe struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	return probe.Stream
+}
+
+// writeOpenAIReply 按 stream 标志写 SSE 或非流式 JSON 补全响应（choices[].message）。
+// content 为回复文本，usageJSON 为可选的 usage 对象 JSON（为空则不带）。
+func writeOpenAIReply(w http.ResponseWriter, stream bool, content, usageJSON string) {
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", content)
+		if usageJSON != "" {
+			_, _ = fmt.Fprintf(w, "data: {\"choices\":[],\"usage\":%s}\n\n", usageJSON)
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if usageJSON != "" {
+		_, _ = fmt.Fprintf(w, "{\"choices\":[{\"message\":{\"content\":%q}}],\"usage\":%s}", content, usageJSON)
+	} else {
+		_, _ = fmt.Fprintf(w, "{\"choices\":[{\"message\":{\"content\":%q}}]}", content)
+	}
+}
 
 func TestServiceDeepSeekKeyLifecycle(t *testing.T) {
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
@@ -194,10 +226,9 @@ func TestServiceSendDeepSeekMessageUpdatesUsage(t *testing.T) {
 		if r.URL.Path != "/chat/completions" {
 			t.Fatalf("path = %s, want /chat/completions", r.URL.Path)
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":12,\"total_tokens\":112,\"prompt_cache_hit_tokens\":96,\"prompt_cache_miss_tokens\":4}}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		body, _ := io.ReadAll(r.Body)
+		writeOpenAIReply(w, requestIsStream(body), "hello",
+			"{\"prompt_tokens\":100,\"completion_tokens\":12,\"total_tokens\":112,\"prompt_cache_hit_tokens\":96,\"prompt_cache_miss_tokens\":4}")
 	}))
 	defer server.Close()
 
@@ -297,16 +328,15 @@ func TestServiceSendsMessageThroughSelectedOpenAICompatibleProvider(t *testing.T
 			t.Fatalf("authorization = %q", got)
 		}
 		var payload struct {
-			Model string `json:"model"`
+			Model  string `json:"model"`
+			Stream bool   `json:"stream"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		receivedModel = payload.Model
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"from upstream\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		writeOpenAIReply(w, payload.Stream, "from upstream",
+			"{\"prompt_tokens\":42,\"completion_tokens\":7,\"total_tokens\":49}")
 	}))
 	defer server.Close()
 
@@ -431,8 +461,11 @@ func TestServiceSendsMessageThroughNativeAnthropicAndGeminiProviders(t *testing.
 				if r.URL.Path != "/models/gemini-custom:streamGenerateContent" {
 					t.Fatalf("path = %s, want gemini stream path", r.URL.Path)
 				}
-				if got := r.URL.Query().Get("key"); got != "sk-gemini" {
-					t.Fatalf("key = %q", got)
+				if got := r.URL.Query().Get("key"); got != "" {
+					t.Fatalf("API key leaked into query: %q", got)
+				}
+				if got := r.Header.Get("x-goog-api-key"); got != "sk-gemini" {
+					t.Fatalf("x-goog-api-key = %q", got)
 				}
 				if got := r.Header.Get("X-Route"); got != "mhcode" {
 					t.Fatalf("X-Route = %q", got)
@@ -495,6 +528,7 @@ func TestServiceMapsReasoningToDeepSeekThinking(t *testing.T) {
 			Type string `json:"type"`
 		} `json:"thinking"`
 		ReasoningEffort string `json:"reasoning_effort"`
+		Stream          bool   `json:"stream"`
 	}
 	var payloads []requestPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -512,9 +546,7 @@ func TestServiceMapsReasoningToDeepSeekThinking(t *testing.T) {
 		payloads = append(payloads, payload)
 		mu.Unlock()
 
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		writeOpenAIReply(w, payload.Stream, "ok", "")
 	}))
 	defer server.Close()
 
@@ -568,6 +600,7 @@ func TestServiceSendDeepSeekMessageReusesAppendOnlySession(t *testing.T) {
 		}
 		var payload struct {
 			Messages []protocol.Message `json:"messages"`
+			Stream   bool               `json:"stream"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -581,9 +614,7 @@ func TestServiceSendDeepSeekMessageReusesAppendOnlySession(t *testing.T) {
 		requests = append(requests, cloneProtocolMessages(payload.Messages))
 		mu.Unlock()
 
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", reply)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		writeOpenAIReply(w, payload.Stream, reply, "")
 	}))
 	defer server.Close()
 
@@ -653,10 +684,9 @@ func TestServiceSendDeepSeekMessageReusesAppendOnlySession(t *testing.T) {
 
 func TestServiceResetDeepSeekSessionClearsSessionAndMetrics(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":12,\"total_tokens\":112,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		body, _ := io.ReadAll(r.Body)
+		writeOpenAIReply(w, requestIsStream(body), "hello",
+			"{\"prompt_tokens\":100,\"completion_tokens\":12,\"total_tokens\":112,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}")
 	}))
 	defer server.Close()
 
@@ -704,9 +734,8 @@ func TestServiceResetDeepSeekSessionClearsSessionAndMetrics(t *testing.T) {
 
 func TestServiceSanitizesInternalPrefixLeak(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"stable_prefix: product_identity secret\"}}]}\n\n"))
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		body, _ := io.ReadAll(r.Body)
+		writeOpenAIReply(w, requestIsStream(body), "stable_prefix: product_identity secret", "")
 	}))
 	defer server.Close()
 
@@ -751,6 +780,128 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "cache_prefix_hash=sha256:") {
 		t.Fatalf("stable prompt should keep prefix hash for observability: %q", prompt)
+	}
+}
+
+func TestDeleteModelProviderPersistsRemovalAndClearsSecret(t *testing.T) {
+	settingsPath := t.TempDir() + "/runtime-settings.json"
+	secrets := vault.NewMemoryVault()
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath, Vault: secrets})
+	if _, err := service.SaveDeepSeekAPIKey("sk-delete-me"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := service.DeleteModelProvider("deepseek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := findModelProvider(state.RuntimeSettings.Model.Providers, "deepseek"); ok {
+		t.Fatal("deleted DeepSeek provider is still present")
+	}
+	if state.RuntimeSettings.Model.SelectedProviderID == "deepseek" {
+		t.Fatal("selected route still points to deleted provider")
+	}
+	if _, err := secrets.Get(secretServiceName, providerSecretAccountName("deepseek")); !errors.Is(err, vault.ErrSecretNotFound) {
+		t.Fatalf("secret lookup error = %v, want ErrSecretNotFound", err)
+	}
+
+	reloaded := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath, Vault: secrets})
+	if _, _, ok := findModelProvider(reloaded.WorkbenchState().RuntimeSettings.Model.Providers, "deepseek"); ok {
+		t.Fatal("deleted default provider was restored after reload")
+	}
+}
+
+func TestDeleteLastModelProviderLeavesEmptyConfiguration(t *testing.T) {
+	settingsPath := t.TempDir() + "/runtime-settings.json"
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath, Vault: vault.NewMemoryVault()})
+	for _, providerID := range []string{"deepseek", "openai-compatible", "local-openai"} {
+		if _, err := service.DeleteModelProvider(providerID); err != nil {
+			t.Fatalf("delete %s: %v", providerID, err)
+		}
+	}
+	state := service.WorkbenchState()
+	if len(state.RuntimeSettings.Model.Providers) != 0 {
+		t.Fatalf("providers = %#v, want empty", state.RuntimeSettings.Model.Providers)
+	}
+	if state.RuntimeSettings.Model.SelectedProviderID != "" || state.RuntimeSettings.Model.SelectedModelID != "" {
+		t.Fatalf("selected route = %q/%q, want empty", state.RuntimeSettings.Model.SelectedProviderID, state.RuntimeSettings.Model.SelectedModelID)
+	}
+
+	reloaded := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath, Vault: vault.NewMemoryVault()})
+	if len(reloaded.WorkbenchState().RuntimeSettings.Model.Providers) != 0 {
+		t.Fatal("empty provider configuration was repopulated after reload")
+	}
+}
+
+func TestSendChatMessageWithEventsEmitsDeltas(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	sessions := t.TempDir()
+	config := ServiceConfig{SkillsDir: t.TempDir(), DeepSeekBaseURL: server.URL, SessionsDir: sessions}
+	service := NewService(config)
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	var deltas []string
+	result, err := service.SendChatMessageWithEvents(context.Background(), "ping", func(event ChatStreamEvent) {
+		if event.Type == "delta" {
+			deltas = append(deltas, event.Delta)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "hello world" {
+		t.Fatalf("content = %q", result.Content)
+	}
+	if strings.Join(deltas, "") != result.Content || len(deltas) != 2 {
+		t.Fatalf("deltas = %#v, result = %q", deltas, result.Content)
+	}
+}
+
+func TestSendChatMessageWithEventsCancellationRollsBackTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	sessions := t.TempDir()
+	config := ServiceConfig{SkillsDir: t.TempDir(), DeepSeekBaseURL: server.URL, SessionsDir: sessions}
+	service := NewService(config)
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := service.SendChatMessageWithEvents(ctx, "cancel me", func(event ChatStreamEvent) {
+		if event.Type == "delta" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if service.sessionState.TurnCount != 0 {
+		t.Fatalf("turn count = %d after cancelled turn", service.sessionState.TurnCount)
+	}
+	if len(service.sessionMessages) == 0 || service.sessionMessages[len(service.sessionMessages)-1].Role == "user" {
+		t.Fatalf("cancelled user message was not rolled back: %#v", service.sessionMessages)
+	}
+	reloaded := NewService(config)
+	for _, message := range reloaded.GetSessionMessages() {
+		if message.Content == "cancel me" {
+			t.Fatalf("cancelled message survived restart: %#v", message)
+		}
 	}
 }
 

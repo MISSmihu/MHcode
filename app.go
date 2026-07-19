@@ -2,28 +2,111 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/agent"
+	"github.com/MISSmihu/MHcode/internal/browserengine"
+	"github.com/MISSmihu/MHcode/internal/computercontrol"
+	"github.com/MISSmihu/MHcode/internal/storage"
+	"github.com/MISSmihu/MHcode/internal/terminal"
+	"github.com/MISSmihu/MHcode/internal/vault"
+	"github.com/MISSmihu/MHcode/internal/workspacegit"
+	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
-	ctx     context.Context
-	service *agent.Service
+	ctx               context.Context
+	service           *agent.Service
+	preview           *workspacePreviewServer
+	browser           *browserengine.Service
+	computer          *computercontrol.Service
+	chat              chatTaskRunner
+	terminal          *terminal.Manager
+	git               workspacegit.Service
+	runtimeSettingsMu sync.RWMutex
+	runtimeSettings   agent.RuntimeSettings
 }
 
 func NewApp() *App {
-	return &App{
-		service: agent.NewService(agent.ServiceConfig{
-			SkillsDir:    "skills",
-			SettingsPath: runtimeSettingsPath(),
-		}),
+	usageStore, usageStoreErr := storage.Open(usageDatabasePath())
+	usageStoreError := ""
+	if usageStoreErr != nil {
+		usageStoreError = usageStoreErr.Error()
 	}
+	app := &App{
+		preview:  newWorkspacePreviewServer(),
+		browser:  browserengine.New(browserProfileDir(), browserDownloadsDir()),
+		computer: computercontrol.New(),
+		terminal: terminal.NewManager(),
+	}
+	app.service = agent.NewService(agent.ServiceConfig{
+		SkillsDir:              "skills",
+		SkillsFS:               bundledSkills,
+		SettingsPath:           runtimeSettingsPath(),
+		SessionsDir:            sessionsDir(),
+		ProjectsPath:           projectsPath(),
+		TemporaryWorkspaceRoot: temporaryWorkspaceRoot(),
+		Vault:                  vault.NewOSVault(),
+		OpenFile:               openDesktopFile,
+		PreviewFile:            app.previewFileFromAgent,
+		RevealFile:             revealDesktopFile,
+		Browser:                &browserToolBridge{app: app},
+		Computer:               &computerToolBridge{app: app},
+		Git:                    app.git,
+		Terminal:               app.terminal,
+		UsageStore:             usageStore,
+		UsageStoreError:        usageStoreError,
+	})
+	initialSettings := app.service.WorkbenchState().RuntimeSettings
+	app.setRuntimeSettings(initialSettings)
+	_ = app.configureBrowser(initialSettings)
+	return app
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	if a.terminal != nil {
+		a.terminal.SetNotify(func(state terminal.SessionState) {
+			wruntime.EventsEmit(ctx, "terminal:update", state)
+		})
+	}
+	// 注入审批通知：工具循环需审批时，向前端发 "approval:request" 事件。
+	a.service.SetApprovalNotify(func(req agent.ApprovalRequest) {
+		wruntime.EventsEmit(ctx, "approval:request", req)
+	})
+	go func() {
+		connectCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		state := a.service.ConfigureMCP(connectCtx, "")
+		wruntime.EventsEmit(ctx, "mcp:state", state)
+	}()
+}
+
+func (a *App) shutdown(_ context.Context) {
+	a.cancelActiveChatTask("")
+	if a.terminal != nil {
+		a.terminal.SetNotify(nil)
+		a.terminal.Close()
+	}
+	clearDataPolicy := a.runtimeSettingsSnapshot().Browser.ClearDataPolicy
+	a.service.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if a.browser != nil {
+		if strings.EqualFold(clearDataPolicy, "session") {
+			_ = a.browser.ClearData(ctx)
+		} else {
+			_ = a.browser.Stop(ctx)
+		}
+	}
+	if a.preview != nil {
+		_ = a.preview.Close(ctx)
+	}
 }
 
 func (a *App) GetWorkbenchState() agent.WorkbenchState {
@@ -67,7 +150,89 @@ func (a *App) ResetDeepSeekSession() (agent.WorkbenchState, error) {
 }
 
 func (a *App) SaveRuntimeSettings(settings agent.RuntimeSettings) (agent.WorkbenchState, error) {
-	return a.service.SaveRuntimeSettings(settings)
+	previousSettings := a.runtimeSettingsSnapshot()
+	previousRoot := previousSettings.WorkspaceRoot
+	state, err := a.service.SaveRuntimeSettings(settings)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		if a.terminal != nil && previousSettings.ShellAccess && (!state.RuntimeSettings.ShellAccess ||
+			previousSettings.SandboxMode != state.RuntimeSettings.SandboxMode ||
+			previousSettings.MaxCommandMemoryMB != state.RuntimeSettings.MaxCommandMemoryMB ||
+			previousSettings.MaxCommandCPUPercent != state.RuntimeSettings.MaxCommandCPUPercent ||
+			previousSettings.MaxCommandProcesses != state.RuntimeSettings.MaxCommandProcesses) {
+			a.terminal.StopAll()
+		}
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+		if configureErr := a.configureBrowser(state.RuntimeSettings); configureErr != nil {
+			return state, configureErr
+		}
+		if strings.EqualFold(state.RuntimeSettings.Browser.ClearDataPolicy, "all") {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if clearErr := a.browser.ClearData(ctx); clearErr != nil {
+				return state, clearErr
+			}
+		}
+		mcpCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		state = a.service.ConfigureMCP(mcpCtx, "")
+		cancel()
+	}
+	return state, err
+}
+
+func (a *App) setRuntimeSettings(settings agent.RuntimeSettings) {
+	a.runtimeSettingsMu.Lock()
+	a.runtimeSettings = settings
+	a.runtimeSettingsMu.Unlock()
+}
+
+func (a *App) runtimeSettingsSnapshot() agent.RuntimeSettings {
+	a.runtimeSettingsMu.RLock()
+	defer a.runtimeSettingsMu.RUnlock()
+	return a.runtimeSettings
+}
+
+func (a *App) RefreshMCPServer(serverID string) agent.WorkbenchState {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return a.service.ConfigureMCP(ctx, serverID)
+}
+
+func (a *App) configureBrowser(settings agent.RuntimeSettings) error {
+	if a.browser == nil {
+		return nil
+	}
+	permissions := make([]browserengine.SitePermission, 0, len(settings.Browser.SitePermissions))
+	for _, permission := range settings.Browser.SitePermissions {
+		permissions = append(permissions, browserengine.SitePermission{
+			Origin:     permission.Origin,
+			Camera:     permission.Camera,
+			Microphone: permission.Microphone,
+			Clipboard:  permission.Clipboard,
+		})
+	}
+	return a.browser.Configure(browserengine.Settings{
+		Enabled:                settings.Browser.Enabled,
+		AllowNetwork:           settings.NetworkAccess,
+		NativePresentation:     true,
+		ClearDataPolicy:        settings.Browser.ClearDataPolicy,
+		ScreenshotAnnotations:  settings.Browser.ScreenshotAnnotations,
+		PasswordManagerEnabled: settings.Browser.PasswordManagerEnabled,
+		AutofillContactEnabled: settings.Browser.AutofillContactEnabled,
+		DeveloperCDPAccess:     settings.Browser.DeveloperCDPAccess,
+		SitePermissions:        permissions,
+		AutofillProfile: browserengine.AutofillProfile{
+			FullName:      settings.Browser.AutofillProfile.FullName,
+			Email:         settings.Browser.AutofillProfile.Email,
+			Phone:         settings.Browser.AutofillProfile.Phone,
+			Organization:  settings.Browser.AutofillProfile.Organization,
+			StreetAddress: settings.Browser.AutofillProfile.StreetAddress,
+			City:          settings.Browser.AutofillProfile.City,
+			Region:        settings.Browser.AutofillProfile.Region,
+			PostalCode:    settings.Browser.AutofillProfile.PostalCode,
+			Country:       settings.Browser.AutofillProfile.Country,
+		},
+	})
 }
 
 func (a *App) SaveModelProviderAPIKey(providerID string, apiKey string) (agent.WorkbenchState, error) {
@@ -78,6 +243,10 @@ func (a *App) ClearModelProviderAPIKey(providerID string) (agent.WorkbenchState,
 	return a.service.ClearModelProviderAPIKey(providerID)
 }
 
+func (a *App) DeleteModelProvider(providerID string) (agent.WorkbenchState, error) {
+	return a.service.DeleteModelProvider(providerID)
+}
+
 func (a *App) RefreshModelProviderModels(providerID string) (agent.WorkbenchState, error) {
 	ctx := a.ctx
 	if ctx == nil {
@@ -86,10 +255,281 @@ func (a *App) RefreshModelProviderModels(providerID string) (agent.WorkbenchStat
 	return a.service.RefreshModelProviderModels(ctx, providerID)
 }
 
+// ListCheckpoints 返回当前会话的可回退检查点（供前端 Timeline）。
+func (a *App) ListCheckpoints() []agent.CheckpointInfo {
+	return a.service.ListCheckpoints()
+}
+
+// RewindToCheckpoint 回退到指定检查点：对话与文件一起回退。
+func (a *App) RewindToCheckpoint(checkpointID string) (agent.WorkbenchState, error) {
+	return a.service.RewindToCheckpoint(checkpointID)
+}
+
+// ListBranches 返回所有对话线（分支）。
+func (a *App) ListBranches() []agent.BranchInfo {
+	return a.service.ListBranches()
+}
+
+// SwitchBranch 切换到另一条对话线（叶子），文件与对话一起切换。
+func (a *App) SwitchBranch(leafID string) (agent.WorkbenchState, error) {
+	return a.service.SwitchBranch(leafID)
+}
+
+// ForkFromMessage 从指定历史消息创建一条保留旧对话的新分支。
+func (a *App) ForkFromMessage(messageEventID string) (agent.WorkbenchState, error) {
+	if err := a.requireIdleChat("分叉对话"); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	return a.service.ForkFromMessage(messageEventID)
+}
+
+// RespondApproval 由前端在用户点击审批弹窗后调用。
+func (a *App) RespondApproval(id string, tool string, approved bool, scope string) error {
+	return a.service.RespondApproval(id, tool, approved, scope)
+}
+
+// SetPlanMode 开关 Plan 两段式（先规划后执行）。
+func (a *App) SetPlanMode(enabled bool) agent.WorkbenchState {
+	return a.service.SetPlanMode(enabled)
+}
+
+// --- 多项目 / 多会话 ---
+
+func (a *App) ListProjects() []agent.ProjectInfo { return a.service.ListProjects() }
+func (a *App) ListSessions() []agent.SessionInfo { return a.service.ListSessions() }
+
+// GetProjectTree 返回所有项目连带各自会话（Codex 式树状侧边栏）。
+func (a *App) GetProjectTree() []agent.ProjectNode { return a.service.GetProjectTree() }
+
+// GetSessionMessages 返回当前活动会话的历史消息（供启动/切换会话时恢复对话）。
+func (a *App) GetSessionMessages() []agent.SessionMessage {
+	return a.service.GetSessionMessages()
+}
+
+func (a *App) CreateProject(name string, workspaceRoot string) (agent.WorkbenchState, error) {
+	previousRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	state, err := a.service.CreateProject(name, workspaceRoot)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+	}
+	return state, err
+}
+func (a *App) SwitchProject(projectID string) (agent.WorkbenchState, error) {
+	previousRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	state, err := a.service.SwitchProject(projectID)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+	}
+	return state, err
+}
+func (a *App) SetProjectPinned(projectID string, pinned bool) (agent.WorkbenchState, error) {
+	return a.service.SetProjectPinned(projectID, pinned)
+}
+func (a *App) RenameProject(projectID string, name string) (agent.WorkbenchState, error) {
+	return a.service.RenameProject(projectID, name)
+}
+func (a *App) ArchiveProjectTasks(projectID string) (agent.WorkbenchState, error) {
+	if err := a.requireIdleChat("归档项目任务"); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	previousRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	state, err := a.service.ArchiveProjectTasks(projectID)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+	}
+	return state, err
+}
+func (a *App) RemoveProject(projectID string) (agent.WorkbenchState, error) {
+	if err := a.requireIdleChat("移除项目"); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	previousRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	state, err := a.service.RemoveProject(projectID)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+	}
+	return state, err
+}
+func (a *App) OpenProjectInFileManager(projectID string) error {
+	return a.service.OpenProjectInFileManager(projectID)
+}
+func (a *App) NewSession() (agent.WorkbenchState, error) {
+	return a.service.NewSession()
+}
+func (a *App) SwitchSession(sessionID string) (agent.WorkbenchState, error) {
+	return a.service.SwitchSession(sessionID)
+}
+func (a *App) ArchiveSession(sessionID string, archived bool) (agent.WorkbenchState, error) {
+	return a.service.ArchiveSession(sessionID, archived)
+}
+func (a *App) DeleteSession(sessionID string) (agent.WorkbenchState, error) {
+	if err := a.requireIdleChat("删除会话"); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	return a.service.DeleteSession(sessionID)
+}
+
+// SelectDirectory 弹出系统目录选择框，供"添加项目"选工作区根。
+func (a *App) SelectDirectory() (string, error) {
+	if a.ctx == nil {
+		return "", nil
+	}
+	return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{
+		Title: "选择项目工作区目录",
+	})
+}
+
+func (a *App) SelectWorktreeParentDirectory() (string, error) {
+	if a.ctx == nil {
+		return "", nil
+	}
+	return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{
+		Title: "选择永久工作树的父目录",
+	})
+}
+
+// OpenWorkspaceFile uses the operating system's default application after the
+// agent service verifies that the artifact belongs to the active workspace.
+func (a *App) OpenWorkspaceFile(path string) error {
+	return a.service.OpenWorkspaceFile(path)
+}
+
+// PreviewWorkspaceFile returns a loopback URL for the embedded browser. The
+// service validates the requested file against the active workspace first.
+func (a *App) PreviewWorkspaceFile(path string) (BrowserPreview, error) {
+	abs, err := a.service.ResolveWorkspaceFile(path)
+	if err != nil {
+		return BrowserPreview{}, err
+	}
+	if !isHTMLFile(abs) {
+		return BrowserPreview{}, fmt.Errorf("内置预览当前仅支持 HTML 文件")
+	}
+	settings := a.runtimeSettingsSnapshot()
+	if !settings.Browser.Enabled {
+		return BrowserPreview{}, fmt.Errorf("内置浏览器已在设置中关闭")
+	}
+	return a.previewResolvedWorkspaceFile(abs)
+}
+
+// RevealWorkspaceFile selects an artifact in the operating system file manager.
+func (a *App) RevealWorkspaceFile(path string) error {
+	return a.service.RevealWorkspaceFile(path)
+}
+
+func (a *App) previewFileFromAgent(path string) error {
+	if !isHTMLFile(path) {
+		return openDesktopFile(path)
+	}
+	settings := a.runtimeSettingsSnapshot().Browser
+	if !settings.Enabled || strings.EqualFold(settings.DefaultLocalURLDestination, "system") {
+		return openDesktopFile(path)
+	}
+	preview, err := a.previewResolvedWorkspaceFile(path)
+	if err != nil {
+		return err
+	}
+	preview.Ask = strings.EqualFold(settings.DefaultLocalURLDestination, "ask")
+	if a.ctx == nil {
+		return fmt.Errorf("MHcode 前端尚未就绪")
+	}
+	wruntime.EventsEmit(a.ctx, "browser:open", preview)
+	return nil
+}
+
+func (a *App) previewResolvedWorkspaceFile(path string) (BrowserPreview, error) {
+	if a.preview == nil {
+		return BrowserPreview{}, fmt.Errorf("内置浏览器预览服务不可用")
+	}
+	workspaceRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	preview, err := a.preview.Preview(workspaceRoot, path)
+	if err != nil {
+		return BrowserPreview{}, err
+	}
+	if a.browser != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		state, browserErr := a.browser.Open(ctx, preview.URL)
+		cancel()
+		if browserErr == nil {
+			preview.TabID = state.ActiveTabID
+			preview.Managed = true
+		}
+	}
+	return preview, nil
+}
+
+func (a *App) resetPreviewIfWorkspaceChanged(previousRoot, nextRoot string) {
+	if filepath.Clean(strings.TrimSpace(previousRoot)) == filepath.Clean(strings.TrimSpace(nextRoot)) {
+		return
+	}
+	a.preview.Reset()
+	if a.terminal != nil {
+		a.terminal.StopAll()
+	}
+	if a.ctx != nil {
+		wruntime.EventsEmit(a.ctx, "browser:close")
+	}
+}
+
 func runtimeSettingsPath() string {
 	configDir, err := os.UserConfigDir()
 	if err != nil || configDir == "" {
 		return "mhcode.runtime.json"
 	}
 	return filepath.Join(configDir, "MHcode", "runtime-settings.json")
+}
+
+// sessionsDir 返回会话事件日志的根目录。
+func sessionsDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "mhcode-sessions"
+	}
+	return filepath.Join(configDir, "MHcode", "sessions")
+}
+
+// projectsPath 返回项目清单 JSON 路径。
+func projectsPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "mhcode-projects.json"
+	}
+	return filepath.Join(configDir, "MHcode", "projects.json")
+}
+
+func temporaryWorkspaceRoot() string {
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, "MHcodeProject")
+	}
+	if configDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(configDir) != "" {
+		return filepath.Join(configDir, "MHcode", "MHcodeProject")
+	}
+	return filepath.Join(".", "MHcodeProject")
+}
+
+func usageDatabasePath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "mhcode.db"
+	}
+	return filepath.Join(configDir, "MHcode", "mhcode.db")
+}
+
+func browserProfileDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return filepath.Join(".mhcode", "browser-profile")
+	}
+	return filepath.Join(configDir, "MHcode", "browser-profile")
+}
+
+func browserDownloadsDir() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return filepath.Join(".mhcode", "downloads")
+	}
+	return filepath.Join(homeDir, "Downloads", "MHcode")
 }

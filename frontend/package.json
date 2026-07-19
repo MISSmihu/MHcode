@@ -5,14 +5,20 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test && vite build",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
+    "highlight.js": "^11.11.1",
     "lucide-solid": "^0.468.0",
+    "markdown-it": "^14.3.0",
     "solid-js": "^1.9.4"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
     "typescript": "^5.6.3",
     "vite": "^6.0.1",
     "vite-plugin-solid": "^2.10.2"

@@ -86,13 +86,17 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 	if strings.TrimSpace(request.Model) == "" {
 		return nil, errors.New("deepseek model is required")
 	}
+	if chatRequestHasAttachments(request) {
+		return nil, errors.New("DeepSeek 原生协议暂不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
+	}
 	body := deepSeekChatRequest{
 		Model:           request.Model,
 		Messages:        request.Messages,
 		Temperature:     request.Temperature,
 		Stream:          true,
-		StreamOptions:   deepSeekStreamOptions{IncludeUsage: true},
+		StreamOptions:   &deepSeekStreamOptions{IncludeUsage: true},
 		ReasoningEffort: request.ReasoningEffort,
+		Tools:           request.Tools,
 	}
 	if strings.TrimSpace(request.ThinkingMode) != "" {
 		body.Thinking = &deepSeekThinking{Type: request.ThinkingMode}
@@ -104,7 +108,7 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +129,69 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 		parseDeepSeekStream(ctx, resp.Body, events)
 	}()
 	return events, nil
+}
+
+// Complete 实现 ToolCaller：非流式补全，可靠解析 tool_calls。
+// 用于 agent 工具循环——流式增量拼 tool_calls 容易出错，非流式一次拿全更稳。
+func (p DeepSeekProvider) Complete(ctx context.Context, request ChatRequest) (CompletionResult, error) {
+	if strings.TrimSpace(p.APIKey) == "" {
+		return CompletionResult{}, errors.New("deepseek api key is required")
+	}
+	if strings.TrimSpace(request.Model) == "" {
+		return CompletionResult{}, errors.New("deepseek model is required")
+	}
+	if chatRequestHasAttachments(request) {
+		return CompletionResult{}, errors.New("DeepSeek 原生协议暂不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
+	}
+	body := deepSeekChatRequest{
+		Model:           request.Model,
+		Messages:        request.Messages,
+		Temperature:     request.Temperature,
+		Stream:          false,
+		ReasoningEffort: request.ReasoningEffort,
+		Tools:           request.Tools,
+	}
+	if strings.TrimSpace(request.ThinkingMode) != "" {
+		body.Thinking = &deepSeekThinking{Type: request.ThinkingMode}
+		if request.ThinkingMode == "disabled" {
+			body.ReasoningEffort = ""
+		}
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "tools"))
+	if err != nil {
+		return CompletionResult{}, err
+	}
+
+	resp, err := p.doRequestWithRetry(ctx, http.MethodPost, "/chat/completions", encoded, "application/json")
+	if err != nil {
+		return CompletionResult{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return CompletionResult{}, deepSeekAPIError(resp)
+	}
+
+	var payload deepSeekCompletionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return CompletionResult{}, fmt.Errorf("decode deepseek completion: %w", err)
+	}
+	if len(payload.Choices) == 0 {
+		return CompletionResult{}, errors.New("deepseek 返回空 choices")
+	}
+	msg := payload.Choices[0].Message
+	result := CompletionResult{
+		Content:   msg.Content,
+		Reasoning: msg.ReasoningContent,
+		ToolCalls: msg.ToolCalls,
+	}
+	if payload.Usage != nil {
+		result.Usage = payload.Usage.toTokenUsage()
+	}
+	return result, nil
 }
 
 func (p DeepSeekProvider) endpoint(path string) string {
@@ -260,6 +327,8 @@ func deepSeekNetworkError(err error, attempts int) error {
 func parseDeepSeekStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	toolCalls := map[int]*streamToolCallAccumulator{}
+	toolCallsEmitted := false
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -277,6 +346,9 @@ func parseDeepSeekStream(ctx context.Context, body io.Reader, events chan<- Stre
 			continue
 		}
 		if payload == "[DONE]" {
+			if !toolCallsEmitted {
+				emitAccumulatedToolCalls(events, toolCalls)
+			}
 			events <- StreamEvent{Type: "done"}
 			return
 		}
@@ -293,6 +365,14 @@ func parseDeepSeekStream(ctx context.Context, body io.Reader, events chan<- Stre
 			if choice.Delta.Content != "" {
 				events <- StreamEvent{Type: "delta", Delta: choice.Delta.Content}
 			}
+			accumulateToolCallDeltas(toolCalls, choice.Delta.ToolCalls)
+			if choice.FinishReason != "" {
+				if len(toolCalls) > 0 && !toolCallsEmitted {
+					emitAccumulatedToolCalls(events, toolCalls)
+					toolCallsEmitted = true
+				}
+				events <- StreamEvent{Type: "finish", FinishReason: choice.FinishReason}
+			}
 		}
 		if chunk.Usage != nil {
 			events <- StreamEvent{Type: "usage", Usage: chunk.Usage.toTokenUsage()}
@@ -305,6 +385,9 @@ func parseDeepSeekStream(ctx context.Context, body io.Reader, events chan<- Stre
 		}
 		events <- StreamEvent{Type: "error", Error: "读取 DeepSeek 流式响应失败: " + err.Error()}
 		return
+	}
+	if !toolCallsEmitted {
+		emitAccumulatedToolCalls(events, toolCalls)
 	}
 	events <- StreamEvent{Type: "done"}
 }
@@ -373,13 +456,14 @@ type deepSeekModelsResponse struct {
 }
 
 type deepSeekChatRequest struct {
-	Model           string                `json:"model"`
-	Messages        []Message             `json:"messages"`
-	Temperature     float64               `json:"temperature,omitempty"`
-	Thinking        *deepSeekThinking     `json:"thinking,omitempty"`
-	ReasoningEffort string                `json:"reasoning_effort,omitempty"`
-	Stream          bool                  `json:"stream"`
-	StreamOptions   deepSeekStreamOptions `json:"stream_options"`
+	Model           string                 `json:"model"`
+	Messages        []Message              `json:"messages"`
+	Temperature     float64                `json:"temperature,omitempty"`
+	Thinking        *deepSeekThinking      `json:"thinking,omitempty"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+	Stream          bool                   `json:"stream"`
+	StreamOptions   *deepSeekStreamOptions `json:"stream_options,omitempty"`
+	Tools           []ToolDefinition       `json:"tools,omitempty"`
 }
 
 type deepSeekStreamOptions struct {
@@ -393,9 +477,24 @@ type deepSeekThinking struct {
 type deepSeekStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Content          string                `json:"content"`
+			ReasoningContent string                `json:"reasoning_content"`
+			ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *deepSeekUsage `json:"usage"`
+}
+
+// deepSeekCompletionResponse 是非流式补全响应（含 tool_calls）。
+type deepSeekCompletionResponse struct {
+	Choices []struct {
+		Message struct {
+			Content          string     `json:"content"`
+			ReasoningContent string     `json:"reasoning_content"`
+			ToolCalls        []ToolCall `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *deepSeekUsage `json:"usage"`
 }

@@ -1,0 +1,1266 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/MISSmihu/MHcode/internal/protocol"
+	"github.com/MISSmihu/MHcode/internal/tools"
+)
+
+// normalizeToolArgs 归一化模型返回的工具参数。
+//
+// OpenAI/DeepSeek function-calling 标准：tool_call 的 arguments 是「被 JSON 编码成字符串
+// 的 JSON」，即 arguments 字段本身是一个字符串，如 "{\"path\":\".\"}"。
+// 我们收到的 json.RawMessage 因此是带引号的字符串字面量，直接 Unmarshal 进 struct 会报
+// "cannot unmarshal string into struct"。这里把这层字符串解开，还原为对象字节。
+// 若本就是对象（个别 provider 直接给对象），原样返回。
+func normalizeToolArgs(raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return json.RawMessage("{}")
+	}
+	// 已是 JSON 对象/数组 → 原样返回。
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		return raw
+	}
+	// 是被编码的字符串 → 先解出字符串内容（里面才是真正的 JSON）。
+	if trimmed[0] == '"' {
+		var inner string
+		if err := json.Unmarshal(raw, &inner); err == nil {
+			inner = strings.TrimSpace(inner)
+			if inner == "" {
+				return json.RawMessage("{}")
+			}
+			return json.RawMessage(inner)
+		}
+	}
+	return raw
+}
+
+// runToolLoopTurn 在工具循环之外套上一层会话簿记（与流式路径的收尾逻辑对齐）：
+// 构造注册表、跑循环、写回 session、更新计数与指标、组装 ChatResult。
+func (s *Service) runToolLoopTurn(
+	ctx context.Context,
+	streamProvider protocol.Provider,
+	caller protocol.ToolCaller,
+	baseRequest protocol.ChatRequest,
+	maxToolCalls int,
+	route chatRoute,
+	prefixDiagnostic requestPrefixDiagnostic,
+	requestMessages []protocol.Message,
+	baseMessageCount int,
+	sink ChatEventSink,
+) (ChatResult, error) {
+	execRequest := baseRequest
+	planStarted := false
+
+	// Plan 两段式：需用户显式开启 Plan 模式，且当前档位 Planner=true 时启用。
+	// 默认关闭，避免每轮翻倍调用、破坏缓存经济性（符合真实工具的显式规划做法）。
+	profile, _ := ReasoningProfileFor(s.reasoning)
+	if s.planMode && !isGuidanceChatTurn(ctx) && profile.Budget.Planner && strings.TrimSpace(s.runtimeSettings.WorkspaceRoot) != "" {
+		emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "正在生成执行计划", Model: route.ModelID})
+		plan, _, planErr := s.runPlanPhase(ctx, caller, baseRequest, maxToolCalls)
+		if planErr != nil {
+			s.sessionMessages = s.sessionMessages[:baseMessageCount]
+			s.markChatProviderStatus(route.Provider.ID, "error", planErr.Error())
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planErr
+		}
+		if plan != "" {
+			planSteps := planStepsFromText(plan)
+			if len(planSteps) > 0 {
+				if planStateErr := s.startPlanState(planSteps); planStateErr != nil {
+					s.sessionMessages = s.sessionMessages[:baseMessageCount]
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+				}
+				planStarted = true
+			}
+			approved, apprErr := s.requestPlanApproval(ctx, plan)
+			if apprErr != nil {
+				s.sessionMessages = s.sessionMessages[:baseMessageCount]
+				apprErr = s.failStartedPlan(planStarted, apprErr)
+				return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, apprErr
+			}
+			if !approved {
+				if planStarted {
+					if planStateErr := s.finishPlanState("cancelled"); planStateErr != nil {
+						return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+					}
+				}
+				// 用户否决计划：不执行，直接把计划作为回复返回。
+				answer := "已生成执行计划，但你选择不执行。\n\n" + plan
+				s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+				s.sessionState.MessageCount = len(s.sessionMessages)
+				s.recordAssistantAndCheckpoint(answer, route.ModelID, []tools.ResultPart{{Kind: tools.PartText, Text: plan}})
+				s.markChatProviderStatus(route.Provider.ID, "ok", "计划已生成，等待下一步。")
+				return ChatResult{
+					Content: answer,
+					Model:   route.ModelID,
+					Usage:   s.metrics,
+					State:   s.workbenchStateLocked(),
+					Parts:   []tools.ResultPart{{Kind: tools.PartText, Text: plan}},
+				}, nil
+			}
+			if len(planSteps) > 0 {
+				planSteps[0].Status = "in_progress"
+				if planStateErr := s.updatePlanState(planSteps); planStateErr != nil {
+					planStateErr = s.failStartedPlan(planStarted, planStateErr)
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+				}
+			}
+			// 批准：把计划注入执行阶段的消息尾部，让模型据此执行。
+			execRequest.Messages = append(append([]protocol.Message{}, baseRequest.Messages...),
+				protocol.Message{Role: "assistant", Content: "执行计划：\n" + plan},
+				protocol.Message{Role: "user", Content: "计划已批准，请按计划执行。"})
+		}
+	}
+
+	reg := s.buildToolRegistry()
+
+	emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "正在分析任务", Model: route.ModelID})
+	outcome, err := s.runStreamingToolLoop(ctx, streamProvider, reg, execRequest, maxToolCalls, sink)
+	resolvedRoute := resolvedProviderRoute(streamProvider, route)
+	if resolvedRoute.Provider.ID != route.Provider.ID {
+		route = resolvedRoute
+		s.adoptProviderRoute(route)
+	}
+	if err != nil {
+		// 回滚本轮追加的用户消息，保持 session 一致。
+		s.sessionMessages = s.sessionMessages[:baseMessageCount]
+		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
+		partialCompleted := hasUsablePartialToolResult(outcome.Parts)
+		if partialCompleted && planStarted {
+			if planErr := s.finishPlanState("completed"); planErr != nil {
+				err = errors.Join(err, fmt.Errorf("finish partial plan: %w", planErr))
+				partialCompleted = false
+			}
+		}
+		if !partialCompleted {
+			err = s.failStartedPlan(planStarted, err)
+		}
+		if partialCompleted {
+			setOutcomeProgressStatus(&outcome, "completed")
+			emitOutcomeProgress(sink, outcome.Parts)
+		}
+		partialContent := partialToolFailureContent(outcome)
+		partialParts := appendTextPartIfMissing(outcome.Parts, partialContent)
+		if partialContent != "" && len(requestMessages) > 0 {
+			currentUser := requestMessages[len(requestMessages)-1]
+			if currentUser.Role == "user" {
+				s.sessionMessages = append(s.sessionMessages,
+					currentUser,
+					protocol.Message{Role: "assistant", Content: partialContent},
+				)
+				s.sessionState.MessageCount = len(s.sessionMessages)
+				s.sessionState.TurnCount++
+				s.recordAssistantAndCheckpoint(partialContent, route.ModelID, partialParts)
+			}
+		}
+		result := ChatResult{
+			Content:   partialContent,
+			Reasoning: outcome.Reasoning,
+			Model:     route.ModelID,
+			Usage:     s.metrics,
+			State:     s.workbenchStateLocked(),
+			Parts:     partialParts,
+		}
+		if partialCompleted {
+			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
+			return result, nil
+		}
+		return result, err
+	}
+
+	if outcome.Usage != nil {
+		s.metrics = usageMetricsFor(route.Provider, outcome.Usage)
+		s.recordUsageMetrics(s.metrics, route)
+	}
+	if planStarted {
+		if planStateErr := s.finishPlanState("completed"); planStateErr != nil {
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+		}
+	}
+
+	answer := sanitizeModelContent(outcome.Content)
+	s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
+	s.sessionState.MessageCount = len(s.sessionMessages)
+	s.sessionState.TurnCount++
+	// 文件快照已在每次工具写入后立即记录，这里只提交 assistant + checkpoint。
+	s.recordAssistantAndCheckpoint(answer, route.ModelID, outcome.Parts)
+	s.markChatProviderStatus(route.Provider.ID, "ok", fmt.Sprintf("试聊成功，%s / %s 工具会话完成，产出 %d 个片段。", route.Provider.Name, route.ModelID, len(outcome.Parts)))
+
+	return ChatResult{
+		Content:   answer,
+		Reasoning: outcome.Reasoning,
+		Model:     route.ModelID,
+		Usage:     s.metrics,
+		State:     s.workbenchStateLocked(),
+		Parts:     outcome.Parts,
+	}, nil
+}
+
+func partialToolFailureContent(outcome toolLoopOutcome) string {
+	for _, part := range outcome.Parts {
+		if isSuccessfulRepositoryRead(part) {
+			return repositoryReadFallbackContent(part)
+		}
+	}
+	for _, part := range outcome.Parts {
+		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
+			return webSearchFallbackContent(part)
+		}
+	}
+	if len(outcome.Parts) > 0 {
+		return "工具已经执行，但上游模型未能完成最终回复。执行记录已保留，可以直接重试。"
+	}
+	return ""
+}
+
+func hasUsablePartialToolResult(parts []tools.ResultPart) bool {
+	return hasSuccessfulRepositoryRead(parts) || hasWebSearchSources(parts)
+}
+
+func hasSuccessfulRepositoryRead(parts []tools.ResultPart) bool {
+	for _, part := range parts {
+		if isSuccessfulRepositoryRead(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSuccessfulRepositoryRead(part tools.ResultPart) bool {
+	return part.Kind == tools.PartToolCall &&
+		part.Name == "read_repository" &&
+		part.Status != "error" &&
+		strings.TrimSpace(part.Output) != ""
+}
+
+func hasWebSearchSources(parts []tools.ResultPart) bool {
+	for _, part := range parts {
+		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func webSearchFallbackContent(part tools.ResultPart) string {
+	var content strings.Builder
+	content.WriteString("网络搜索已完成。以下摘要直接整理自搜索来源，请通过链接核对关键细节：")
+	for index, source := range part.Sources {
+		title := strings.TrimSpace(source.Title)
+		if title == "" {
+			title = strings.TrimSpace(source.URL)
+		}
+		fmt.Fprintf(&content, "\n\n%d. %s", index+1, title)
+		if snippet := compactFallbackSnippet(source.Snippet, 220); snippet != "" {
+			content.WriteString("\n   ")
+			content.WriteString(snippet)
+		}
+		if source.URL != "" {
+			content.WriteString("\n   ")
+			content.WriteString(strings.TrimSpace(source.URL))
+		}
+	}
+	return content.String()
+}
+
+func ensureWebSearchSourcesListed(content string, parts []tools.ResultPart) string {
+	content = strings.TrimSpace(content)
+	sources := make([]tools.SearchSource, 0)
+	seen := map[string]bool{}
+	for _, part := range parts {
+		if part.Kind != tools.PartWebSearch {
+			continue
+		}
+		for _, source := range part.Sources {
+			url := strings.TrimSpace(source.URL)
+			if url == "" || seen[url] {
+				continue
+			}
+			seen[url] = true
+			source.URL = url
+			sources = append(sources, source)
+		}
+	}
+	if len(sources) == 0 {
+		return content
+	}
+
+	missing := make([]tools.SearchSource, 0, len(sources))
+	for _, source := range sources {
+		title := strings.TrimSpace(source.Title)
+		hasTitle := title == "" || strings.Contains(content, title)
+		if !strings.Contains(content, source.URL) || !hasTitle {
+			missing = append(missing, source)
+		}
+	}
+	if len(missing) == 0 {
+		return content
+	}
+
+	var result strings.Builder
+	if content != "" {
+		result.WriteString(content)
+		result.WriteString("\n\n")
+	}
+	if len(missing) == len(sources) {
+		result.WriteString("来源链接：")
+	} else {
+		result.WriteString("补充来源链接：")
+	}
+	for _, source := range missing {
+		title := strings.TrimSpace(source.Title)
+		if title == "" {
+			title = source.URL
+		}
+		result.WriteString("\n- ")
+		result.WriteString(title)
+		result.WriteString("\n  <")
+		result.WriteString(strings.ReplaceAll(source.URL, ">", "%3E"))
+		result.WriteString(">")
+	}
+	return result.String()
+}
+
+func compactFallbackSnippet(value string, maxRunes int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "..."
+	}
+	return value
+}
+
+func repositoryReadFallbackContent(part tools.ResultPart) string {
+	output := strings.TrimSpace(strings.ReplaceAll(part.Output, "\r\n", "\n"))
+	if output == "" {
+		return ""
+	}
+
+	metadata, readme, tree, entries, fileContent := splitRepositoryFallbackOutput(output)
+	var content strings.Builder
+	content.WriteString("GitHub 仓库读取已完成，但上游模型未能继续整理。以下内容直接来自仓库工具结果：")
+	if repositoryURL := strings.TrimSpace(part.Input); repositoryURL != "" {
+		content.WriteString("\n\n仓库地址：<")
+		content.WriteString(strings.ReplaceAll(repositoryURL, ">", "%3E"))
+		content.WriteString(">")
+	}
+	appendRepositoryFallbackSection(&content, "仓库信息", metadata, 1_200)
+	appendRepositoryFallbackSection(&content, "README（截取）", readme, 3_200)
+	appendRepositoryFallbackSection(&content, "目录树（截取）", tree, 2_400)
+	appendRepositoryFallbackSection(&content, "目录内容（截取）", entries, 2_400)
+	appendRepositoryFallbackSection(&content, "文件内容（截取）", fileContent, 4_000)
+	content.WriteString("\n\n完整原始结果仍保留在上方“读取仓库”记录中，可展开查看或直接重试整理。")
+	return content.String()
+}
+
+func splitRepositoryFallbackOutput(output string) (metadata, readme, tree, entries, fileContent string) {
+	metadata = strings.TrimSpace(output)
+	if before, after, ok := strings.Cut(metadata, "\nREADME:\n"); ok {
+		metadata = strings.TrimSpace(before)
+		readme = strings.TrimSpace(after)
+		if beforeTree, afterTree, hasTree := strings.Cut(readme, "\nRepository tree:\n"); hasTree {
+			readme = strings.TrimSpace(beforeTree)
+			tree = strings.TrimSpace(afterTree)
+		}
+		return
+	}
+	if before, after, ok := strings.Cut(metadata, "\nRepository tree:\n"); ok {
+		metadata = strings.TrimSpace(before)
+		tree = strings.TrimSpace(after)
+		return
+	}
+	if before, after, ok := strings.Cut(metadata, "\nEntries:\n"); ok {
+		metadata = strings.TrimSpace(before)
+		entries = strings.TrimSpace(after)
+		return
+	}
+	if before, after, ok := strings.Cut(metadata, "\n\n"); ok {
+		metadata = strings.TrimSpace(before)
+		fileContent = strings.TrimSpace(after)
+	}
+	return
+}
+
+func appendRepositoryFallbackSection(content *strings.Builder, title, value string, maxRunes int) {
+	value = compactMultilineFallback(value, maxRunes)
+	if value == "" {
+		return
+	}
+	content.WriteString("\n\n**")
+	content.WriteString(title)
+	content.WriteString("**\n\n")
+	for _, line := range strings.Split(value, "\n") {
+		content.WriteString("    ")
+		content.WriteString(line)
+		content.WriteByte('\n')
+	}
+}
+
+func compactMultilineFallback(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		return strings.TrimSpace(string(runes[:maxRunes])) + "\n... [内容已截取]"
+	}
+	return value
+}
+
+func emptyToolCompletionContent(parts []tools.ResultPart) string {
+	for _, part := range parts {
+		if isSuccessfulRepositoryRead(part) {
+			return repositoryReadFallbackContent(part)
+		}
+	}
+	for _, part := range parts {
+		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
+			return webSearchFallbackContent(part)
+		}
+	}
+	return ""
+}
+
+func appendTextPartIfMissing(parts []tools.ResultPart, content string) []tools.ResultPart {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return parts
+	}
+	for _, part := range parts {
+		if part.Kind == tools.PartText && strings.TrimSpace(part.Text) == content {
+			return parts
+		}
+	}
+	return append(parts, tools.ResultPart{Kind: tools.PartText, Text: content})
+}
+
+// buildToolRegistry 依据当前 runtime settings 构造工具注册表。
+// 沙盒策略从 RuntimeSettings 映射到 tools.SandboxPolicy，实现权限边界。
+func (s *Service) buildToolRegistry() *tools.Registry {
+	policy := tools.SandboxPolicy{
+		SandboxMode:          s.runtimeSettings.SandboxMode,
+		WorkspaceRoot:        s.runtimeSettings.WorkspaceRoot,
+		ExtraWritableRoots:   s.runtimeSettings.ExtraWritableRoots,
+		FilesystemAccess:     s.runtimeSettings.FilesystemAccess,
+		NetworkAccess:        s.runtimeSettings.NetworkAccess,
+		ShellAccess:          s.runtimeSettings.ShellAccess,
+		AllowDestructiveOps:  s.runtimeSettings.AllowDestructiveOps,
+		MaxCommandSeconds:    s.runtimeSettings.MaxCommandSeconds,
+		MaxCommandMemoryMB:   s.runtimeSettings.MaxCommandMemoryMB,
+		MaxCommandCPUPercent: s.runtimeSettings.MaxCommandCPUPercent,
+		MaxCommandProcesses:  s.runtimeSettings.MaxCommandProcesses,
+	}
+	reg := tools.NewRegistry(
+		tools.UpdatePlanTool{OnUpdate: s.updatePlanState},
+		tools.ReadFileTool{Policy: policy},
+		tools.FileInfoTool{Policy: policy},
+		tools.ListDirTool{Policy: policy},
+		tools.SearchTool{Policy: policy},
+	)
+	if s.runtimeSettings.NetworkAccess {
+		reg.Add(tools.ReadRepositoryTool{Policy: policy})
+		reg.Add(tools.WebSearchTool{Policy: policy})
+	}
+	if s.config.OpenFile != nil || s.config.PreviewFile != nil {
+		reg.Add(tools.OpenFileTool{Policy: policy, Open: s.config.OpenFile, Preview: s.config.PreviewFile})
+	}
+	if s.config.Browser != nil && s.runtimeSettings.Browser.Enabled {
+		reg.Add(tools.BrowserTool{Policy: policy, Controller: s.config.Browser})
+	}
+	computerSettings := s.runtimeSettings.ComputerControl
+	if s.config.Computer != nil && (computerSettings.AnyAppEnabled || computerSettings.ChromeEnabled || len(computerSettings.AlwaysAllowedApps) > 0) {
+		reg.Add(tools.ComputerTool{Policy: policy, Controller: s.config.Computer})
+	}
+	reg.Add(tools.WriteFileTool{Policy: policy})
+	reg.Add(tools.ApplyPatchTool{Policy: policy})
+	reg.Add(tools.CopyFileTool{Policy: policy})
+	reg.Add(tools.DeleteFileTool{Policy: policy})
+	// run_command 仅在 ShellAccess 开启时注册（文件操作绝不经 shell）。
+	if s.runtimeSettings.ShellAccess {
+		reg.Add(tools.RunCommandTool{Policy: policy})
+	}
+	if s.config.Git != nil {
+		reg.Add(GitTool{Policy: policy, Controller: s.config.Git})
+	}
+	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess {
+		reg.Add(TerminalTool{Policy: policy, Controller: s.config.Terminal})
+	}
+	if s.mcpManager != nil {
+		for _, remoteTool := range s.mcpManager.Tools() {
+			reg.Add(remoteTool)
+		}
+	}
+	return reg
+}
+
+// buildReadOnlyRegistry 只含只读工具，供 Plan 阶段「先探索、不改动」使用。
+func (s *Service) buildReadOnlyRegistry() *tools.Registry {
+	policy := tools.SandboxPolicy{
+		SandboxMode:          "read-only",
+		WorkspaceRoot:        s.runtimeSettings.WorkspaceRoot,
+		ExtraWritableRoots:   s.runtimeSettings.ExtraWritableRoots,
+		FilesystemAccess:     "read-only",
+		NetworkAccess:        s.runtimeSettings.NetworkAccess,
+		ShellAccess:          false,
+		AllowDestructiveOps:  false,
+		MaxCommandSeconds:    s.runtimeSettings.MaxCommandSeconds,
+		MaxCommandMemoryMB:   s.runtimeSettings.MaxCommandMemoryMB,
+		MaxCommandCPUPercent: s.runtimeSettings.MaxCommandCPUPercent,
+		MaxCommandProcesses:  s.runtimeSettings.MaxCommandProcesses,
+	}
+	reg := tools.NewRegistry(
+		tools.ReadFileTool{Policy: policy},
+		tools.FileInfoTool{Policy: policy},
+		tools.ListDirTool{Policy: policy},
+		tools.SearchTool{Policy: policy},
+	)
+	if s.config.Git != nil {
+		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: true})
+	}
+	if s.runtimeSettings.NetworkAccess {
+		reg.Add(tools.ReadRepositoryTool{Policy: policy})
+		reg.Add(tools.WebSearchTool{Policy: policy})
+	}
+	return reg
+}
+
+// toolDefinitions 把注册表的工具 schema 转成 provider 需要的 protocol.ToolDefinition。
+func toolDefinitions(reg *tools.Registry) []protocol.ToolDefinition {
+	schemas := reg.Schemas()
+	defs := make([]protocol.ToolDefinition, 0, len(schemas))
+	for _, sc := range schemas {
+		defs = append(defs, protocol.ToolDefinition{
+			Type: sc.Type,
+			Function: protocol.ToolDefinitionFunc{
+				Name:        sc.Function.Name,
+				Description: sc.Function.Description,
+				Parameters:  sc.Function.Parameters,
+			},
+		})
+	}
+	return defs
+}
+
+// toolLoopOutcome 汇总一次工具循环的最终结果。
+type toolLoopOutcome struct {
+	Content   string
+	Reasoning string
+	Parts     []tools.ResultPart
+	Changes   []tools.FileChange
+	Usage     *protocol.TokenUsage
+}
+
+// runToolLoop 执行「补全 → 若有 tool_calls 则执行并回喂 → 再补全」的循环，
+// 直到模型给出最终文本或达到 maxToolCalls 上限。
+// caller 为支持 function-calling 的 provider；baseMessages 为初始对话（含用户输入）。
+func (s *Service) runToolLoop(
+	ctx context.Context,
+	caller protocol.ToolCaller,
+	reg *tools.Registry,
+	req protocol.ChatRequest,
+	maxToolCalls int,
+) (toolLoopOutcome, error) {
+	return s.runToolLoopWithCompletion(ctx, reg, req, maxToolCalls, caller.Complete, nil)
+}
+
+func (s *Service) runStreamingToolLoop(
+	ctx context.Context,
+	provider protocol.Provider,
+	reg *tools.Registry,
+	req protocol.ChatRequest,
+	maxToolCalls int,
+	sink ChatEventSink,
+) (toolLoopOutcome, error) {
+	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		return collectProviderStream(ctx, provider, request, sink)
+	}
+	return s.runToolLoopWithCompletion(ctx, reg, req, maxToolCalls, complete, sink)
+}
+
+type completionFunc func(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error)
+
+const postToolCompletionRetries = 2
+
+type completedWebSearch struct {
+	query   string
+	sources []tools.SearchSource
+}
+
+type toolLoopGuard struct {
+	searches                   []completedWebSearch
+	browserUnavailable         bool
+	browserExplicitlyRequested bool
+	externalBrowserSuppressed  bool
+}
+
+func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.Message, bool, bool) {
+	name := call.Function.Name
+	input := toolInputForDisplay(name, call.Function.Arguments)
+	if name == "browser" && !g.browserExplicitlyRequested {
+		rawArgs := normalizeToolArgs(call.Function.Arguments)
+		if g.externalBrowserSuppressed || browserNavigationNeedsApproval(rawArgs) {
+			g.externalBrowserSuppressed = true
+			sourceCount := 0
+			for _, search := range g.searches {
+				sourceCount += len(search.sources)
+			}
+			summary := "网页未打开：用户没有要求浏览器导航。若需检索公开信息，请使用 web_search，并直接整理回答、列出来源标题和完整 URL。"
+			if sourceCount > 0 {
+				summary = fmt.Sprintf("网页未打开：用户没有要求浏览器导航。本轮已获得 %d 条搜索来源，请直接基于来源整理完整回答，并逐条列出标题和完整 URL；不要再次调用 browser。", sourceCount)
+			}
+			return tools.Result{Summary: summary}, protocol.Message{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Name:       name,
+				Content:    summary,
+			}, true, true
+		}
+	}
+	if name == "browser" && g.browserUnavailable {
+		summary := "内置浏览器本轮仍不可用，已跳过重复启动。请使用已有搜索来源完成回答。"
+		result := tools.Result{
+			Summary: summary,
+			IsError: true,
+			Parts: []tools.ResultPart{{
+				Kind: tools.PartToolCall, Name: name, Status: "error", Input: input, Output: summary,
+			}},
+		}
+		return result, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, false
+	}
+	if name != "web_search" || strings.TrimSpace(input) == "" {
+		return tools.Result{}, protocol.Message{}, false, false
+	}
+	for _, search := range g.searches {
+		if !searchQueriesSimilar(input, search.query) {
+			continue
+		}
+		summary := fmt.Sprintf("本轮已完成相近搜索 %q，复用已有 %d 条来源，未重复联网。", search.query, len(search.sources))
+		result := tools.Result{
+			Summary: summary,
+			Parts: []tools.ResultPart{
+				{Kind: tools.PartToolCall, Name: name, Status: "ok", Input: input, Output: summary},
+				{Kind: tools.PartWebSearch, Query: search.query, Sources: append([]tools.SearchSource(nil), search.sources...)},
+			},
+		}
+		return result, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, false
+	}
+	return tools.Result{}, protocol.Message{}, false, false
+}
+
+func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, message *protocol.Message) {
+	switch call.Function.Name {
+	case "web_search":
+		if result.IsError {
+			return
+		}
+		sources := searchSourcesFromParts(result.Parts)
+		if len(sources) == 0 {
+			return
+		}
+		g.searches = append(g.searches, completedWebSearch{
+			query:   toolInputForDisplay("web_search", call.Function.Arguments),
+			sources: sources,
+		})
+	case "browser":
+		if !result.IsError || !browserEngineUnavailable(result.Summary) {
+			return
+		}
+		g.browserUnavailable = true
+		message.Content = strings.TrimSpace(message.Content + "\n本轮不要再次调用 browser；如已有搜索来源，请直接基于来源完成回答。")
+	}
+}
+
+func searchSourcesFromParts(parts []tools.ResultPart) []tools.SearchSource {
+	for _, part := range parts {
+		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
+			return append([]tools.SearchSource(nil), part.Sources...)
+		}
+	}
+	return nil
+}
+
+func browserEngineUnavailable(summary string) bool {
+	return strings.Contains(summary, "内置浏览器启动失败") || strings.Contains(summary, "启动浏览器引擎失败")
+}
+
+func browserUseExplicitlyRequested(messages []protocol.Message) bool {
+	request := ""
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Role == "user" {
+			request = strings.ToLower(strings.TrimSpace(messages[index].Content))
+			break
+		}
+	}
+	if request == "" {
+		return false
+	}
+	for _, phrase := range []string{
+		"不要打开", "不用打开", "无需打开", "别打开", "不要使用浏览器", "不用浏览器",
+		"do not open", "don't open", "dont open", "without opening", "do not use the browser",
+	} {
+		if strings.Contains(request, phrase) {
+			return false
+		}
+	}
+	for _, phrase := range []string{
+		"打开网页", "打开网站", "打开链接", "访问网页", "访问网站", "使用浏览器", "用浏览器", "内置浏览器",
+		"浏览这个网页", "浏览这个网站", "读取网页", "分析网页", "操作网页", "点击网页", "登录网站", "登录网页",
+		"open the webpage", "open the page", "open the website", "open this link", "use the browser", "in-app browser",
+		"visit the website", "browse the website", "read the webpage", "click on the page", "log in to the website",
+	} {
+		if strings.Contains(request, phrase) {
+			return true
+		}
+	}
+	hasAddress := strings.Contains(request, "http://") || strings.Contains(request, "https://") || strings.Contains(request, "www.")
+	if !hasAddress {
+		return false
+	}
+	for _, action := range []string{"打开", "访问", "浏览", "读取", "分析", "登录", "open", "visit", "browse", "read", "inspect", "log in"} {
+		if strings.Contains(request, action) {
+			return true
+		}
+	}
+	return false
+}
+
+func searchQueriesSimilar(left, right string) bool {
+	leftSite, leftTerms, leftCompact := searchQuerySignature(left)
+	rightSite, rightTerms, rightCompact := searchQuerySignature(right)
+	if leftSite != rightSite && (leftSite != "" || rightSite != "") {
+		return false
+	}
+	if leftCompact != "" && leftCompact == rightCompact {
+		return true
+	}
+	if len(leftTerms) == 0 || len(rightTerms) == 0 {
+		return false
+	}
+	intersection := 0
+	for term := range leftTerms {
+		if rightTerms[term] {
+			intersection++
+		}
+	}
+	minimum := len(leftTerms)
+	if len(rightTerms) < minimum {
+		minimum = len(rightTerms)
+	}
+	return intersection >= 2 && float64(intersection)/float64(minimum) >= 0.72
+}
+
+func searchQuerySignature(query string) (string, map[string]bool, string) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	fields := strings.Fields(query)
+	kept := make([]string, 0, len(fields))
+	site := ""
+	for _, field := range fields {
+		if strings.HasPrefix(field, "site:") {
+			site = strings.Trim(strings.TrimPrefix(field, "site:"), "\"'()[]{}，。；;")
+			continue
+		}
+		kept = append(kept, field)
+	}
+	query = strings.Join(kept, " ")
+	for _, phrase := range []string{"今天", "今日", "当前", "最新", "现在", "实时", "today", "latest", "current", "now"} {
+		query = strings.ReplaceAll(query, phrase, " ")
+	}
+	terms := map[string]bool{}
+	segments := strings.FieldsFunc(query, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	var compact strings.Builder
+	for _, segment := range segments {
+		runes := []rune(segment)
+		containsDigit := false
+		containsHan := false
+		for _, r := range runes {
+			containsDigit = containsDigit || unicode.IsDigit(r)
+			containsHan = containsHan || unicode.Is(unicode.Han, r)
+			if !unicode.IsDigit(r) {
+				compact.WriteRune(r)
+			}
+		}
+		if containsDigit {
+			continue
+		}
+		if containsHan {
+			if len(runes) == 1 {
+				terms[string(runes)] = true
+				continue
+			}
+			for index := 0; index < len(runes)-1; index++ {
+				terms[string(runes[index:index+2])] = true
+			}
+			continue
+		}
+		term := string(runes)
+		if len(term) > 4 && strings.HasSuffix(term, "s") {
+			term = strings.TrimSuffix(term, "s")
+		}
+		if term != "" {
+			terms[term] = true
+		}
+	}
+	return site, terms, compact.String()
+}
+
+func (s *Service) runToolLoopWithCompletion(
+	ctx context.Context,
+	reg *tools.Registry,
+	req protocol.ChatRequest,
+	maxToolCalls int,
+	complete completionFunc,
+	sink ChatEventSink,
+) (toolLoopOutcome, error) {
+	outcome := toolLoopOutcome{}
+	messages := append([]protocol.Message{}, req.Messages...)
+	toolDefs := toolDefinitions(reg)
+	toolsDisabled := false // 自定义模型不支持 function-calling 时降级为纯对话
+	guard := toolLoopGuard{browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages)}
+
+	executed := 0
+	for {
+		stepReq := req
+		stepReq.Messages = fitToolLoopMessages(messages, req.TargetInputTokens)
+		if !toolsDisabled {
+			stepReq.Tools = toolDefs
+		}
+
+		completion, err := complete(ctx, stepReq)
+		if err != nil && executed > 0 && isRetryablePostToolCompletionError(ctx, err) {
+			for retry := 1; retry <= postToolCompletionRetries; retry++ {
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:    "status",
+					Message: fmt.Sprintf("模型连接中断，正在继续整理工具结果（%d/%d）", retry, postToolCompletionRetries),
+				})
+				if waitErr := waitForPostToolRetry(ctx, retry); waitErr != nil {
+					err = waitErr
+					break
+				}
+				completion, err = complete(ctx, stepReq)
+				if err == nil || !isRetryablePostToolCompletionError(ctx, err) {
+					break
+				}
+			}
+		}
+		if err != nil {
+			// 首轮带工具失败：很可能该模型/端点不支持 tools（自定义模型常见）。
+			// 降级为不带 tools 重试一次，保证普通对话可用。
+			if !toolsDisabled && executed == 0 && len(toolDefs) > 0 {
+				toolsDisabled = true
+				continue
+			}
+			setOutcomeProgressStatus(&outcome, "failed")
+			emitOutcomeProgress(sink, outcome.Parts)
+			return outcome, err
+		}
+		if completion.Usage != nil {
+			outcome.Usage = completion.Usage
+		}
+		if strings.TrimSpace(completion.Reasoning) != "" {
+			outcome.Reasoning = completion.Reasoning
+		}
+
+		// 无工具调用 → 最终答案。
+		if len(completion.ToolCalls) == 0 {
+			outcome.Content = completion.Content
+			if strings.TrimSpace(outcome.Content) == "" {
+				outcome.Content = emptyToolCompletionContent(outcome.Parts)
+			}
+			outcome.Content = ensureWebSearchSourcesListed(outcome.Content, outcome.Parts)
+			if strings.TrimSpace(outcome.Content) != "" {
+				outcome.Parts = append(outcome.Parts, tools.ResultPart{
+					Kind: tools.PartText,
+					Text: outcome.Content,
+				})
+			}
+			setOutcomeProgressStatus(&outcome, "completed")
+			emitOutcomeProgress(sink, outcome.Parts)
+			return outcome, nil
+		}
+
+		// 记录 assistant 的工具调用轮（回喂需要）。
+		messages = append(messages, protocol.Message{
+			Role:      "assistant",
+			Content:   completion.Content,
+			ToolCalls: completion.ToolCalls,
+		})
+		if strings.TrimSpace(completion.Content) != "" {
+			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: completion.Content})
+		}
+
+		// 逐个执行工具调用。
+		for _, call := range completion.ToolCalls {
+			if executed >= maxToolCalls {
+				// 达到上限：告知模型并结束。
+				note := fmt.Sprintf("已达到本轮工具调用上限（%d 次），停止继续调用。", maxToolCalls)
+				outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: note})
+				outcome.Content = strings.TrimSpace(outcome.Content + "\n" + note)
+				setOutcomeProgressStatus(&outcome, "failed")
+				emitOutcomeProgress(sink, outcome.Parts)
+				return outcome, nil
+			}
+			executed++
+			toolInput := toolInputForDisplay(call.Function.Name, call.Function.Arguments)
+			isProgressUpdate := call.Function.Name == "update_plan"
+			result, toolMsg, guarded, hidden := guard.before(call)
+			if !isProgressUpdate && !hidden {
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:       "tool",
+					Message:    fmt.Sprintf("正在运行 %s", call.Function.Name),
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					ToolInput:  toolInput,
+					Status:     "running",
+				})
+			}
+
+			if !guarded {
+				result, toolMsg = s.executeToolCall(ctx, reg, call)
+				guard.after(call, result, &toolMsg)
+			}
+			toolStatus := "completed"
+			if result.IsError {
+				toolStatus = "error"
+			}
+			if (!isProgressUpdate || result.IsError) && !hidden {
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:       "tool",
+					Message:    result.Summary,
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					ToolInput:  toolInput,
+					Status:     toolStatus,
+					Parts:      result.Parts,
+				})
+			}
+			if !hidden {
+				outcome.Parts = mergeOutcomeParts(outcome.Parts, result.Parts)
+				outcome.Changes = append(outcome.Changes, result.Changes...)
+				updateOutcomeProgressStats(&outcome)
+				emitOutcomeProgress(sink, outcome.Parts)
+			}
+			// 把工具结果回喂给模型。
+			messages = append(messages, toolMsg)
+		}
+	}
+}
+
+func isRetryablePostToolCompletionError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"eof", "timeout", "timed out", "connection reset", "connection refused",
+		"server closed", "temporarily unavailable", "bad gateway", "service unavailable",
+		"gateway timeout", "deadline", "超时", "中断", "http 502", "http 503", "http 504",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForPostToolRetry(ctx context.Context, retry int) error {
+	timer := time.NewTimer(time.Duration(retry) * 350 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart {
+	for _, part := range incoming {
+		if part.Kind == tools.PartToolCall && part.Name == "web_search" && part.Status != "error" {
+			continue
+		}
+		if part.Kind == tools.PartWebSearch {
+			replaced := false
+			for index := range existing {
+				if existing[index].Kind != tools.PartWebSearch {
+					continue
+				}
+				existing[index] = mergeWebSearchParts(existing[index], part)
+				replaced = true
+				break
+			}
+			if !replaced {
+				existing = append(existing, part)
+			}
+			continue
+		}
+		if part.Kind != tools.PartProgress {
+			existing = append(existing, part)
+			continue
+		}
+		replaced := false
+		for index := range existing {
+			if existing[index].Kind == tools.PartProgress {
+				existing[index] = part
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			existing = append(existing, part)
+		}
+	}
+	return existing
+}
+
+func mergeWebSearchParts(existing, incoming tools.ResultPart) tools.ResultPart {
+	if existing.Query == "" {
+		existing.Query = incoming.Query
+	} else if incoming.Query != "" && existing.Query != incoming.Query && !strings.Contains(existing.Query, "含补充搜索") {
+		existing.Query += "（含补充搜索）"
+	}
+	byURL := make(map[string]int, len(existing.Sources)+len(incoming.Sources))
+	for index, source := range existing.Sources {
+		byURL[strings.TrimSpace(source.URL)] = index
+	}
+	for _, source := range incoming.Sources {
+		key := strings.TrimSpace(source.URL)
+		if key == "" {
+			continue
+		}
+		if index, ok := byURL[key]; ok {
+			if existing.Sources[index].Title == "" {
+				existing.Sources[index].Title = source.Title
+			}
+			if existing.Sources[index].Snippet == "" {
+				existing.Sources[index].Snippet = source.Snippet
+			}
+			continue
+		}
+		if len(existing.Sources) >= 16 {
+			break
+		}
+		byURL[key] = len(existing.Sources)
+		existing.Sources = append(existing.Sources, source)
+	}
+	return existing
+}
+
+func updateOutcomeProgressStats(outcome *toolLoopOutcome) {
+	if outcome == nil {
+		return
+	}
+	files, additions, deletions := tools.SummarizeFileChanges(outcome.Changes)
+	for index := range outcome.Parts {
+		if outcome.Parts[index].Kind != tools.PartProgress {
+			continue
+		}
+		outcome.Parts[index].ChangedFiles = files
+		outcome.Parts[index].Additions = additions
+		outcome.Parts[index].Deletions = deletions
+		return
+	}
+}
+
+func setOutcomeProgressStatus(outcome *toolLoopOutcome, status string) {
+	if outcome == nil {
+		return
+	}
+	updateOutcomeProgressStats(outcome)
+	for index := range outcome.Parts {
+		if outcome.Parts[index].Kind == tools.PartProgress {
+			if status == "completed" {
+				for _, step := range outcome.Parts[index].Steps {
+					if step.Status != "completed" {
+						status = "running"
+						break
+					}
+				}
+			}
+			outcome.Parts[index].TaskStatus = status
+			return
+		}
+	}
+}
+
+func emitOutcomeProgress(sink ChatEventSink, parts []tools.ResultPart) {
+	for index := range parts {
+		if parts[index].Kind != tools.PartProgress {
+			continue
+		}
+		progress := parts[index]
+		emitChatEvent(sink, ChatStreamEvent{Type: "progress", Progress: &progress})
+		return
+	}
+}
+
+// executeToolCall 执行单个工具调用，返回结构化结果与回喂给模型的 tool 消息。
+func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call protocol.ToolCall) (tools.Result, protocol.Message) {
+	name := call.Function.Name
+	tool, ok := reg.Get(name)
+	if !ok {
+		summary := fmt.Sprintf("未知工具: %s", name)
+		return tools.Result{
+				Summary: summary,
+				IsError: true,
+				Parts:   []tools.ResultPart{{Kind: tools.PartToolCall, Name: name, Status: "error", Output: summary}},
+			}, protocol.Message{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Name:       name,
+				Content:    summary,
+			}
+	}
+
+	result, err := s.runToolWithApproval(ctx, tool, name, normalizeToolArgs(call.Function.Arguments))
+	if err != nil {
+		summary := fmt.Sprintf("工具 %s 执行出错: %v", name, err)
+		return tools.Result{
+				Summary: summary,
+				IsError: true,
+				Parts:   []tools.ResultPart{{Kind: tools.PartToolCall, Name: name, Status: "error", Output: summary}},
+			}, protocol.Message{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Name:       name,
+				Content:    summary,
+			}
+	}
+	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy)
+
+	result = ensureToolErrorPart(result, name, normalizeToolArgs(call.Function.Arguments))
+	if !result.IsError {
+		for _, change := range result.Changes {
+			if snapshotErr := s.recordFileSnapshot(change); snapshotErr != nil {
+				rollbackErr := tools.RestoreFile(s.sandboxPolicy(), change.Path, change.Before, change.Existed, change.LineEnding, change.Encoding, change.HadBOM)
+				summary := fmt.Sprintf("工具 %s 已写入文件，但记录回退快照失败: %v", name, snapshotErr)
+				if rollbackErr != nil {
+					summary += fmt.Sprintf("；自动恢复也失败: %v", rollbackErr)
+				} else {
+					summary += "；已自动恢复写入前状态"
+				}
+				result = tools.Result{Summary: summary, IsError: true}
+				result = ensureToolErrorPart(result, name, normalizeToolArgs(call.Function.Arguments))
+				break
+			}
+			s.turnChanges = append(s.turnChanges, change)
+		}
+	}
+	// Build model feedback only after snapshot recording and any automatic
+	// rollback, so the model never receives a stale success message.
+	feedback := result.Summary
+	if feedback == "" {
+		feedback = "（无输出）"
+	}
+	for _, part := range result.Parts {
+		if part.Kind == tools.PartToolCall && part.Output != "" && strings.TrimSpace(part.Output) != strings.TrimSpace(feedback) {
+			feedback = feedback + "\n" + part.Output
+			break
+		}
+	}
+	return result, protocol.Message{
+		Role:        "tool",
+		ToolCallID:  call.ID,
+		Name:        name,
+		Content:     feedback,
+		Attachments: protocolToolAttachments(result.Attachments),
+	}
+}
+
+func protocolToolAttachments(attachments []tools.Attachment) []protocol.Attachment {
+	converted := make([]protocol.Attachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		converted = append(converted, protocol.Attachment{Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data})
+	}
+	return converted
+}
+
+func applyToolResultPolicy(result tools.Result, policy string) tools.Result {
+	summaryLimit, detailLimit := 4_000, 8_000
+	switch policy {
+	case "balanced":
+		summaryLimit, detailLimit = 12_000, 24_000
+	case "raw-local":
+		summaryLimit, detailLimit = 32_000, 64_000
+	}
+	result.Summary = clipContextText(result.Summary, summaryLimit)
+	for index := range result.Parts {
+		part := &result.Parts[index]
+		part.Input = clipContextText(part.Input, detailLimit/2)
+		part.Output = clipContextText(part.Output, detailLimit)
+		if part.Kind == tools.PartText {
+			part.Text = clipContextText(part.Text, detailLimit)
+		}
+		for sourceIndex := range part.Sources {
+			part.Sources[sourceIndex].Snippet = clipContextText(part.Sources[sourceIndex].Snippet, 800)
+		}
+	}
+	return result
+}
+
+func ensureToolErrorPart(result tools.Result, name string, rawArgs json.RawMessage) tools.Result {
+	if !result.IsError {
+		return result
+	}
+	for _, part := range result.Parts {
+		if part.Kind == tools.PartToolCall {
+			return result
+		}
+	}
+	result.Parts = []tools.ResultPart{{
+		Kind:   tools.PartToolCall,
+		Name:   name,
+		Status: "error",
+		Input:  toolInputForDisplay(name, rawArgs),
+		Output: result.Summary,
+	}}
+	return result
+}
+
+func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
+	var args map[string]any
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return ""
+	}
+	key := "path"
+	switch name {
+	case "search", "web_search":
+		key = "query"
+	case "read_repository":
+		key = "url"
+	case "run_command":
+		key = "command"
+	case "copy_file":
+		source, _ := args["source"].(string)
+		destination, _ := args["destination"].(string)
+		return strings.TrimSpace(source + " -> " + destination)
+	case "browser":
+		if value, _ := args["url"].(string); strings.TrimSpace(value) != "" {
+			return value
+		}
+		key = "action"
+	case "computer":
+		action, _ := args["action"].(string)
+		windowID, _ := args["window_id"].(string)
+		return strings.TrimSpace(action + " " + windowID)
+	}
+	value, _ := args[key].(string)
+	return value
+}

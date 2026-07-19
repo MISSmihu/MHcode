@@ -8,4 +8,14 @@ export default defineConfig({
     port: 34116,
     strictPort: false,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          markdown: ["markdown-it", "highlight.js"],
+          solid: ["solid-js"],
+        },
+      },
+    },
+  },
 });

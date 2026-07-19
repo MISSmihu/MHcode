@@ -1,29 +1,112 @@
 # MHcode
 
-MHcode 是一个面向开发者的 AI 协议交换台。首发目标是打透 DeepSeek 官方接入，并把 Skills、MCP、工具调用、缓存命中、模型路由和费用观测做成核心能力。
+MHcode 是一个本地优先的 AI 编程 Agent 工作台。它把多模型协议、结构化开发工具、权限审批、Plan、AI 团队、项目记忆、对话分支、Git、持久终端和内置浏览器放进同一个桌面应用。
 
-## 技术路线
+> 当前处于快速开发阶段，Windows 是主要验证平台。源码可构建、核心测试可运行，但还不是经过签名、升级迁移和真实多供应商长期压测的稳定发行版。
 
-- 桌面壳：Wails v2 稳定线，后续观察 Wails v3。
-- 核心引擎：Go。
-- 前端界面：SolidJS + TypeScript + Vite。
-- 本地存储：SQLite。
-- 本地密钥：系统 Keychain / Credential Manager。
-- 进程通信：Wails Go binding，必要时补本地 WebSocket / JSON-RPC。
-- 首发模型协议：DeepSeek 官方 API。
-- 扩展协议：OpenAI Compatible、Anthropic、Gemini、Azure OpenAI、Ollama、LM Studio、vLLM、国内模型平台和自定义 HTTP/SSE/WebSocket。
+## 当前能力
 
-## 第一阶段目标
+- 模型协议：DeepSeek 官方、OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Gemini 原生协议及自定义兼容供应商。
+- 模型管理：密钥保存、连接测试、上游模型发现、模型删除、协议兼容参数、上下文窗口来源与手动覆盖。
+- Agent：流式工具循环、低/中/高/超高推理档位、显式 Plan、任务进度、消息排队与运行中引导。
+- AI 团队：规划、实现、测试、审阅和汇总角色，可为每个角色选择供应商与模型。
+- 结构化工具：文件读取/搜索/写入/补丁/复制/删除、命令、Git、终端、网络搜索、远程仓库读取、浏览器和其他窗口操控。
+- 上下文：稳定前缀、MCP schema 快照、工具结果摘要、模型感知的自动上下文压缩及 tokens/缓存/费用观测。
+- 工作区：项目与会话持久化、长期记忆、checkpoint、rewind、对话分叉、Git 审阅和持久终端。
+- 桌面能力：Chromium 内核浏览器、网页检查与截图、文件预览、图片粘贴和预览、Windows 窗口控制。
 
-1. 建立 Wails + Go + SolidJS 桌面骨架。
-2. 实现 DeepSeek 官方接入：密钥、模型探测、流式输出、错误翻译。
-3. 实现推理强度菜单：低 / 中 / 高 / 超高。
-4. 实现 Skills 加载和 MCP schema 快照。
-5. 实现稳定前缀与易变尾部，缓存命中率目标 `96%+`。
-6. 实现 tokens、缓存命中率、单轮费用和会话费用统计。
+## 技术栈
+
+- Go `1.26.5` 工具链
+- Wails `v2.12.0`
+- SolidJS + TypeScript + Vite
+- Bun `1.3.x`
+- SQLite（纯 Go 驱动）
+- Windows Credential Manager 密钥存储
+- Chrome DevTools Protocol + Edge/Chrome 浏览器内核
+
+详细模块边界见 [技术栈与开发工具链](docs/technical-stack.zh-CN.md)。
+
+## 本地开发
+
+### 前置条件
+
+1. Go。`go.mod` 会选择 `go1.26.5` 工具链。
+2. Bun。Windows PowerShell 中统一调用 `bun.cmd`，避免执行策略拦截 `bun.ps1`。
+3. Git。
+4. Wails CLI：
+
+```powershell
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+```
+
+5. Windows WebView2 Runtime；内置浏览器还需要 Microsoft Edge 或 Google Chrome。
+
+### 安装与检查
+
+```powershell
+git clone https://github.com/MISSmihu/MHcode.git
+cd MHcode
+
+go mod download
+
+cd frontend
+bun.cmd install --frozen-lockfile
+bun.cmd run check
+cd ..
+
+go test ./... -count=1
+go vet ./...
+```
+
+### 运行与构建
+
+```powershell
+# 开发模式
+wails dev
+
+# Windows 生产构建，输出到 build/bin/MHcode.exe
+wails build -clean
+```
+
+`frontend/wailsjs` 和 `frontend/dist` 是生成目录，不要手工编辑或提交。前端只使用 `frontend/bun.lock`，不要新增第二份包管理器锁文件。
+
+## 本地数据与密钥
+
+Windows 默认数据目录为 `%AppData%\MHcode`：
+
+- `runtime-settings.json`：非敏感运行配置和供应商元数据。
+- `projects.json`：项目与会话清单。
+- `sessions/`：事件日志、checkpoint、分支和项目记忆。
+- `mhcode.db`：用量、供应商状态等 SQLite 数据。
+- `browser-profile/`：内置浏览器配置。
+
+API Key 和浏览器密码不写入 JSON 或 SQLite，Windows 下保存到 Credential Manager。移除最后一个项目后，应用会使用 `%USERPROFILE%\MHcodeProject` 作为临时工作区。
+
+## 安全边界
+
+- 工作区读写、额外可写目录、网络、Shell、破坏性操作和审批策略由运行设置共同控制。
+- Windows 命令进程使用 Job Object 管理进程树，并可限制内存、CPU、进程数和子进程权限。
+- 当前操作系统层沙箱**不提供文件系统或网络命名空间隔离**；这两项仍由路径校验、命令策略和用户审批约束。不要把 UI 中的“沙箱”理解为虚拟机级隔离。
+- 非 Windows 平台目前只有基础进程管理，尚未达到 Windows 的验证程度。
+
+## 修改基线
+
+提交前至少运行：
+
+```powershell
+cd frontend
+bun.cmd run check
+cd ..
+go test ./... -count=1
+go vet ./...
+```
+
+涉及 Wails API、浏览器原生表面、Windows 进程控制或打包资源时，再运行 `wails build -clean`。涉及模型上下文目录时，当前必须同步修改 Go 与前端目录并补测试，直到该目录改为单一生成源。
 
 ## 文档
 
-- [开发计划](docs/development-plan.zh-CN.md)
-- [技术栈与开发工具链](docs/technical-stack.zh-CN.md)
-- [Skills 开发文档](docs/skills-development.zh-CN.md)
+- [当前架构与开发工具链](docs/technical-stack.zh-CN.md)
+- [开发状态与发布门槛](docs/development-plan.zh-CN.md)
+- [Skills 与 Agent 核心维护](docs/skills-development.zh-CN.md)
+- [内置 Agent 规则](skills/mhcode-agent-core/SKILL.md)
