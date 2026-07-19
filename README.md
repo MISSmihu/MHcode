@@ -110,3 +110,7 @@ go vet ./...
 - [开发状态与发布门槛](docs/development-plan.zh-CN.md)
 - [Skills 与 Agent 核心维护](docs/skills-development.zh-CN.md)
 - [内置 Agent 规则](skills/mhcode-agent-core/SKILL.md)
+
+## 许可证
+
+MHcode 使用 [MIT License](LICENSE)。发布衍生版本时请保留原版权和许可证声明。
