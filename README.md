@@ -110,6 +110,8 @@ go vet ./...
 - [开发状态与发布门槛](docs/development-plan.zh-CN.md)
 - [Skills 与 Agent 核心维护](docs/skills-development.zh-CN.md)
 - [内置 Agent 规则](skills/mhcode-agent-core/SKILL.md)
+- [贡献与 Pull Request 流程](CONTRIBUTING.md)
+- [版本变更记录](CHANGELOG.md)
 
 ## 许可证
 
