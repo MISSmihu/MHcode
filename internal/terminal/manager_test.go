@@ -35,14 +35,14 @@ func TestManagerRunsPersistentWorkspaceShell(t *testing.T) {
 			t.Fatal(err)
 		}
 		normalizedOutput := strings.ToLower(filepath.Clean(strings.TrimSpace(state.Output)))
-		normalizedRoot := strings.ToLower(filepath.Clean(root))
+		normalizedRoot := strings.ToLower(filepath.Clean(state.Workdir))
 		if strings.Contains(normalizedOutput, normalizedRoot) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !strings.Contains(strings.ToLower(filepath.Clean(state.Output)), strings.ToLower(filepath.Clean(root))) {
-		t.Fatalf("terminal output = %q, want workspace %q", state.Output, root)
+	if !strings.Contains(strings.ToLower(filepath.Clean(state.Output)), strings.ToLower(filepath.Clean(state.Workdir))) {
+		t.Fatalf("terminal output = %q, want workspace %q", state.Output, state.Workdir)
 	}
 	if err := manager.Stop(state.ID); err != nil {
 		t.Fatal(err)

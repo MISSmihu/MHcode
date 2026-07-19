@@ -195,7 +195,7 @@ func TestServiceCreatesPermanentWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Path != destination || created.Branch != "mhcode/permanent" || created.RepositoryRoot != repository {
+	if !samePath(created.Path, destination) || created.Branch != "mhcode/permanent" || !samePath(created.RepositoryRoot, repository) {
 		t.Fatalf("created worktree = %#v", created)
 	}
 	if data, err := os.ReadFile(filepath.Join(destination, "tracked.txt")); err != nil || strings.ReplaceAll(string(data), "\r\n", "\n") != "worktree fixture\n" {

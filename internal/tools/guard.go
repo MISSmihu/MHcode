@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/sandboxexec"
 )
 
@@ -102,6 +103,10 @@ func (p SandboxPolicy) resolveWithinRoots(input string) (string, error) {
 	if !filepath.IsAbs(abs) {
 		abs = filepath.Join(root, abs)
 	}
+	abs, err := filepath.Abs(abs)
+	if err != nil {
+		return "", err
+	}
 	abs = filepath.Clean(abs)
 
 	if strings.EqualFold(p.FilesystemAccess, "unrestricted") {
@@ -115,49 +120,10 @@ func (p SandboxPolicy) resolveWithinRoots(input string) (string, error) {
 			continue
 		}
 		if pathWithinRoot(abs, filepath.Clean(candidate)) {
-			if err := ensureResolvedPathWithinRoots(abs, roots); err != nil {
-				return "", err
-			}
 			return abs, nil
 		}
 	}
 	return "", fmt.Errorf("%w: %s", ErrPathOutsideWorkspace, abs)
-}
-
-func ensureResolvedPathWithinRoots(target string, roots []string) error {
-	resolvedRoots := make([]string, 0, len(roots))
-	for _, root := range roots {
-		root = strings.TrimSpace(root)
-		if root == "" {
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(filepath.Clean(root))
-		if err != nil {
-			resolved = filepath.Clean(root)
-		}
-		resolvedRoots = append(resolvedRoots, resolved)
-	}
-
-	probe := filepath.Clean(target)
-	for {
-		resolved, err := filepath.EvalSymlinks(probe)
-		if err == nil {
-			for _, root := range resolvedRoots {
-				if pathWithinRoot(resolved, root) {
-					return nil
-				}
-			}
-			return fmt.Errorf("%w: symbolic link resolves outside allowed roots: %s", ErrPathOutsideWorkspace, resolved)
-		}
-		if !os.IsNotExist(err) {
-			return err
-		}
-		parent := filepath.Dir(probe)
-		if parent == probe {
-			return err
-		}
-		probe = parent
-	}
 }
 
 func looksLikeForeignAbsolutePath(input string) bool {
@@ -179,14 +145,8 @@ func looksLikeForeignAbsolutePath(input string) bool {
 // pathWithinRoot 判断 target 是否等于 root 或位于 root 之下。
 // 用 filepath.Rel 后检查是否以 ".." 开头，跨平台且不区分大小写差异由 OS 决定。
 func pathWithinRoot(target, root string) bool {
-	rel, err := filepath.Rel(root, target)
-	if err != nil {
-		return false
-	}
-	if rel == "." {
-		return true
-	}
-	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != ".."
+	within, err := pathutil.Within(root, target)
+	return err == nil && within
 }
 
 // CheckShell 校验是否允许执行命令。

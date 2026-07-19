@@ -9,12 +9,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/sandboxexec"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
@@ -106,7 +106,7 @@ func (m *Manager) start(workdir string, restricted bool, limits sandboxexec.Limi
 	if workdir == "" {
 		return SessionState{}, errors.New("terminal workdir is required")
 	}
-	abs, err := filepath.Abs(workdir)
+	abs, err := pathutil.Canonical(workdir)
 	if err != nil {
 		return SessionState{}, err
 	}

@@ -8,11 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 )
 
 const (
@@ -291,7 +292,7 @@ func repositoryRoot(ctx context.Context, workspaceRoot string) (string, error) {
 	if workspaceRoot == "" {
 		return "", errors.New("workspace root is required")
 	}
-	absWorkspace, err := filepath.Abs(workspaceRoot)
+	absWorkspace, err := pathutil.Canonical(workspaceRoot)
 	if err != nil {
 		return "", err
 	}
@@ -306,9 +307,13 @@ func repositoryRoot(ctx context.Context, workspaceRoot string) (string, error) {
 		}
 		return "", err
 	}
-	repoRoot := filepath.Clean(strings.TrimSpace(string(raw)))
+	repoRoot := strings.TrimSpace(string(raw))
 	if repoRoot == "" {
 		return "", ErrNotRepository
+	}
+	repoRoot, err = pathutil.Canonical(repoRoot)
+	if err != nil {
+		return "", err
 	}
 	within, err := pathWithin(absWorkspace, repoRoot)
 	if err != nil {
@@ -321,11 +326,7 @@ func repositoryRoot(ctx context.Context, workspaceRoot string) (string, error) {
 }
 
 func pathWithin(root, target string) (bool, error) {
-	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
-	if err != nil {
-		return false, err
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
+	return pathutil.Within(root, target)
 }
 
 func cleanRelativePath(path string) (string, error) {
@@ -379,7 +380,7 @@ func validateWorktreeDestination(repoRoot, destination string) (string, error) {
 	if destination == "" {
 		return "", errors.New("worktree destination is required")
 	}
-	absDestination, err := filepath.Abs(destination)
+	absDestination, err := pathutil.Canonical(destination)
 	if err != nil {
 		return "", err
 	}
@@ -408,12 +409,12 @@ func validateWorktreeDestination(repoRoot, destination string) (string, error) {
 }
 
 func samePath(left, right string) bool {
-	left = filepath.Clean(left)
-	right = filepath.Clean(right)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(left, right)
+	leftWithinRight, err := pathutil.Within(left, right)
+	if err != nil || !leftWithinRight {
+		return false
 	}
-	return left == right
+	rightWithinLeft, err := pathutil.Within(right, left)
+	return err == nil && rightWithinLeft
 }
 
 func listBranches(ctx context.Context, repoRoot string) ([]Branch, error) {

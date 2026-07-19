@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 )
 
 func TestResolveWritePathRejectsTraversal(t *testing.T) {
@@ -58,6 +60,19 @@ func TestResolveReadPathExtraRoot(t *testing.T) {
 	target := filepath.Join(extra, "x.txt")
 	if _, err := policy.ResolveWritePath(target); err != nil {
 		t.Fatalf("额外可写根内路径应通过，实际: %v", err)
+	}
+}
+
+func TestResolveWritePathAcceptsCanonicalWorkspaceAlias(t *testing.T) {
+	root := t.TempDir()
+	canonicalRoot, err := pathutil.Canonical(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := SandboxPolicy{WorkspaceRoot: root, FilesystemAccess: "workspace-write"}
+	target := filepath.Join(canonicalRoot, "nested", "file.txt")
+	if _, err := policy.ResolveWritePath(target); err != nil {
+		t.Fatalf("canonical workspace path should be accepted: %v", err)
 	}
 }
 

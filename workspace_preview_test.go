@@ -36,7 +36,9 @@ func TestWorkspacePreviewServesHTMLAndRelativeAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preview.Name != "index.html" || preview.Path != page {
+	pageInfo, statErr := os.Stat(page)
+	previewInfo, previewStatErr := os.Stat(preview.Path)
+	if preview.Name != "index.html" || statErr != nil || previewStatErr != nil || !os.SameFile(pageInfo, previewInfo) {
 		t.Fatalf("preview = %+v", preview)
 	}
 	if body := getPreviewBody(t, preview.URL); !strings.Contains(body, "MHcode") {
