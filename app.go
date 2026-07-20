@@ -405,6 +405,12 @@ func (a *App) OpenWorkspaceFile(path string) error {
 	return a.service.OpenWorkspaceFile(path)
 }
 
+// ReadWorkspaceFile returns a bounded, encoding-safe text preview for the
+// right-side file panel. The agent service enforces the active workspace.
+func (a *App) ReadWorkspaceFile(path string) (agent.WorkspaceFilePreview, error) {
+	return a.service.ReadWorkspaceFile(path)
+}
+
 // PreviewWorkspaceFile returns a loopback URL for the embedded browser. The
 // service validates the requested file against the active workspace first.
 func (a *App) PreviewWorkspaceFile(path string) (BrowserPreview, error) {

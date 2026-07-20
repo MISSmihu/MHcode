@@ -570,6 +570,7 @@ func runGitWithExitPolicyTimeout(ctx context.Context, repoRoot string, limit int
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "git", args...)
+	configureCommand(cmd)
 	cmd.Dir = repoRoot
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

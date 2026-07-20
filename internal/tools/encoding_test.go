@@ -197,6 +197,19 @@ func TestUTF16LERoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeFileTextDistinguishesBinaryFromUTF8AndUTF16(t *testing.T) {
+	binaryContent := decodeFileText([]byte{0, 1, 2, 3})
+	if !binaryContent.Binary || binaryContent.Encoding != EncodingBinary {
+		t.Fatalf("binary content misclassified: %+v", binaryContent)
+	}
+
+	utf16WithoutBOM := encodeUTF16("hello\r\n", binary.LittleEndian)
+	text := decodeFileText(utf16WithoutBOM)
+	if text.Binary || text.Encoding != EncodingUTF16LE || text.Content != "hello\n" {
+		t.Fatalf("UTF-16 without BOM misclassified: %+v", text)
+	}
+}
+
 func TestPowerShellScriptDefaultUsesUTF8BOMOnWindows(t *testing.T) {
 	if os.PathSeparator != '\\' {
 		t.Skip("Windows-specific script default")

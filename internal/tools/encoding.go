@@ -93,15 +93,15 @@ func decodeFileText(raw []byte) FileText {
 			result.Encoding, result.Binary = EncodingBinary, true
 			return result
 		}
-	case utf8.Valid(raw):
-		result.Encoding = EncodingUTF8
-		text = string(raw)
 	case looksLikeUTF16(raw, binary.LittleEndian):
 		result.Encoding = EncodingUTF16LE
 		text, _ = decodeUTF16(raw, binary.LittleEndian)
 	case looksLikeUTF16(raw, binary.BigEndian):
 		result.Encoding = EncodingUTF16BE
 		text, _ = decodeUTF16(raw, binary.BigEndian)
+	case utf8.Valid(raw) && !looksBinary(raw):
+		result.Encoding = EncodingUTF8
+		text = string(raw)
 	case !looksBinary(raw):
 		if decoded, ok := tryDecodeGBK(raw); ok {
 			result.Encoding = EncodingGB18030
@@ -159,7 +159,7 @@ func looksLikeUTF16(raw []byte, order binary.ByteOrder) bool {
 			zeroOdd++
 		}
 	}
-	threshold := len(raw) / 8
+	threshold := max(2, len(raw)/8)
 	if order == binary.LittleEndian {
 		return zeroOdd >= threshold && zeroOdd > zeroEven*2
 	}

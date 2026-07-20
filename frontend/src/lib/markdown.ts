@@ -1,5 +1,6 @@
 import MarkdownIt from "markdown-it";
 import hljs from "highlight.js/lib/common";
+import { parseWorkspacePathCandidate } from "./workspace-path";
 
 // 单例 markdown 渲染器：代码块走 highlight.js 语法高亮，其余走标准 CommonMark。
 // 输出的 HTML 由调用方以 innerHTML 注入；输入始终来自模型文本，markdown-it 默认转义 HTML，
@@ -30,6 +31,17 @@ const md: MarkdownIt = new MarkdownIt({
     );
   },
 });
+
+md.renderer.rules.code_inline = (tokens, idx) => {
+  const content = tokens[idx].content;
+  const candidate = parseWorkspacePathCandidate(content);
+  if (!candidate) return `<code>${escapeHtml(content)}</code>`;
+  return (
+    `<a class="workspace-file-link" href="#" data-workspace-path="${escapeAttr(candidate.path)}"` +
+    `${candidate.line ? ` data-workspace-line="${candidate.line}"` : ""} title="在右侧查看文件">` +
+    `<code>${escapeHtml(content)}</code></a>`
+  );
+};
 
 // 链接统一在新窗口打开并加安全 rel。
 const defaultLinkOpen =

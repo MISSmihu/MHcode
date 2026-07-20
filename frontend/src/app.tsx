@@ -17,7 +17,6 @@ import {
   Copy,
   Cpu,
   Database,
-  FileDiff,
   FileText,
   Folder,
   FolderOpen,
@@ -69,14 +68,14 @@ import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCle
 import type { JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { ReasoningMenu } from "./components/ReasoningMenu";
-import { BrowserPreviewPanel } from "./components/BrowserPreviewPanel";
+import { SidePanelHost } from "./components/SidePanelHost";
+import type { SidePanelView } from "./components/SidePanelHost";
 import { MessageContent, TaskProgress, textToParts } from "./components/chat/MessageContent";
 import type { TaskProgressPart } from "./components/chat/MessageContent";
 import { TimelinePanel } from "./components/TimelinePanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { ImagePreviewModal } from "./components/ImagePreviewModal";
 import { WorkspaceToolsPanel } from "./components/WorkspaceToolsPanel";
-import { ReviewPanel } from "./components/ReviewPanel";
 import {
   clearDeepSeekAPIKey,
   getWorkbenchState,
@@ -149,6 +148,8 @@ import type {
   RuntimeSettings,
   UsageMetrics,
   WorkbenchState,
+  WorkspaceFileRequest,
+  WorkspaceFileView,
 } from "./types";
 
 const fallbackProfile =
@@ -326,12 +327,15 @@ function App() {
   const [browserPreview, setBrowserPreview] = createSignal<BrowserPreview>();
   const [workspaceToolsOpen, setWorkspaceToolsOpen] = createSignal(false);
   const [reviewOpen, setReviewOpen] = createSignal(false);
+  const [sidePanelView, setSidePanelView] = createSignal<SidePanelView>("browser");
+  const [workspaceFileRequest, setWorkspaceFileRequest] = createSignal<WorkspaceFileRequest>();
   let chatScrollRef: HTMLElement | undefined;
   let shellRef: HTMLElement | undefined;
   let workbenchRef: HTMLDivElement | undefined;
   let composerEditorRef: HTMLDivElement | undefined;
   let composerTailEditorRef: HTMLDivElement | undefined;
   let composerImageInputRef: HTMLInputElement | undefined;
+  let workspaceFileRequestID = 0;
   let projectActionMenuRef: HTMLDivElement | undefined;
   let pointerSidebarResizeActive = false;
   let mouseSidebarResizeActive = false;
@@ -456,8 +460,8 @@ function App() {
           return;
         }
       }
-      setReviewOpen(false);
       setBrowserPreview({ ...preview, ask: false });
+      setSidePanelView("browser");
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -466,18 +470,28 @@ function App() {
   const handlePreviewFile = async (path: string) => {
     setError("");
     try {
-      setReviewOpen(false);
       setBrowserPreview(await previewWorkspaceFile(path));
+      setSidePanelView("browser");
     } catch (err) {
       setError(errorMessage(err));
       throw err;
     }
   };
 
+  const handleOpenWorkspaceFile = (path: string, view: WorkspaceFileView = "file", line?: number) => {
+    const target = path.trim();
+    if (!target) return;
+    setError("");
+    setWorkspaceToolsOpen(false);
+    setWorkspaceFileRequest({ id: ++workspaceFileRequestID, path: target, view, line });
+    setReviewOpen(true);
+    setSidePanelView("files");
+    queueMicrotask(constrainBrowserPanelWidth);
+  };
+
   const handleOpenBrowser = async () => {
     setError("");
     try {
-      setReviewOpen(false);
       const browserState = await openBrowserURL("about:blank");
       setBrowserPreview({
         path: "",
@@ -486,6 +500,7 @@ function App() {
         tabId: browserState.activeTabId,
         managed: true,
       });
+      setSidePanelView("browser");
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -493,7 +508,6 @@ function App() {
 
   const openLinkInternally = async (url: string) => {
     setError("");
-    setReviewOpen(false);
     const browserState = await openBrowserURL(url);
     let name = "网页";
     try {
@@ -508,16 +522,28 @@ function App() {
       tabId: browserState.activeTabId,
       managed: true,
     });
+    setSidePanelView("browser");
+  };
+
+  const closeBrowserPanel = () => {
+    setBrowserPreview(undefined);
+    if (reviewOpen()) setSidePanelView("files");
+  };
+
+  const closeReviewPanel = () => {
+    setReviewOpen(false);
+    if (browserPreview()) setSidePanelView("browser");
   };
 
   const toggleReviewPanel = () => {
-    const next = !reviewOpen();
-    setReviewOpen(next);
-    if (next) {
-      setBrowserPreview(undefined);
-      setWorkspaceToolsOpen(false);
-      queueMicrotask(constrainBrowserPanelWidth);
+    if (reviewOpen() && sidePanelView() === "files") {
+      closeReviewPanel();
+      return;
     }
+    setReviewOpen(true);
+    setSidePanelView("files");
+    setWorkspaceToolsOpen(false);
+    queueMicrotask(constrainBrowserPanelWidth);
   };
 
   const requestOpenURL = (url: string) => {
@@ -927,7 +953,7 @@ function App() {
     const unsubscribeBrowserOpen = onBrowserPreviewOpen((preview) => {
       void handleBrowserPreviewRequest(preview);
     });
-    const unsubscribeBrowserClose = onBrowserPreviewClose(() => setBrowserPreview(undefined));
+    const unsubscribeBrowserClose = onBrowserPreviewClose(closeBrowserPanel);
     const unsubscribeChatTask = onChatTaskEvent(handleChatTaskEvent);
     const unsubscribeMCPState = onMCPState(setState);
     const closeProjectMenuOnOutsidePress = (event: PointerEvent) => {
@@ -2903,7 +2929,12 @@ function App() {
 
       <div
         class="workbench-main"
-        classList={{ "side-panel-open": Boolean(browserPreview()) || reviewOpen(), "browser-open": Boolean(browserPreview()), "review-open": reviewOpen(), "resizing-browser": resizingBrowserPanel() }}
+        classList={{
+          "side-panel-open": Boolean(browserPreview()) || reviewOpen(),
+          "browser-open": sidePanelView() === "browser" && Boolean(browserPreview()),
+          "review-open": sidePanelView() === "files" && reviewOpen(),
+          "resizing-browser": resizingBrowserPanel(),
+        }}
         ref={workbenchRef}
         style={{ "--browser-panel-width": `${Math.round(browserPanelWidth())}px` } as JSX.CSSProperties}
       >
@@ -2939,11 +2970,11 @@ function App() {
             <button
               type="button"
               classList={{ active: reviewOpen() }}
-              title="代码审阅"
-              aria-label="代码审阅"
+              title="文件与更改"
+              aria-label="文件与更改"
               onClick={toggleReviewPanel}
             >
-              <FileDiff size={15} />
+              <FileText size={15} />
             </button>
             <button type="button" title="内置浏览器" aria-label="内置浏览器" onClick={() => void handleOpenBrowser()}>
               <Globe2 size={15} />
@@ -3005,6 +3036,7 @@ function App() {
                     <MessageContent
                       parts={message.parts && message.parts.length > 0 ? message.parts : textToParts(message.content)}
                       onPreviewFile={handlePreviewFile}
+                      onOpenWorkspaceFile={handleOpenWorkspaceFile}
                       onOpenURL={requestOpenURL}
                     />
                     <Show when={(message.streaming && !message.parts?.some((part) => part.kind === "tool_call")) || message.cancelled}>
@@ -3076,6 +3108,7 @@ function App() {
                             <MessageContent
                               parts={textToParts(message.content)}
                               inferFileArtifacts={false}
+                              onOpenWorkspaceFile={handleOpenWorkspaceFile}
                               onOpenURL={requestOpenURL}
                             />
                           </Show>
@@ -3183,17 +3216,19 @@ function App() {
           </For>
         </section>
 
-        <Show when={!chatNearBottom() && messages().length > 0}>
-          <button
-            class="chat-jump-bottom"
-            type="button"
-            title="跳到最新消息"
-            aria-label="跳到最新消息"
-            onClick={() => scrollChatToBottom()}
-          >
-            <ArrowDown size={16} />
-          </button>
-        </Show>
+        <div class="chat-jump-bottom-dock">
+          <Show when={!chatNearBottom() && messages().length > 0}>
+            <button
+              class="chat-jump-bottom"
+              type="button"
+              title="跳到最新消息"
+              aria-label="跳到最新消息"
+              onClick={() => scrollChatToBottom()}
+            >
+              <ArrowDown size={16} />
+            </button>
+          </Show>
+        </div>
 
         <Show when={activeTaskProgress()}>
           {(progress) => (
@@ -3467,71 +3502,18 @@ function App() {
         />
       </section>
 
-      <Show when={browserPreview()}>
-        {(preview) => (
-          <>
-            <div
-              class="browser-panel-resizer"
-				classList={{ "browser-surface-suspended": browserSurfaceSuspended() }}
-              role="separator"
-              aria-label="调整浏览器面板宽度"
-              aria-orientation="vertical"
-              aria-valuemin={Math.round(browserPanelLimits().min)}
-              aria-valuemax={Math.round(browserPanelLimits().max)}
-              aria-valuenow={Math.round(browserPanelWidth())}
-              tabIndex={0}
-              title="拖拽调整浏览器宽度，双击恢复默认"
-              onPointerDown={startBrowserResize}
-              onPointerMove={moveWindowPointerBrowserResize}
-              onPointerUp={stopBrowserResize}
-              onPointerCancel={stopBrowserResize}
-              onMouseDown={startMouseBrowserResize}
-              onDblClick={resetBrowserPanelWidth}
-              onKeyDown={(event) => {
-                if (event.key === "ArrowLeft") {
-                  event.preventDefault();
-                  nudgeBrowserPanelWidth(1);
-                }
-                if (event.key === "ArrowRight") {
-                  event.preventDefault();
-                  nudgeBrowserPanelWidth(-1);
-                }
-                if (event.key === "Home") {
-                  event.preventDefault();
-                  setAndPersistBrowserPanelWidth(browserPanelLimits().min);
-                }
-                if (event.key === "End") {
-                  event.preventDefault();
-                  setAndPersistBrowserPanelWidth(browserPanelLimits().max);
-                }
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  resetBrowserPanelWidth();
-                }
-              }}
-            />
-            <BrowserPreviewPanel
-              preview={preview()}
-              annotationPolicy={runtimeDraft()?.browser.screenshotAnnotations ?? "never"}
-              credentials={runtimeDraft()?.browser.credentials ?? []}
-				suspended={browserSurfaceSuspended()}
-              onClose={() => setBrowserPreview(undefined)}
-            />
-          </>
-        )}
-      </Show>
-      <Show when={reviewOpen()}>
+      <Show when={Boolean(browserPreview()) || reviewOpen()}>
         <>
           <div
             class="browser-panel-resizer"
             role="separator"
-            aria-label="调整审阅面板宽度"
+            aria-label="调整右侧面板宽度"
             aria-orientation="vertical"
             aria-valuemin={Math.round(browserPanelLimits().min)}
             aria-valuemax={Math.round(browserPanelLimits().max)}
             aria-valuenow={Math.round(browserPanelWidth())}
             tabIndex={0}
-            title="拖拽调整审阅宽度，双击恢复默认"
+            title="拖拽调整右侧面板宽度，双击恢复默认"
             onPointerDown={startBrowserResize}
             onPointerMove={moveWindowPointerBrowserResize}
             onPointerUp={stopBrowserResize}
@@ -3561,11 +3543,19 @@ function App() {
               }
             }}
           />
-          <ReviewPanel
-            open={reviewOpen()}
+          <SidePanelHost
+            browser={browserPreview()}
+            reviewOpen={reviewOpen()}
+            activeView={sidePanelView()}
             workspaceRoot={runtimeSettings().workspaceRoot}
-            readOnly={runtimeSettings().sandboxMode === "read-only" || runtimeSettings().filesystemAccess === "read-only"}
-            onClose={() => setReviewOpen(false)}
+            fileRequest={workspaceFileRequest()}
+            dark={themeMode() === "dark"}
+            browserSuspended={browserSurfaceSuspended()}
+            annotationPolicy={runtimeDraft()?.browser.screenshotAnnotations ?? "never"}
+            credentials={runtimeDraft()?.browser.credentials ?? []}
+            onSelectView={setSidePanelView}
+            onCloseBrowser={closeBrowserPanel}
+            onCloseFiles={closeReviewPanel}
           />
         </>
       </Show>

@@ -235,6 +235,28 @@ export type GitDiff = {
   truncated: boolean;
 };
 
+export type WorkspaceFileView = "file" | "changes";
+
+export type WorkspaceFileRequest = {
+  id: number;
+  path: string;
+  view: WorkspaceFileView;
+  line?: number;
+};
+
+export type WorkspaceFilePreview = {
+  path: string;
+  name: string;
+  content: string;
+  encoding: string;
+  lineEnding: string;
+  lineCount: number;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  tooLarge: boolean;
+};
+
 export type TerminalSessionState = {
   id: string;
   shell: string;

@@ -402,7 +402,13 @@ export function WorkspaceToolsPanel(props: WorkspaceToolsPanelProps) {
           </div>
         }>
           <div class="git-panel">
-            <Show when={status()?.available} fallback={<div class="workspace-tools-empty">当前工作区不是 Git 仓库</div>}>
+            <Show when={status()?.available} fallback={
+              <div class="workspace-tools-empty workspace-tools-git-empty">
+                <GitBranch size={20} />
+                <strong>这个文件夹没有启用版本记录</strong>
+                <span>不影响文件查看、编辑或运行项目；只有提交历史和版本差异功能不可用。</span>
+              </div>
+            }>
               <div class="git-toolbar">
                 <div class="git-branch-control">
                   <GitBranch size={14} />

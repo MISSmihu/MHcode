@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, WorkbenchState } from "../types";
+import type { ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, WorkbenchState, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -53,6 +53,7 @@ type WailsAppBinding = {
   SelectDirectory?: () => Promise<string>;
   SelectWorktreeParentDirectory?: () => Promise<string>;
   OpenWorkspaceFile?: (path: string) => Promise<void>;
+  ReadWorkspaceFile?: (path: string) => Promise<WorkspaceFilePreview>;
   PreviewWorkspaceFile?: (path: string) => Promise<BrowserPreview>;
   RevealWorkspaceFile?: (path: string) => Promise<void>;
   GetBrowserState?: () => Promise<BrowserState>;
@@ -920,6 +921,14 @@ export async function openWorkspaceFile(path: string): Promise<void> {
     return;
   }
   throw new Error("文件打开功能仅在 MHcode 桌面应用中可用。");
+}
+
+export async function readWorkspaceFile(path: string): Promise<WorkspaceFilePreview> {
+  const binding = wailsBinding();
+  if (binding?.ReadWorkspaceFile) {
+    return binding.ReadWorkspaceFile(path);
+  }
+  throw new Error("文件预览仅在 MHcode 桌面应用中可用。");
 }
 
 export async function previewWorkspaceFile(path: string): Promise<BrowserPreview> {

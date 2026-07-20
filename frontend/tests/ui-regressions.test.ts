@@ -51,8 +51,61 @@ describe("chat UI regressions", () => {
   test("renders generated files as collapsed artifacts with HTML open actions", async () => {
     const messageContent = await Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text();
     expect(messageContent).toContain('<details class="op-file-artifact"');
-    expect(messageContent).toContain('isHTML() ? "内置打开" : "打开"');
-    expect(messageContent).toContain("外部打开");
+    expect(messageContent).toContain('runFromSummary(event, "view")');
+    expect(messageContent).toContain("在右侧查看文件");
+    expect(messageContent).toContain("在内置浏览器中预览");
+  });
+
+  test("opens workspace files in a non-Git right-side file panel", async () => {
+    const [app, messageContent, reviewPanel] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/ReviewPanel.tsx", import.meta.url)).text(),
+    ]);
+    expect(app).toContain("onOpenWorkspaceFile={handleOpenWorkspaceFile}");
+    expect(app).toContain("fileRequest={workspaceFileRequest()}");
+    expect(messageContent).toContain("<EditedFilesList");
+    expect(messageContent).toContain('props.item.category === "edit" ? true : undefined');
+    expect(messageContent).toContain("data-workspace-path");
+    expect(reviewPanel).toContain("readWorkspaceFile(target)");
+    expect(reviewPanel).toContain("文件会在这里打开，不需要 Git 仓库。");
+    expect(reviewPanel).not.toContain("当前工作区不是 Git 仓库");
+  });
+
+  test("uses a read-only CodeMirror viewer and compact read_file links", async () => {
+    const [messageContent, reviewPanel, codeViewer] = await Promise.all([
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/ReviewPanel.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/CodeViewer.tsx", import.meta.url)).text(),
+    ]);
+    expect(reviewPanel).toContain("<CodeViewer");
+    expect(reviewPanel).not.toContain('class="review-code-line"');
+    expect(codeViewer).toContain("basicSetup");
+    expect(codeViewer).toContain("LanguageDescription.matchFilename");
+    expect(codeViewer).toContain("EditorState.readOnly.of(true)");
+    expect(codeViewer).toContain("EditorView.scrollIntoView");
+    expect(messageContent).toContain('class="op-read-file"');
+    expect(messageContent).toContain('props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine)');
+  });
+
+  test("preserves the embedded browser while switching to a file tab", async () => {
+    const [app, host, css] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/SidePanelHost.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    const openFileStart = app.indexOf("const handleOpenWorkspaceFile");
+    const openFileEnd = app.indexOf("const handleOpenBrowser", openFileStart);
+    const openFileHandler = app.slice(openFileStart, openFileEnd);
+    expect(openFileHandler).toContain('setSidePanelView("files")');
+    expect(openFileHandler).not.toContain("setBrowserPreview(undefined)");
+    expect(app).toContain("<SidePanelHost");
+    expect(host).toContain('type SidePanelView = "browser" | "files"');
+    expect(host).toContain('suspended={props.browserSuspended || activeView() !== "browser"}');
+    expect(host).toContain('onClick={() => props.onSelectView("browser")}');
+    expect(host).toContain('onClick={() => props.onSelectView("files")}');
+    expect(css).toContain(".side-panel-page.inactive");
+    expect(css).toContain("visibility: hidden;");
   });
 
   test("keeps task progress above the composer instead of inside messages", async () => {
@@ -68,6 +121,27 @@ describe("chat UI regressions", () => {
     expect(css).toContain(".task-progress-dock > .op-task-progress");
     expect(css).toContain("width: min(760px, 100%);");
     expect(css).toContain("justify-self: center;");
+  });
+
+  test("keeps the jump-to-bottom action centered above the plan and composer", async () => {
+    const [app, css] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    expect(app).toContain('<div class="chat-jump-bottom-dock">');
+    expect(app.indexOf('class="chat-jump-bottom-dock"')).toBeLessThan(app.indexOf('<section class="task-progress-dock"'));
+
+    const dockStart = css.indexOf(".chat-jump-bottom-dock {");
+    const dockRule = css.slice(dockStart, css.indexOf("}", dockStart) + 1);
+    expect(dockRule).toContain("height: 0;");
+    expect(dockRule).toContain("pointer-events: none;");
+
+    const buttonStart = css.indexOf(".chat-jump-bottom {");
+    const buttonRule = css.slice(buttonStart, css.indexOf("}", buttonStart) + 1);
+    expect(buttonRule).toContain("bottom: 12px;");
+    expect(buttonRule).toContain("left: 50%;");
+    expect(buttonRule).toContain("transform: translateX(-50%);");
+    expect(buttonRule).not.toContain("right: max(");
   });
 
   test("allows independent background tasks for different sessions", async () => {

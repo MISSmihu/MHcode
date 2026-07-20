@@ -19,8 +19,9 @@ import {
   Users,
   Wrench,
 } from "lucide-solid";
-import type { MessagePart } from "../../types";
+import type { MessagePart, WorkspaceFileView } from "../../types";
 import { renderMarkdown, handleCodeCopyClick } from "../../lib/markdown";
+import { parseWorkspaceFileRangeCandidate, parseWorkspacePathCandidate } from "../../lib/workspace-path";
 import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench";
 
 // 操作流渲染：按片段类型分派。工具/diff 卡片默认折叠，用户按需展开（对标 ZCode/Codex）。
@@ -28,6 +29,7 @@ export function MessageContent(props: {
   parts: MessagePart[];
   inferFileArtifacts?: boolean;
   onPreviewFile?: (path: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
 }) {
   const renderedParts = createMemo(() => withInferredFileArtifacts(props.parts, props.inferFileArtifacts !== false));
@@ -38,12 +40,17 @@ export function MessageContent(props: {
         {(block) => (
           <Switch>
             <Match when={block.kind === "text"}>
-              <MarkdownBlock source={(block as TextRenderBlock).part.text} onOpenURL={props.onOpenURL} />
+              <MarkdownBlock
+                source={(block as TextRenderBlock).part.text}
+                onOpenURL={props.onOpenURL}
+                onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+              />
             </Match>
             <Match when={block.kind === "activity"}>
               <ActivityGroup
                 parts={(block as ActivityRenderBlock).parts}
                 onPreviewFile={props.onPreviewFile}
+                onOpenWorkspaceFile={props.onOpenWorkspaceFile}
                 onOpenURL={props.onOpenURL}
               />
             </Match>
@@ -74,6 +81,7 @@ type ActivityItem = { category: ActivityCategory; parts: MessagePart[] };
 function ActivityGroup(props: {
   parts: MessagePart[];
   onPreviewFile?: (path: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
 }) {
   const items = createMemo(() => buildActivityItems(props.parts));
@@ -81,19 +89,41 @@ function ActivityGroup(props: {
   return (
     <>
       <div class="op-activity-feed">
-        <For each={items()}>{(item) => <ActivityRow item={item} onOpenURL={props.onOpenURL} />}</For>
+        <For each={items()}>
+          {(item) => (
+            <ActivityRow
+              item={item}
+              onOpenURL={props.onOpenURL}
+              onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+            />
+          )}
+        </For>
       </div>
       <For each={artifacts()}>
-        {(part) => <FileCard part={part} onPreviewFile={props.onPreviewFile} />}
+        {(part) => (
+          <FileCard
+            part={part}
+            onPreviewFile={props.onPreviewFile}
+            onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+          />
+        )}
       </For>
     </>
   );
 }
 
-function ActivityRow(props: { item: ActivityItem; onOpenURL?: (url: string) => void | Promise<void> }) {
+function ActivityRow(props: {
+  item: ActivityItem;
+  onOpenURL?: (url: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+}) {
   const status = () => activityStatus(props.item);
   return (
-    <details class="op-activity-item" classList={{ [status()]: true }} open={status() === "error"}>
+    <details
+      class="op-activity-item"
+      classList={{ [status()]: true }}
+      open={status() === "error" || props.item.category === "edit" ? true : undefined}
+    >
       <summary title={activityTitle(props.item)}>
         <span class="op-activity-icon"><ActivityIcon category={props.item.category} /></span>
         <span class="op-activity-label">{activityLabel(props.item)}</span>
@@ -106,6 +136,9 @@ function ActivityRow(props: { item: ActivityItem; onOpenURL?: (url: string) => v
         <ChevronRight class="op-activity-chevron" size={14} aria-hidden="true" />
       </summary>
       <div class="op-activity-body">
+        <Show when={props.item.category === "edit"}>
+          <EditedFilesList parts={props.item.parts} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
+        </Show>
         <For each={props.item.parts}>
           {(part) => (
             <Switch>
@@ -113,10 +146,11 @@ function ActivityRow(props: { item: ActivityItem; onOpenURL?: (url: string) => v
                 <ToolDetail
                   part={part as ToolPart}
                   hideOutput={props.item.parts.some((item) => item.kind === "web_search_results")}
+                  onOpenWorkspaceFile={props.onOpenWorkspaceFile}
                 />
               </Match>
-              <Match when={part.kind === "diff"}>
-                <DiffDetail part={part as DiffPart} />
+              <Match when={part.kind === "diff" && props.item.category !== "edit"}>
+                <DiffDetail part={part as DiffPart} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
               </Match>
               <Match when={part.kind === "web_search_results"}>
                 <WebSearchResults part={part as WebSearchPart} onOpenURL={props.onOpenURL} />
@@ -145,25 +179,71 @@ function ActivityIcon(props: { category: ActivityCategory }) {
   );
 }
 
-function ToolDetail(props: { part: ToolPart; hideOutput?: boolean }) {
+function ToolDetail(props: {
+  part: ToolPart;
+  hideOutput?: boolean;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+}) {
+  const readReference = createMemo(() => props.part.name === "read_file"
+    ? parseWorkspaceFileRangeCandidate(props.part.input ?? "")
+    : undefined);
   return (
     <div class="op-activity-detail">
       <div class="op-activity-detail-head">
         <code>{props.part.name}</code>
         <span>{toolStatusLabel(props.part.status ?? "ok")}</span>
       </div>
-      <Show when={props.part.input}><pre>{props.part.input}</pre></Show>
-      <Show when={props.part.output && !props.hideOutput}><pre>{props.part.output}</pre></Show>
+      <Show when={readReference()} fallback={
+        <>
+          <Show when={props.part.input}><pre>{props.part.input}</pre></Show>
+          <Show when={props.part.output && !props.hideOutput}><pre>{props.part.output}</pre></Show>
+        </>
+      }>
+        <button
+          type="button"
+          class="op-read-file"
+          disabled={!props.onOpenWorkspaceFile}
+          title={`在右侧查看 ${readReference()?.path}`}
+          onClick={() => {
+            const reference = readReference();
+            if (reference) void props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine);
+          }}
+        >
+          <FileCode2 size={15} aria-hidden="true" />
+          <span class="op-read-file-main">
+            <strong>{baseName(readReference()?.path ?? "")}</strong>
+            <small>{readReference()?.path}</small>
+          </span>
+          <Show when={readRangeLabel(readReference())}>
+            <span class="op-read-file-range">{readRangeLabel(readReference())}</span>
+          </Show>
+          <ChevronRight size={13} aria-hidden="true" />
+        </button>
+        <Show when={props.part.status === "error" && props.part.output && !props.hideOutput}>
+          <pre>{props.part.output}</pre>
+        </Show>
+      </Show>
     </div>
   );
 }
 
-function DiffDetail(props: { part: DiffPart }) {
+function DiffDetail(props: {
+  part: DiffPart;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+}) {
   const lines = () => props.part.patch.split("\n");
   return (
     <div class="op-activity-diff">
       <div class="op-activity-detail-head">
-        <code>{props.part.path}</code>
+        <button
+          type="button"
+          class="op-diff-file-link"
+          title={`在右侧查看 ${props.part.path}`}
+          onClick={() => void props.onOpenWorkspaceFile?.(props.part.path, "changes")}
+        >
+          <FileCode2 size={13} />
+          <code>{props.part.path}</code>
+        </button>
         <span class="op-diff-stat">
           <Show when={props.part.additions}><em class="add">+{props.part.additions}</em></Show>
           <Show when={props.part.deletions}><em class="del">-{props.part.deletions}</em></Show>
@@ -174,6 +254,55 @@ function DiffDetail(props: { part: DiffPart }) {
       </pre>
     </div>
   );
+}
+
+type EditedFileSummary = {
+  path: string;
+  additions: number;
+  deletions: number;
+};
+
+function EditedFilesList(props: {
+  parts: MessagePart[];
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+}) {
+  const files = createMemo(() => editedFileSummaries(props.parts));
+  return (
+    <div class="op-edited-files">
+      <For each={files()}>
+        {(file) => (
+          <button
+            type="button"
+            class="op-edited-file"
+            title={`在右侧查看 ${file.path}`}
+            onClick={() => void props.onOpenWorkspaceFile?.(file.path, "changes")}
+          >
+            <FileCode2 size={14} aria-hidden="true" />
+            <span>{file.path}</span>
+            <span class="op-diff-stat">
+              <Show when={file.additions > 0}><em class="add">+{file.additions}</em></Show>
+              <Show when={file.deletions > 0}><em class="del">-{file.deletions}</em></Show>
+            </span>
+            <ChevronRight size={13} aria-hidden="true" />
+          </button>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function editedFileSummaries(parts: MessagePart[]): EditedFileSummary[] {
+  const files = new Map<string, EditedFileSummary>();
+  for (const part of parts) {
+    if (part.kind !== "diff" && part.kind !== "file") continue;
+    const current = files.get(part.path) ?? { path: part.path, additions: 0, deletions: 0 };
+    if (part.kind === "diff") {
+      current.additions += part.additions ?? 0;
+      current.deletions += part.deletions ?? 0;
+    }
+    files.set(part.path, current);
+  }
+  return [...files.values()];
 }
 
 function DiffLine(props: { line: string }) {
@@ -476,7 +605,7 @@ function activityArtifacts(parts: MessagePart[]): FilePart[] {
   const byPath = new Map<string, FilePart>();
   for (const part of parts) {
     if (part.kind !== "file") continue;
-    if (part.fileAction !== "created" && part.fileAction !== "modified" && part.created !== true) continue;
+    if (part.fileAction !== "created" && part.created !== true) continue;
     byPath.set(part.path, part);
   }
   return [...byPath.values()];
@@ -491,6 +620,13 @@ function compactLabel(value: string): string {
   return text.length > 30 ? `${text.slice(0, 30)}…` : text;
 }
 
+function readRangeLabel(reference: ReturnType<typeof parseWorkspaceFileRangeCandidate>): string {
+  if (!reference?.startLine) return "";
+  return reference.endLine && reference.endLine !== reference.startLine
+    ? `${reference.startLine}-${reference.endLine} 行`
+    : `第 ${reference.startLine} 行`;
+}
+
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
@@ -502,17 +638,23 @@ function isImagePath(path: string): boolean {
 function FileCard(props: {
   part: Extract<MessagePart, { kind: "file" }>;
   onPreviewFile?: (path: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 }) {
-  const [busyAction, setBusyAction] = createSignal<"preview" | "open" | "reveal" | "">("");
+  const [busyAction, setBusyAction] = createSignal<"view" | "preview" | "open" | "reveal" | "">("");
   const [error, setError] = createSignal("");
   const fileName = () => baseName(props.part.path);
   const isHTML = () => extensionOf(props.part.path) === "html" || extensionOf(props.part.path) === "htm";
 
-  const run = async (action: "preview" | "open" | "reveal") => {
+  const run = async (action: "view" | "preview" | "open" | "reveal") => {
     setBusyAction(action);
     setError("");
     try {
-      if (action === "preview") {
+      if (action === "view") {
+        if (!props.onOpenWorkspaceFile) {
+          throw new Error("当前视图无法打开右侧文件面板。");
+        }
+        await props.onOpenWorkspaceFile(props.part.path, "file");
+      } else if (action === "preview") {
         if (!props.onPreviewFile) {
           throw new Error("当前视图无法打开内置预览。");
         }
@@ -529,7 +671,7 @@ function FileCard(props: {
     }
   };
 
-  const runFromSummary = (event: MouseEvent, action: "preview" | "open" | "reveal") => {
+  const runFromSummary = (event: MouseEvent, action: "view" | "preview" | "open" | "reveal") => {
     event.preventDefault();
     event.stopPropagation();
     void run(action);
@@ -551,22 +693,27 @@ function FileCard(props: {
           <button
             type="button"
             disabled={Boolean(busyAction())}
-            onClick={(event) => runFromSummary(event, isHTML() ? "preview" : "open")}
-            title={isHTML() ? "在 MHcode 内置浏览器中打开" : "使用系统默认应用打开"}
+            onClick={(event) => runFromSummary(event, "view")}
+            title="在右侧查看文件"
           >
-            <Show when={busyAction() === (isHTML() ? "preview" : "open")} fallback={isHTML() ? <Globe2 size={14} /> : <ExternalLink size={14} />}>
+            <Show when={busyAction() === "view"} fallback={<Eye size={14} />}>
               <LoaderCircle class="spinning" size={14} />
             </Show>
-            {isHTML() ? "内置打开" : "打开"}
+            查看
           </button>
           <Show when={isHTML()}>
-            <button class="op-file-system" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "open")} title="使用系统浏览器打开">
-              <Show when={busyAction() === "open"} fallback={<ExternalLink size={14} />}>
+            <button class="op-file-system" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "preview")} title="在内置浏览器中预览">
+              <Show when={busyAction() === "preview"} fallback={<Globe2 size={14} />}>
                 <LoaderCircle class="spinning" size={14} />
               </Show>
-              外部打开
+              预览
             </button>
           </Show>
+          <button class="op-file-system" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "open")} title="使用系统应用打开" aria-label="使用系统应用打开">
+            <Show when={busyAction() === "open"} fallback={<ExternalLink size={14} />}>
+              <LoaderCircle class="spinning" size={14} />
+            </Show>
+          </button>
           <button class="op-file-reveal" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "reveal")} title="在文件夹中显示" aria-label="在文件夹中显示">
             <Show when={busyAction() === "reveal"} fallback={<FolderOpen size={15} />}>
               <LoaderCircle class="spinning" size={15} />
@@ -585,15 +732,38 @@ function FileCard(props: {
   );
 }
 
-function MarkdownBlock(props: { source: string; onOpenURL?: (url: string) => void | Promise<void> }) {
+function MarkdownBlock(props: {
+  source: string;
+  onOpenURL?: (url: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+}) {
   const handleClick = (event: MouseEvent) => {
     handleCodeCopyClick(event);
     const target = event.target as HTMLElement | null;
+    const workspaceLink = target?.closest<HTMLElement>("[data-workspace-path]");
+    if (workspaceLink) {
+      event.preventDefault();
+      event.stopPropagation();
+      const path = workspaceLink.dataset.workspacePath ?? "";
+      const line = Number(workspaceLink.dataset.workspaceLine ?? "") || undefined;
+      if (path && props.onOpenWorkspaceFile) void props.onOpenWorkspaceFile(path, "file", line);
+      return;
+    }
     const anchor = target?.closest<HTMLAnchorElement>("a[href]");
-    if (!anchor || !props.onOpenURL) return;
+    if (!anchor) return;
+    const href = anchor.getAttribute("href") ?? "";
+    if (/^https?:\/\//i.test(href)) {
+      if (!props.onOpenURL) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void props.onOpenURL(href);
+      return;
+    }
+    const candidate = parseWorkspacePathCandidate(href);
+    if (!candidate || !props.onOpenWorkspaceFile) return;
     event.preventDefault();
     event.stopPropagation();
-    void props.onOpenURL(anchor.href);
+    void props.onOpenWorkspaceFile(candidate.path, "file", candidate.line);
   };
   return (
     <div class="md-body" onClick={handleClick} innerHTML={renderMarkdown(props.source)} />
