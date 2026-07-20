@@ -49,12 +49,24 @@ func (p *failoverProvider) Stream(ctx context.Context, request protocol.ChatRequ
 		for {
 			seenOutput := false
 			retry := false
-			for event := range currentEvents {
+		streamLoop:
+			for {
+				var event protocol.StreamEvent
+				var ok bool
+				select {
+				case <-ctx.Done():
+					go drainProviderStream(currentEvents)
+					return
+				case event, ok = <-currentEvents:
+					if !ok {
+						break streamLoop
+					}
+				}
 				if event.Type == "error" && !seenOutput {
 					streamErr := errors.New(event.Error)
 					if isProviderFailoverError(ctx, streamErr) && p.advance(currentIndex, streamErr) {
 						retry = true
-						break
+						break streamLoop
 					}
 				}
 				if event.Type == "delta" || event.Type == "tool_calls" {
@@ -72,7 +84,10 @@ func (p *failoverProvider) Stream(ctx context.Context, request protocol.ChatRequ
 			var openErr error
 			currentCandidate, currentIndex, currentEvents, openErr = p.openStream(ctx, request)
 			if openErr != nil {
-				output <- protocol.StreamEvent{Type: "error", Error: openErr.Error()}
+				select {
+				case <-ctx.Done():
+				case output <- protocol.StreamEvent{Type: "error", Error: openErr.Error()}:
+				}
 				return
 			}
 			_ = currentCandidate

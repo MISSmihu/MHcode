@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 )
@@ -19,6 +20,8 @@ type teamProviderScript struct {
 	readOnlyToolLeak    bool
 	reviewerNeedsChange bool
 	implementerErr      error
+	blockRole           string
+	blockStarted        chan struct{}
 }
 
 type scriptedTeamProvider struct {
@@ -32,7 +35,7 @@ func (p scriptedTeamProvider) ListModels(context.Context) ([]protocol.Model, err
 	return []protocol.Model{{ID: "model-" + p.role}}, nil
 }
 
-func (p scriptedTeamProvider) Stream(_ context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+func (p scriptedTeamProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
 	if p.script == nil {
 		return nil, errors.New("missing team provider script")
 	}
@@ -50,6 +53,17 @@ func (p scriptedTeamProvider) Stream(_ context.Context, request protocol.ChatReq
 	needsChange := p.script.reviewerNeedsChange
 	implementerErr := p.script.implementerErr
 	p.script.mu.Unlock()
+	if p.role == p.script.blockRole {
+		if p.script.blockStarted != nil {
+			close(p.script.blockStarted)
+		}
+		events := make(chan protocol.StreamEvent)
+		go func() {
+			<-ctx.Done()
+			close(events)
+		}()
+		return events, nil
+	}
 	if p.role == TeamRoleImplementer && implementerErr != nil {
 		return nil, implementerErr
 	}
@@ -246,6 +260,44 @@ func TestTeamModeLowReasoningRejectsBeforeAnyRoleRuns(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "generated.txt")); !os.IsNotExist(err) {
 		t.Fatalf("rejected team mode wrote a file: %v", err)
+	}
+}
+
+func TestTeamModeCancellationStopsBeforeNextRole(t *testing.T) {
+	svc, _, script := newTeamTestService(t, false)
+	started := make(chan struct{})
+	script.blockRole = TeamRolePlanner
+	script.blockStarted = started
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.SendChatMessage(ctx, "取消团队任务")
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("planner did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("team cancellation error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("team cancellation did not return promptly")
+	}
+	script.mu.Lock()
+	implementerCalls := script.calls[TeamRoleImplementer]
+	script.mu.Unlock()
+	if implementerCalls != 0 {
+		t.Fatalf("implementer started after cancellation: %d calls", implementerCalls)
+	}
+	if state := svc.WorkbenchState().Team; state.Status != "cancelled" || state.Active {
+		t.Fatalf("team state after cancellation = %#v", state)
 	}
 }
 

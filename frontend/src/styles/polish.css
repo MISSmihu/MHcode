@@ -1,6 +1,13 @@
 /* Final visual layer. Keep product-wide typography and workbench hierarchy here. */
 :root {
   color-scheme: dark;
+  --ui-font-size: 14px;
+  --code-font-size: 13px;
+  --ui-line-height: 1.55;
+  --ui-scale: 1;
+  --ui-layout-width: 100vw;
+  --ui-layout-height: 100vh;
+  --ui-font-smoothing: auto;
   --ui-font:
     "Segoe UI Variable Text",
     "Segoe UI Variable",
@@ -9,12 +16,12 @@
     "Microsoft YaHei",
     sans-serif;
   font-family: var(--ui-font);
-  font-size: 14px;
+  font-size: var(--ui-font-size);
   font-synthesis: none;
   font-kerning: normal;
   font-variant-ligatures: none;
   text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: auto;
+  -webkit-font-smoothing: var(--ui-font-smoothing);
   --mono: "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   --bg-main: #181818;
   --bg-sidebar: #1d1d1d;
@@ -78,9 +85,9 @@ select {
 }
 
 body {
-  font-size: 14px;
+  font-size: var(--ui-font-size);
   font-weight: 400;
-  line-height: 20px;
+  line-height: var(--ui-line-height);
 }
 
 button,
@@ -108,14 +115,146 @@ kbd,
 
 .mh-shell {
   grid-template-columns: var(--sidebar-width, 268px) 6px minmax(0, 1fr);
+  width: 100vw;
+  height: 100vh;
+  zoom: 1;
+}
+
+:root[data-ui-scale-mode="manual"] .mh-shell {
+  width: var(--ui-layout-width, 100vw);
+  height: var(--ui-layout-height, 100vh);
+  zoom: var(--ui-scale, 1);
 }
 
 .mh-sidebar {
+  height: 100%;
   background: var(--bg-sidebar);
+}
+
+.sidebar-resizer,
+.workbench-main {
+  height: 100%;
 }
 
 .sidebar-resizer {
   width: 6px;
+}
+
+@media (max-width: 860px) {
+  .mh-shell {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+    min-height: var(--ui-layout-height, 100vh);
+  }
+
+  .mh-sidebar,
+  .sidebar-resizer {
+    display: none;
+  }
+
+  .workbench-main {
+    height: var(--ui-layout-height, 100vh);
+    min-height: var(--ui-layout-height, 100vh);
+  }
+}
+
+/* Readability and multi-session status. The previous muted values were too
+   close to the surface colors, especially for the error strip and sidebar. */
+:root {
+  --text-secondary: #c4c4c4;
+  --text-muted: #a3a3a3;
+}
+
+:root[data-theme="light"],
+body[data-theme="light"],
+.mh-shell.theme-light {
+  --text-secondary: #505050;
+  --text-muted: #686868;
+}
+
+.proj-tree-head {
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.proj-name {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.sess-row {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.sess-row.active,
+.sess-row:hover {
+  color: var(--text-primary);
+}
+
+.sess-title {
+  font-size: 13px;
+}
+
+.sess-time {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.sess-running-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  animation: session-task-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes session-task-pulse {
+  0%, 100% { opacity: .62; }
+  50% { opacity: 1; }
+}
+
+.error-strip {
+  color: #ffd9de;
+  background: #3b1e23;
+  border-color: #a94b58;
+  font-weight: 500;
+}
+
+.browser-preview-error,
+.review-error {
+  color: #ffd9de;
+  background: #321b20;
+  border-color: #8f424d;
+  font-weight: 500;
+}
+
+.browser-preview-error.status {
+  color: var(--text-secondary);
+  background: var(--bg-card);
+}
+
+:root[data-theme="light"] .error-strip,
+body[data-theme="light"] .error-strip,
+.mh-shell.theme-light .error-strip {
+  color: #7d1f2c;
+  background: #fff0f1;
+  border-color: #d36a75;
+}
+
+:root[data-theme="light"] .browser-preview-error,
+body[data-theme="light"] .browser-preview-error,
+.mh-shell.theme-light .browser-preview-error,
+:root[data-theme="light"] .review-error,
+body[data-theme="light"] .review-error,
+.mh-shell.theme-light .review-error {
+  color: #7d1f2c;
+  background: #fff4f4;
+  border-color: #d36a75;
 }
 
 .sidebar-resizer::after {
@@ -244,6 +383,27 @@ kbd,
   min-width: 32px;
 }
 
+.background-task-indicator {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.background-task-indicator svg {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
 .chat-scroll {
   padding: 30px max(24px, calc((100% - 1040px) / 2)) 20px;
 }
@@ -289,8 +449,8 @@ kbd,
 }
 
 .md-body {
-  font-size: 14px;
-  line-height: 24px;
+  font-size: var(--ui-font-size);
+  line-height: var(--ui-line-height);
 }
 
 .md-body h1,
@@ -317,8 +477,8 @@ kbd,
 
 .op-user-bubble {
   border-radius: 8px 8px 3px 8px;
-  font-size: 14px;
-  line-height: 22px;
+  font-size: var(--ui-font-size);
+  line-height: var(--ui-line-height);
 }
 
 .op-task-footer,
@@ -372,8 +532,8 @@ kbd,
   box-shadow: none;
   text-decoration: none;
   -webkit-appearance: none;
-  font-size: 14px;
-  line-height: 22px;
+  font-size: var(--ui-font-size);
+  line-height: var(--ui-line-height);
 }
 
 .composer-text-editor::before,
@@ -485,7 +645,56 @@ kbd,
 }
 
 .settings-screen {
+  width: var(--ui-layout-width, 100vw);
+  height: var(--ui-layout-height, 100vh);
   background: var(--drawer-bg);
+}
+
+.mh-shell :is(.approval-overlay, .image-viewer-overlay, .link-open-overlay) {
+  inset: 0 auto auto 0;
+  width: var(--ui-layout-width, 100vw);
+  height: var(--ui-layout-height, 100vh);
+}
+
+.appearance-range-control {
+  display: grid;
+  grid-template-columns: minmax(150px, 240px) 50px;
+  align-items: center;
+  min-width: 220px;
+  gap: 10px;
+}
+
+.appearance-range-control input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.appearance-range-control output {
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+}
+
+.settings-row-control .appearance-font-input {
+  width: min(360px, 38vw);
+}
+
+.code-block pre,
+.op-activity-detail > pre,
+.op-diff-body,
+.terminal-output,
+.terminal-input-row,
+.review-diff-scroll {
+  font-size: var(--code-font-size);
+}
+
+@media (max-width: 760px) {
+  .appearance-range-control,
+  .settings-row-control .appearance-font-input {
+    width: 100%;
+    min-width: 0;
+  }
 }
 
 .drawer-head {
@@ -922,3 +1131,40 @@ kbd,
     padding: 10px;
   }
 }
+
+/* Final contrast overrides. */
+.proj-tree-head { color: var(--text-secondary); font-size: 13px; font-weight: 650; }
+.proj-row { min-height: 36px; font-size: 14px; }
+.proj-name { color: var(--text-primary); font-size: 14px; font-weight: 650; }
+.sess-row { min-height: 34px; color: var(--text-secondary); font-size: 14px; font-weight: 450; }
+.sess-row.active, .sess-row:hover { color: var(--text-primary); }
+.sess-title { font-size: 14px; }
+.sess-time { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+.sess-running-dot {
+  width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+  animation: session-task-pulse 1.5s ease-in-out infinite;
+}
+.error-strip {
+  min-height: 42px;
+  color: #ffe5e8;
+  background: #3b1e23;
+  border-color: #b95765;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.error-strip > svg { flex: 0 0 auto; color: #ff8792; }
+.browser-preview-error, .review-error {
+  color: #ffd9de; background: #321b20; border-color: #8f424d; font-weight: 500;
+}
+.browser-preview-error.status { color: var(--text-secondary); background: var(--bg-card); }
+:root[data-theme="light"] .error-strip,
+body[data-theme="light"] .error-strip,
+.mh-shell.theme-light .error-strip { color: #7b1725; background: #fff0f2; border-color: #cc5968; }
+:root[data-theme="light"] .browser-preview-error,
+body[data-theme="light"] .browser-preview-error,
+.mh-shell.theme-light .browser-preview-error,
+:root[data-theme="light"] .review-error,
+body[data-theme="light"] .review-error,
+.mh-shell.theme-light .review-error { color: #7d1f2c; background: #fff4f4; border-color: #d36a75; }

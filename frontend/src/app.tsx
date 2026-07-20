@@ -62,6 +62,8 @@ import {
   Zap,
   ExternalLink,
   Ellipsis,
+  Undo2,
+  Redo2,
 } from "lucide-solid";
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
@@ -83,7 +85,8 @@ import {
   refreshMCPServer,
   saveDeepSeekAPIKey,
   saveModelProviderAPIKey,
-  startChatMessage,
+  startChatMessageForSession,
+  getActiveChatTasks,
   guideChatMessage,
   stopChatMessage,
   onChatTaskEvent,
@@ -119,6 +122,7 @@ import {
   selectDirectory,
   selectWorktreeParentDirectory,
   getSessionMessages,
+  getSessionMessagesForSession,
   onBrowserPreviewOpen,
   onBrowserPreviewClose,
   openWorkspaceFile,
@@ -168,7 +172,24 @@ import { errorMessage } from "./lib/errors";
 import { reconcileSessionMessages } from "./lib/session-history";
 import { clearGuidanceMessages, dequeueMessage, enqueueMessage, prioritizeMessage, removeMessage, takeMessageForEditing } from "./lib/message-queue";
 import type { ComposerLink, QueuedComposerMessage } from "./lib/message-queue";
+import {
+  composerSnapshotsEqual,
+  emptyComposerHistory,
+  recordComposerSnapshot,
+  redoComposerSnapshot,
+  undoComposerSnapshot,
+} from "./lib/composer-history";
+import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
 import { hasUsablePartialResult } from "./lib/chat-results";
+import type { UIAppearancePreferences } from "./ui-appearance";
+import {
+  applyUIAppearance,
+  defaultUIAppearance,
+  normalizeUIAppearance,
+  persistUIAppearance,
+  readStoredUIAppearance,
+  resolveEffectiveUIScale,
+} from "./ui-appearance";
 
 type ProjectMenuState = {
   project: ProjectNode;
@@ -183,6 +204,17 @@ type ProjectDialogState = {
   branch: string;
   destinationParent: string;
   destinationName: string;
+};
+
+type SessionTaskRuntime = {
+  taskID: string;
+  sessionID: string;
+  messageID: string;
+  prompt: string;
+  tail: string;
+  attachments: ChatAttachment[];
+  links: ComposerLink[];
+  startedAt: string;
 };
 
 function parentDirectory(path: string): string {
@@ -208,6 +240,7 @@ function worktreePathSegment(value: string): string {
 
 function App() {
   const storedBrowserPanelWidth = readStoredBrowserPanelWidth();
+  const storedUIAppearance = readStoredUIAppearance();
   const [state, setState] = createSignal<WorkbenchState>();
   const [loading, setLoading] = createSignal(true);
   const [updatingReasoning, setUpdatingReasoning] = createSignal(false);
@@ -225,6 +258,7 @@ function App() {
   const [submittedAttachments, setSubmittedAttachments] = createSignal<ChatAttachment[]>([]);
   const [submittedLinks, setSubmittedLinks] = createSignal<ComposerLink[]>([]);
   const [queuedMessages, setQueuedMessages] = createSignal<QueuedComposerMessage[]>([]);
+  const [queuedMessagesBySession, setQueuedMessagesBySession] = createSignal<Record<string, QueuedComposerMessage[]>>({});
   const [resettingSession, setResettingSession] = createSignal(false);
   const [apiKeyDraft, setAPIKeyDraft] = createSignal("");
   const [providerKeyDrafts, setProviderKeyDrafts] = createSignal<Record<string, string>>({});
@@ -237,6 +271,8 @@ function App() {
   const [composerTailDraft, setComposerTailDraftSignal] = createSignal("");
   const [composerAttachments, setComposerAttachments] = createSignal<ChatAttachment[]>([]);
   const [composerLinks, setComposerLinks] = createSignal<ComposerLink[]>([]);
+  const [composerUndoDepth, setComposerUndoDepth] = createSignal(0);
+  const [composerRedoDepth, setComposerRedoDepth] = createSignal(0);
   const [addingImages, setAddingImages] = createSignal(false);
   const [pendingLinkURL, setPendingLinkURL] = createSignal("");
   const [linkOpenBusy, setLinkOpenBusy] = createSignal<"internal" | "external" | "">("");
@@ -253,6 +289,8 @@ function App() {
   const [browserPanelWidth, setBrowserPanelWidth] = createSignal(storedBrowserPanelWidth ?? defaultBrowserPanelWidth);
   const [resizingBrowserPanel, setResizingBrowserPanel] = createSignal(false);
   const [themeMode, setThemeMode] = createSignal<ThemeMode>(readStoredThemeMode());
+  const [uiAppearance, setUIAppearance] = createSignal<UIAppearancePreferences>(storedUIAppearance);
+  const [effectiveUIScale, setEffectiveUIScale] = createSignal(resolveEffectiveUIScale(storedUIAppearance));
   // 侧边栏交互状态（此前为写死的假 UI，现改为真实信号驱动）
   const [sidebarTab, setSidebarTab] = createSignal<"groups" | "projects">("groups");
   const [showAllSessions, setShowAllSessions] = createSignal(false);
@@ -260,6 +298,8 @@ function App() {
   const [projects, setProjects] = createSignal<ProjectInfo[]>([]);
   const [sessions, setSessions] = createSignal<SessionInfo[]>([]);
   const [projectTree, setProjectTree] = createSignal<ProjectNode[]>([]);
+  const [sessionTaskRuntimes, setSessionTaskRuntimes] = createSignal<Record<string, SessionTaskRuntime>>({});
+  const [selectedSessionID, setSelectedSessionID] = createSignal("");
   const [sessionSort, setSessionSort] = createSignal<"recent" | "name">("recent");
   const [showArchived, setShowArchived] = createSignal(false);
   const [switchingSession, setSwitchingSession] = createSignal(false);
@@ -298,6 +338,24 @@ function App() {
   let pointerBrowserResizeActive = false;
   let mouseBrowserResizeActive = false;
   let browserPanelWidthInitialized = storedBrowserPanelWidth !== undefined;
+  let composerHistory: ComposerHistory = emptyComposerHistory();
+
+  const syncUIAppearance = () => {
+    const next = applyUIAppearance(uiAppearance(), shellRef);
+    setEffectiveUIScale((current) => current === next ? current : next);
+  };
+
+  const updateUIAppearance = (patch: Partial<UIAppearancePreferences>) => {
+    const next = normalizeUIAppearance({ ...uiAppearance(), ...patch });
+    setUIAppearance(next);
+    persistUIAppearance(next);
+  };
+
+  const resetUIAppearance = () => {
+    const next = { ...defaultUIAppearance };
+    setUIAppearance(next);
+    persistUIAppearance(next);
+  };
 
   const profile = createMemo(() => state()?.reasoning ?? fallbackProfile);
   const options = createMemo(() => state()?.reasoningOptions ?? fallbackReasoningOptions);
@@ -330,6 +388,37 @@ function App() {
     const root = runtimeSettings().workspaceRoot?.trim();
     return root ? baseNameFromPath(root) : "未选择项目";
   });
+  const activeSessionID = createMemo(() => {
+    if (selectedSessionID()) return selectedSessionID();
+    const activeProject = projectTree().find((project) => project.isActive);
+    return activeProject?.sessions.find((session) => session.isActive)?.id
+      ?? sessions().find((session) => session.isActive)?.id
+      ?? "";
+  });
+  const activeSessionTask = createMemo(() => sessionTaskRuntimes()[activeSessionID()]);
+  const isSessionBusy = (sessionID: string) => Boolean(sessionID && sessionTaskRuntimes()[sessionID]);
+  const currentSessionBusy = createMemo(() => isSessionBusy(activeSessionID()));
+  const anySessionBusy = createMemo(() => Object.keys(sessionTaskRuntimes()).length > 0);
+  const backgroundTaskCount = createMemo(
+    () => Object.keys(sessionTaskRuntimes()).filter((sessionID) => sessionID !== activeSessionID()).length,
+  );
+  const activeSessionTitle = createMemo(() => {
+    const sessionID = activeSessionID();
+    for (const project of projectTree()) {
+      const session = project.sessions.find((candidate) => candidate.id === sessionID);
+      if (session) return session.title || "新对话";
+    }
+    return sessions().find((session) => session.id === sessionID)?.title || "新对话";
+  });
+
+  const rememberCurrentSessionQueue = (sessionID = activeSessionID()) => {
+    if (!sessionID) return;
+    setQueuedMessagesBySession((current) => ({ ...current, [sessionID]: [...queuedMessages()] }));
+  };
+
+  const restoreSessionQueue = (sessionID: string) => {
+    setQueuedMessages(queuedMessagesBySession()[sessionID] ?? []);
+  };
   const planMode = createMemo(() => state()?.planMode ?? false);
   const teamMode = createMemo(() => runtimeSettings().team.enabled);
   // 完全访问 = 审批策略为 never（命令/文件修改不再逐次弹框确认）。
@@ -527,17 +616,34 @@ function App() {
     setActiveTaskProgress((current) => current ? { ...current, taskStatus } : current);
   };
 
-  const finishChatTask = () => {
+  const finishChatTask = (finishedSessionID = activeSessionID(), finishedTaskID = "") => {
+    const visibleSessionID = activeSessionID();
+    const visibleTaskID = activeChatTaskID();
     const pendingReasoning = pendingReasoningLevel();
-    setSendingMessage(false);
-    setActiveChatTaskID("");
-    setStreamingMessageID("");
-    setSubmittedPrompt("");
-    setSubmittedTail("");
-    setSubmittedAttachments([]);
-    setSubmittedLinks([]);
-    setPendingReasoningLevel(undefined);
-    return pendingReasoning && pendingReasoning !== profile().id ? pendingReasoning : undefined;
+    if (!finishedSessionID) return undefined;
+    let removed = false;
+    setSessionTaskRuntimes((current) => {
+      const task = current[finishedSessionID];
+      if (!task || (finishedTaskID && task.taskID && task.taskID !== finishedTaskID)) return current;
+      const next = { ...current };
+      delete next[finishedSessionID];
+      removed = true;
+      return next;
+    });
+    const belongsToVisibleTask = visibleSessionID === finishedSessionID
+      && (!finishedTaskID || !visibleTaskID || visibleTaskID === finishedTaskID);
+    if (removed && belongsToVisibleTask) {
+      setSendingMessage(false);
+      setActiveChatTaskID("");
+      setStreamingMessageID("");
+      setSubmittedPrompt("");
+      setSubmittedTail("");
+      setSubmittedAttachments([]);
+      setSubmittedLinks([]);
+      setPendingReasoningLevel(undefined);
+      return pendingReasoning && pendingReasoning !== profile().id ? pendingReasoning : undefined;
+    }
+    return undefined;
   };
 
   const applyPendingReasoning = async (pending?: ReasoningLevel) => {
@@ -565,11 +671,23 @@ function App() {
   };
 
   const handleChatTaskEvent = (event: ChatTaskEvent) => {
+    const eventSessionID = event.sessionId?.trim() || activeSessionID();
     const currentTaskID = activeChatTaskID();
+    const currentSessionID = activeSessionID();
+    const eventTask = eventSessionID ? sessionTaskRuntimes()[eventSessionID] : undefined;
+    const isCurrentSession = !eventSessionID || !currentSessionID || eventSessionID === currentSessionID;
+    const matchesSessionTask = !eventTask || !eventTask.taskID || eventTask.taskID === event.taskId;
+    if (!isCurrentSession || !matchesSessionTask || (currentTaskID && event.taskId !== currentTaskID)) {
+      if (event.type === "completed" || event.type === "failed" || event.type === "cancelled") {
+        if (eventSessionID && matchesSessionTask) finishChatTask(eventSessionID, event.taskId);
+        void refreshProjectsAndSessions();
+      }
+      return;
+    }
     if (currentTaskID && event.taskId !== currentTaskID) {
       return;
     }
-    if (!currentTaskID && !sendingMessage()) {
+    if (!eventTask && !sendingMessage()) {
       return;
     }
     if (!currentTaskID) {
@@ -715,13 +833,15 @@ function App() {
         } else {
           updateStreamingMessage((message) => ({ ...message, streaming: false, status: undefined }));
         }
-        const pendingReasoning = finishChatTask();
+        const pendingReasoning = finishChatTask(eventSessionID, event.taskId);
         void (async () => {
-          await restoreSessionMessages(true);
-          await applyPendingReasoning(pendingReasoning);
-          await startNextQueuedMessage();
+          if (eventSessionID === activeSessionID()) {
+            await restoreSessionMessages(true, eventSessionID);
+            await applyPendingReasoning(pendingReasoning);
+            await startNextQueuedMessage();
+          }
           void refreshProjectsAndSessions();
-          void refreshCheckpoints();
+          if (eventSessionID === activeSessionID()) void refreshCheckpoints();
         })();
         break;
       }
@@ -731,6 +851,7 @@ function App() {
         setComposerTail(submittedTail());
         setComposerAttachments(submittedAttachments());
         setComposerLinks(submittedLinks());
+        resetComposerHistory();
         updateStreamingMessage((message) => ({
           ...message,
           parts: settleLiveProgress(message.parts, "cancelled"),
@@ -739,7 +860,7 @@ function App() {
           status: undefined,
         }));
         settleActiveTaskProgress("cancelled");
-        void applyPendingReasoning(finishChatTask());
+        void applyPendingReasoning(finishChatTask(eventSessionID, event.taskId));
         break;
       case "failed": {
         setQueuedMessages(clearGuidanceMessages);
@@ -755,6 +876,7 @@ function App() {
           setComposerTail(submittedTail());
           setComposerAttachments(submittedAttachments());
           setComposerLinks(submittedLinks());
+          resetComposerHistory();
         }
         updateStreamingMessage((current) => ({
           ...current,
@@ -781,7 +903,7 @@ function App() {
         } else {
           settleActiveTaskProgress(partialToolCompleted ? "completed" : "failed");
         }
-        void applyPendingReasoning(finishChatTask());
+        void applyPendingReasoning(finishChatTask(eventSessionID, event.taskId));
         break;
       }
     }
@@ -790,9 +912,14 @@ function App() {
   onMount(() => {
     applyThemeMode(themeMode());
     applySidebarWidth(sidebarWidth(), shellRef);
-    void refreshState();
-    void refreshProjectsAndSessions();
-    void restoreSessionMessages();
+    syncUIAppearance();
+    void (async () => {
+      await recoverActiveChatTasks();
+      await refreshState();
+      await refreshProjectsAndSessions();
+      await restoreSessionMessages();
+      activateSessionTask(activeSessionID());
+    })();
     // 订阅后端审批请求，入队等待用户处理。
     const unsubscribe = onApprovalRequest((req) => {
       setApprovalQueue((queue) => [...queue, req]);
@@ -865,8 +992,13 @@ function App() {
   });
 
   createEffect(() => {
+    uiAppearance();
+    syncUIAppearance();
+  });
+
+  createEffect(() => {
     messages();
-    sendingMessage();
+    currentSessionBusy();
     const shouldFollow = chatNearBottom();
     queueMicrotask(() => {
       if (shouldFollow) {
@@ -890,7 +1022,7 @@ function App() {
   };
 
   const changeReasoning = async (level: ReasoningLevel) => {
-    if (sendingMessage()) {
+    if (currentSessionBusy()) {
       setPendingReasoningLevel(level);
       setError("");
       return;
@@ -1064,7 +1196,9 @@ function App() {
       setQueuedMessages([]);
       setComposerDraft("");
       setComposerTail("");
+      setComposerAttachments([]);
       setComposerLinks([]);
+      resetComposerHistory();
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -1165,6 +1299,80 @@ function App() {
     }
   };
 
+  const currentComposerSnapshot = (): ComposerSnapshot => ({
+    draft: promptDraft(),
+    tail: composerTailDraft(),
+    attachments: composerAttachments().map((attachment) => ({ ...attachment })),
+    links: composerLinks().map((link) => ({ ...link })),
+  });
+
+  const syncComposerHistoryDepth = () => {
+    setComposerUndoDepth(composerHistory.past.length);
+    setComposerRedoDepth(composerHistory.future.length);
+  };
+
+  const resetComposerHistory = () => {
+    composerHistory = emptyComposerHistory();
+    syncComposerHistoryDepth();
+  };
+
+  const applyComposerSnapshot = (snapshot: ComposerSnapshot) => {
+    setComposerDraft(snapshot.draft);
+    setComposerTail(snapshot.tail);
+    setComposerAttachments(snapshot.attachments.map((attachment) => ({ ...attachment })));
+    setComposerLinks(snapshot.links.map((link) => ({ ...link })));
+  };
+
+  const commitComposerSnapshot = (snapshot: ComposerSnapshot) => {
+    const current = currentComposerSnapshot();
+    if (composerSnapshotsEqual(current, snapshot)) return;
+    composerHistory = recordComposerSnapshot(composerHistory, current);
+    syncComposerHistoryDepth();
+    applyComposerSnapshot(snapshot);
+  };
+
+  const focusComposerAfterHistoryMove = () => {
+    queueMicrotask(() => {
+      const editor = composerLinks().length > 0 ? composerTailEditorRef : composerEditorRef;
+      editor?.focus();
+      if (editor) placeCaretAtEnd(editor);
+    });
+  };
+
+  const undoComposerInput = () => {
+    const move = undoComposerSnapshot(composerHistory, currentComposerSnapshot());
+    composerHistory = move.history;
+    syncComposerHistoryDepth();
+    if (!move.snapshot) return;
+    applyComposerSnapshot(move.snapshot);
+    focusComposerAfterHistoryMove();
+  };
+
+  const redoComposerInput = () => {
+    const move = redoComposerSnapshot(composerHistory, currentComposerSnapshot());
+    composerHistory = move.history;
+    syncComposerHistoryDepth();
+    if (!move.snapshot) return;
+    applyComposerSnapshot(move.snapshot);
+    focusComposerAfterHistoryMove();
+  };
+
+  const handleComposerHistoryShortcut = (event: KeyboardEvent): boolean => {
+    if (event.isComposing || event.altKey || (!event.ctrlKey && !event.metaKey)) return false;
+    const key = event.key.toLowerCase();
+    if (key === "z") {
+      event.preventDefault();
+      event.shiftKey ? redoComposerInput() : undoComposerInput();
+      return true;
+    }
+    if (key === "y") {
+      event.preventDefault();
+      redoComposerInput();
+      return true;
+    }
+    return false;
+  };
+
   const focusComposerEnd = () => {
     const editor = composerLinks().length > 0 ? composerTailEditorRef : composerEditorRef;
     editor?.focus();
@@ -1173,18 +1381,21 @@ function App() {
 
   const addComposerLinks = (links: ComposerLink[]) => {
     if (links.length === 0) return;
-    setComposerLinks((current) => mergeComposerLinks(current, links));
+    const current = currentComposerSnapshot();
+    commitComposerSnapshot({ ...current, links: mergeComposerLinks(current.links, links) });
   };
 
   const removeComposerLink = (url: string) => {
-    const next = composerLinks().filter((link) => link.url !== url);
-    setComposerLinks(next);
-    if (next.length > 0) return;
-    const tail = composerTailDraft().trim();
-    if (tail) {
-      setComposerDraft([promptDraft().trim(), tail].filter(Boolean).join(" "));
-      setComposerTail("");
+    const current = currentComposerSnapshot();
+    const links = current.links.filter((link) => link.url !== url);
+    let draft = current.draft;
+    let tail = current.tail;
+    if (links.length === 0 && tail.trim()) {
+      draft = [draft.trim(), tail.trim()].filter(Boolean).join(" ");
+      tail = "";
     }
+    commitComposerSnapshot({ ...current, draft, tail, links });
+    if (links.length > 0) return;
     queueMicrotask(() => {
       composerEditorRef?.focus();
       if (composerEditorRef) placeCaretAtEnd(composerEditorRef);
@@ -1226,7 +1437,7 @@ function App() {
       if (totalBytes > 12 * 1024 * 1024) {
         throw new Error("图片总大小不能超过 12 MB。");
       }
-      setComposerAttachments(combined);
+      commitComposerSnapshot({ ...currentComposerSnapshot(), attachments: combined });
       if (files.length > available) setError("一次最多添加 4 张图片，其余图片未加入。");
     } catch (err) {
       setError(errorMessage(err));
@@ -1264,7 +1475,15 @@ function App() {
     const attachments = (attachmentOverride ?? composerAttachments()).map((attachment) => ({ ...attachment }));
     const links = (linkOverride ?? composerLinks()).map((link) => ({ ...link }));
     const prompt = composeComposerPrompt(draft, links, tail);
-    if ((!prompt && attachments.length === 0) || sendingMessage()) {
+    const sessionID = activeSessionID();
+    if (!prompt && attachments.length === 0) {
+      return;
+    }
+    if (!sessionID) {
+      setError("当前没有可用会话，请先新建或选择一个会话");
+      return;
+    }
+    if (isSessionBusy(sessionID)) {
       return;
     }
     if (!activeProviderReady() || !activeChatModel()) {
@@ -1293,27 +1512,50 @@ function App() {
     setComposerTail("");
     setComposerAttachments([]);
     setComposerLinks([]);
+    resetComposerHistory();
     setSubmittedPrompt(draft);
     setSubmittedTail(tail);
     setSubmittedAttachments(attachments);
     setSubmittedLinks(links);
     setStreamingMessageID(assistantMessageID);
     setSendingMessage(true);
+    setSessionTaskRuntimes((current) => ({
+      ...current,
+      [sessionID]: {
+        taskID: "",
+        sessionID,
+        messageID: assistantMessageID,
+        prompt: draft,
+        tail,
+        attachments,
+        links,
+        startedAt: new Date().toISOString(),
+      },
+    }));
     setError("");
+    let taskID = "";
     try {
-      const taskID = await startChatMessage(prompt, attachments);
-      if (sendingMessage()) {
+      taskID = await startChatMessageForSession(sessionID, prompt, attachments);
+      setSessionTaskRuntimes((current) => {
+        const task = current[sessionID];
+        if (!task) return current;
+        return { ...current, [sessionID]: { ...task, taskID } };
+      });
+      if (sessionID === activeSessionID()) {
         setActiveChatTaskID(taskID);
       }
     } catch (err) {
       const message = errorMessage(err);
-      setError(message);
-      setComposerDraft(draft);
-      setComposerTail(tail);
-      setComposerAttachments(attachments);
-      setComposerLinks(links);
-      updateStreamingMessage((current) => ({ ...current, content: message, failed: true, streaming: false, status: undefined }));
-      void applyPendingReasoning(finishChatTask());
+      if (sessionID === activeSessionID()) {
+        setError(message);
+        setComposerDraft(draft);
+        setComposerTail(tail);
+        setComposerAttachments(attachments);
+        setComposerLinks(links);
+        resetComposerHistory();
+        updateStreamingMessage((current) => ({ ...current, content: message, failed: true, streaming: false, status: undefined }));
+      }
+      void applyPendingReasoning(finishChatTask(sessionID, taskID));
     }
   };
 
@@ -1338,12 +1580,13 @@ function App() {
     setComposerTail("");
     setComposerAttachments([]);
     setComposerLinks([]);
+    resetComposerHistory();
     setError("");
     queueMicrotask(() => composerEditorRef?.focus());
   };
 
   const startNextQueuedMessage = async () => {
-    if (sendingMessage()) return;
+    if (currentSessionBusy()) return;
     const dequeued = dequeueMessage(queuedMessages());
     if (!dequeued.message) return;
     setQueuedMessages(dequeued.queue);
@@ -1360,7 +1603,7 @@ function App() {
     }
     setQueuedMessages((current) => prioritizeMessage(current, id));
     const taskID = activeChatTaskID();
-    if (!sendingMessage() || !taskID) {
+    if (!currentSessionBusy() || !taskID) {
       setQueuedMessages(clearGuidanceMessages);
       return;
     }
@@ -1388,11 +1631,12 @@ function App() {
     setComposerTail(editing.message.tail);
     setComposerAttachments(editing.message.attachments);
     setComposerLinks(editing.message.links);
+    resetComposerHistory();
     queueMicrotask(focusComposerEnd);
   };
 
   const sendMessage = async () => {
-    if (sendingMessage()) {
+    if (currentSessionBusy()) {
       enqueueCurrentMessage();
       return;
     }
@@ -1400,13 +1644,33 @@ function App() {
   };
 
   const stopMessage = async () => {
+    const sessionID = activeSessionID();
     const taskID = activeChatTaskID();
-    if (!taskID) {
+    if (!sessionID || !taskID) {
       return;
     }
     updateStreamingMessage((message) => ({ ...message, status: "正在停止" }));
     try {
-      await stopChatMessage(taskID);
+      const accepted = await stopChatMessage(taskID);
+      if (accepted) return;
+
+      const activeTasks = await getActiveChatTasks();
+      const stillRunning = activeTasks.some((task) => task.taskId === taskID || task.sessionId === sessionID);
+      if (stillRunning) {
+        setError("停止请求未被当前任务接受，请重试。");
+        return;
+      }
+      updateStreamingMessage((message) => ({
+        ...message,
+        parts: settleLiveProgress(message.parts, "cancelled"),
+        streaming: false,
+        cancelled: true,
+        status: undefined,
+      }));
+      settleActiveTaskProgress("cancelled");
+      const pendingReasoning = finishChatTask(sessionID, taskID);
+      await restoreSessionMessages(true, sessionID);
+      await applyPendingReasoning(pendingReasoning);
     } catch (err) {
       setError(errorMessage(err));
     }
@@ -1419,6 +1683,9 @@ function App() {
       setProjects(projs);
       setSessions(sess);
       setProjectTree(tree);
+      const activeProject = tree.find((project) => project.isActive);
+      const activeSession = activeProject?.sessions.find((session) => session.isActive);
+      if (activeSession) setSelectedSessionID(activeSession.id);
     } catch {
       // 辅助功能失败不打断主流程。
     }
@@ -1442,9 +1709,9 @@ function App() {
   };
 
   // 从后端事件日志恢复当前会话的历史消息到前端（修复关闭打开对话消失）。
-  const restoreSessionMessages = async (preserveCurrentOnEmpty = false) => {
+  const restoreSessionMessages = async (preserveCurrentOnEmpty = false, sessionID = activeSessionID()) => {
     try {
-      const history = await getSessionMessages();
+      const history = await getSessionMessagesForSession(sessionID);
       setMessages((current) => reconcileSessionMessages(current, history, preserveCurrentOnEmpty));
     } catch {
       // 恢复失败不阻断使用。
@@ -1452,7 +1719,68 @@ function App() {
   };
 
   // 当前活动会话内容需在切换后重载：从后端事件日志恢复消息。
-  const reloadAfterSessionChange = (nextState: WorkbenchState) => {
+  const activateSessionTask = (sessionID: string) => {
+    const task = sessionTaskRuntimes()[sessionID];
+    if (!task) {
+      setSendingMessage(false);
+      setActiveChatTaskID("");
+      setStreamingMessageID("");
+      return;
+    }
+    setSendingMessage(true);
+    setActiveChatTaskID(task.taskID);
+    setStreamingMessageID(task.messageID);
+    setSubmittedPrompt(task.prompt);
+    setSubmittedTail(task.tail);
+    setSubmittedAttachments(task.attachments);
+    setSubmittedLinks(task.links);
+    setMessages((current) => {
+      if (current.some((message) => message.id === task.messageID)) return current;
+      const composed = composeComposerPrompt(task.prompt, task.links, task.tail);
+      const hasUser = current.some((message) => message.role === "user" && message.content === composed);
+      return [
+        ...current,
+        ...(!composed || hasUser ? [] : [{ ...createChatMessage("user", composed), attachments: task.attachments }]),
+        {
+          id: task.messageID,
+          role: "assistant" as const,
+          content: "",
+          createdAt: task.startedAt,
+          model: activeChatModel(),
+          streaming: true,
+          status: "后台任务正在运行",
+        },
+      ];
+    });
+  };
+
+  const recoverActiveChatTasks = async () => {
+    try {
+      const activeTasks = await getActiveChatTasks();
+      if (activeTasks.length === 0) return;
+      const recovered: Record<string, SessionTaskRuntime> = {};
+      for (const task of activeTasks) {
+        const sessionID = task.sessionId?.trim();
+        if (!sessionID) continue;
+        recovered[sessionID] = {
+          taskID: task.taskId,
+          sessionID,
+          messageID: "assistant-recovered-" + task.taskId,
+          prompt: "",
+          tail: "",
+          attachments: [],
+          links: [],
+          startedAt: task.startedAt || new Date().toISOString(),
+        };
+      }
+      setSessionTaskRuntimes((current) => ({ ...recovered, ...current }));
+    } catch {
+      // A failed recovery must not block opening the workspace.
+    }
+  };
+
+  const reloadAfterSessionChange = (nextState: WorkbenchState, rememberQueue = true) => {
+    if (rememberQueue) rememberCurrentSessionQueue();
     setState(nextState);
     setActiveTaskProgress(undefined);
     setQueuedMessages([]);
@@ -1460,8 +1788,9 @@ function App() {
     setComposerTail("");
     setComposerAttachments([]);
     setComposerLinks([]);
+    resetComposerHistory();
     setChatNearBottom(true);
-    void restoreSessionMessages();
+    if (rememberQueue) void restoreSessionMessages();
     void refreshProjectsAndSessions();
     void refreshCheckpoints();
   };
@@ -1477,7 +1806,13 @@ function App() {
   const handleSwitchSession = async (sessionID: string) => {
     setSwitchingSession(true);
     try {
-      reloadAfterSessionChange(await switchSession(sessionID));
+      rememberCurrentSessionQueue(activeSessionID());
+      const nextState = await switchSession(sessionID);
+      setSelectedSessionID(sessionID);
+      reloadAfterSessionChange(nextState, false);
+      await restoreSessionMessages(false, sessionID);
+      restoreSessionQueue(sessionID);
+      activateSessionTask(sessionID);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -1670,7 +2005,7 @@ function App() {
   };
 
   const handleDeleteSession = async (session: SessionInfo) => {
-    if (sendingMessage() || deletingSessionID()) {
+    if (isSessionBusy(session.id) || deletingSessionID()) {
       return;
     }
     const title = session.title || "新对话";
@@ -1702,7 +2037,7 @@ function App() {
   };
 
   const beginEditMessage = (message: ChatMessage) => {
-    if (!message.eventId || sendingMessage()) {
+    if (!message.eventId || currentSessionBusy()) {
       return;
     }
     setEditingMessageID(message.id);
@@ -1728,7 +2063,7 @@ function App() {
   const handleEditResend = async (message: ChatMessage) => {
     const prompt = editMessageDraft().trim();
     const attachments = editMessageAttachments();
-    if (!message.eventId || (!prompt && attachments.length === 0) || sendingMessage() || editingMessageBusy()) {
+    if (!message.eventId || (!prompt && attachments.length === 0) || currentSessionBusy() || editingMessageBusy()) {
       return;
     }
     setEditingMessageBusy(true);
@@ -1752,7 +2087,7 @@ function App() {
   };
 
   const handleForkMessage = async (message: ChatMessage) => {
-    if (!message.eventId || sendingMessage() || forkingMessageID()) {
+    if (!message.eventId || currentSessionBusy() || forkingMessageID()) {
       return;
     }
     setForkingMessageID(message.id);
@@ -1770,6 +2105,7 @@ function App() {
       setComposerTail(forkDraft.tail);
       setComposerLinks(forkDraft.links);
       setComposerAttachments(message.role === "user" ? (message.attachments ?? []) : []);
+      resetComposerHistory();
       queueMicrotask(focusComposerEnd);
     } catch (err) {
       setError(errorMessage(err));
@@ -1927,7 +2263,7 @@ function App() {
 
   const resizeSidebar = (clientX: number) => {
     const left = shellRef?.getBoundingClientRect().left ?? 0;
-    const width = clamp(clientX - left, minSidebarWidth, maxSidebarWidth);
+    const width = clamp((clientX - left) / Math.max(effectiveUIScale(), 0.01), minSidebarWidth, maxSidebarWidth);
     setSidebarWidth(width);
     applySidebarWidth(width, shellRef);
   };
@@ -1976,8 +2312,9 @@ function App() {
   };
 
   const browserPanelLimits = () => {
-    const available = workbenchRef?.getBoundingClientRect().width ?? window.innerWidth;
-    const overlay = window.innerWidth <= 1080;
+    const scale = Math.max(effectiveUIScale(), 0.01);
+    const available = (workbenchRef?.getBoundingClientRect().width ?? window.innerWidth) / scale;
+    const overlay = window.innerWidth / scale <= 1080;
     const min = Math.min(minBrowserPanelWidth, available);
     const max = overlay
       ? available
@@ -1986,8 +2323,9 @@ function App() {
   };
 
   const defaultBrowserWidth = () => {
-    const available = workbenchRef?.getBoundingClientRect().width ?? window.innerWidth;
-    const desired = window.innerWidth <= 1080 ? defaultBrowserPanelWidth : available * 0.48;
+    const scale = Math.max(effectiveUIScale(), 0.01);
+    const available = (workbenchRef?.getBoundingClientRect().width ?? window.innerWidth) / scale;
+    const desired = window.innerWidth / scale <= 1080 ? defaultBrowserPanelWidth : available * 0.48;
     const limits = browserPanelLimits();
     return clamp(desired, limits.min, limits.max);
   };
@@ -2008,7 +2346,7 @@ function App() {
       return;
     }
     const limits = browserPanelLimits();
-    setBrowserPanelWidth(clamp(rect.right - clientX, limits.min, limits.max));
+    setBrowserPanelWidth(clamp((rect.right - clientX) / Math.max(effectiveUIScale(), 0.01), limits.min, limits.max));
   };
 
   const moveWindowPointerBrowserResize = (event: PointerEvent) => {
@@ -2161,9 +2499,13 @@ function App() {
     }
     constrainBrowserPanelWidth();
     window.addEventListener("resize", constrainBrowserPanelWidth);
+    window.addEventListener("resize", syncUIAppearance);
+    window.visualViewport?.addEventListener("resize", syncUIAppearance);
     onCleanup(() => {
       observer.disconnect();
       window.removeEventListener("resize", constrainBrowserPanelWidth);
+      window.removeEventListener("resize", syncUIAppearance);
+      window.visualViewport?.removeEventListener("resize", syncUIAppearance);
     });
   });
 
@@ -2218,7 +2560,7 @@ function App() {
         </div>
 
         <div class="quick-menu">
-          <button type="button" onClick={() => void handleNewSession()} disabled={resettingSession() || sendingMessage()}>
+          <button type="button" onClick={() => void handleNewSession()} disabled={resettingSession()}>
             <MessageSquarePlus size={16} />
             <span>新建任务</span>
           </button>
@@ -2263,7 +2605,7 @@ function App() {
                       class="proj-row"
                       classList={{ active: project.isActive }}
                       type="button"
-                      disabled={projectActionBusy() || sendingMessage()}
+                      disabled={projectActionBusy()}
                       onClick={() => void handleSwitchProject(project.id)}
                       title={project.workspaceRoot}
                     >
@@ -2293,11 +2635,14 @@ function App() {
                           class="sess-row"
                           classList={{ active: session.isActive }}
                           type="button"
-                          disabled={switchingSession() || deletingSessionID() === session.id || sendingMessage()}
+                          disabled={switchingSession() || deletingSessionID() === session.id}
                           onClick={() => void handleSwitchSession(session.id)}
                           title={session.title}
                         >
                           <span class="sess-title">{session.title || "新对话"}</span>
+                          <Show when={sessionTaskRuntimes()[session.id]}>
+                            <span class="sess-running-dot" title="后台生成中" aria-label="后台生成中" />
+                          </Show>
                           <span class="sess-time">{relativeTime(session.updatedAt)}</span>
                         </button>
                         <div class="sess-actions">
@@ -2306,7 +2651,7 @@ function App() {
                             type="button"
                             title={session.archived ? "取消归档" : "归档"}
                             aria-label={session.archived ? "取消归档" : "归档"}
-                            disabled={sendingMessage() || Boolean(deletingSessionID())}
+                            disabled={isSessionBusy(session.id) || Boolean(deletingSessionID())}
                             onClick={() => void handleArchiveSession(session.id, !session.archived)}
                           >
                             <Archive size={12} />
@@ -2316,7 +2661,7 @@ function App() {
                             type="button"
                             title="永久删除对话"
                             aria-label="永久删除对话"
-                            disabled={sendingMessage() || Boolean(deletingSessionID())}
+                            disabled={isSessionBusy(session.id) || Boolean(deletingSessionID())}
                             onClick={() => void handleDeleteSession(session)}
                           >
                             <Trash2 size={12} />
@@ -2341,7 +2686,7 @@ function App() {
                 aria-label={`${menu().project.name} 项目操作`}
                 style={{ left: `${menu().left}px`, top: `${menu().top}px` }}
               >
-                <button type="button" role="menuitem" disabled={projectActionBusy() || sendingMessage()} onClick={() => void handleSetProjectPinned(menu().project)}>
+                <button type="button" role="menuitem" disabled={projectActionBusy() || anySessionBusy()} onClick={() => void handleSetProjectPinned(menu().project)}>
                   <Pin size={15} />
                   <span>{menu().project.pinned ? "取消置顶" : "置顶项目"}</span>
                 </button>
@@ -2352,18 +2697,18 @@ function App() {
                 <button
                   type="button"
                   role="menuitem"
-                  disabled={projectActionBusy() || sendingMessage() || runtimeSettings().filesystemAccess === "read-only" || runtimeSettings().sandboxMode === "read-only"}
+                  disabled={projectActionBusy() || anySessionBusy() || runtimeSettings().filesystemAccess === "read-only" || runtimeSettings().sandboxMode === "read-only"}
                   title={runtimeSettings().filesystemAccess === "read-only" || runtimeSettings().sandboxMode === "read-only" ? "只读模式下不可创建工作树" : ""}
                   onClick={() => openProjectDialog("worktree", menu().project)}
                 >
                   <GitBranch size={15} />
                   <span>创建永久工作树</span>
                 </button>
-                <button type="button" role="menuitem" disabled={projectActionBusy() || sendingMessage()} onClick={() => openProjectDialog("rename", menu().project)}>
+                <button type="button" role="menuitem" disabled={projectActionBusy() || anySessionBusy()} onClick={() => openProjectDialog("rename", menu().project)}>
                   <Pencil size={15} />
                   <span>重命名项目</span>
                 </button>
-                <button type="button" role="menuitem" disabled={projectActionBusy() || sendingMessage()} onClick={() => openProjectDialog("archive", menu().project)}>
+                <button type="button" role="menuitem" disabled={projectActionBusy() || anySessionBusy()} onClick={() => openProjectDialog("archive", menu().project)}>
                   <Archive size={15} />
                   <span>归档任务</span>
                 </button>
@@ -2371,7 +2716,7 @@ function App() {
                   class="danger"
                   type="button"
                   role="menuitem"
-                  disabled={projectActionBusy() || sendingMessage()}
+                  disabled={projectActionBusy() || anySessionBusy()}
                   onClick={() => openProjectDialog("remove", menu().project)}
                 >
                   <X size={15} />
@@ -2565,7 +2910,7 @@ function App() {
       <section class="chat-pane" classList={{ "workspace-tools-open": workspaceToolsOpen() }}>
         <header class="chat-header">
           <div>
-            <strong>新对话</strong>
+            <strong>{activeSessionTitle()}</strong>
             <span>{modelName()}</span>
           </div>
           <div class="header-actions">
@@ -2573,6 +2918,12 @@ function App() {
               <ShieldCheck size={15} />
               {formatPercent(cacheHitRate(), hasCacheTokens())}
             </button>
+            <Show when={backgroundTaskCount() > 0}>
+              <span class="background-task-indicator" role="status" title={String(backgroundTaskCount()) + " 个会话正在后台生成"}>
+                <Bot size={14} />
+                {backgroundTaskCount()} 后台
+              </span>
+            </Show>
             <button type="button" title="回退时间线" aria-label="回退时间线" onClick={() => void openTimeline()}>
               <History size={15} />
             </button>
@@ -2681,7 +3032,7 @@ function App() {
                             type="button"
                             title="从这条回复分叉"
                             aria-label="从这条回复分叉"
-                            disabled={sendingMessage() || Boolean(forkingMessageID())}
+                            disabled={currentSessionBusy() || Boolean(forkingMessageID())}
                             onClick={() => void handleForkMessage(message)}
                           >
                             <GitFork size={14} />
@@ -2808,7 +3159,7 @@ function App() {
                             type="button"
                             title="编辑并重新发送"
                             aria-label="编辑并重新发送"
-                            disabled={sendingMessage() || Boolean(forkingMessageID())}
+                            disabled={currentSessionBusy() || Boolean(forkingMessageID())}
                             onClick={() => beginEditMessage(message)}
                           >
                             <Pencil size={14} />
@@ -2817,7 +3168,7 @@ function App() {
                             type="button"
                             title="从这条消息分叉"
                             aria-label="从这条消息分叉"
-                            disabled={sendingMessage() || Boolean(forkingMessageID())}
+                            disabled={currentSessionBusy() || Boolean(forkingMessageID())}
                             onClick={() => void handleForkMessage(message)}
                           >
                             <GitFork size={14} />
@@ -2881,7 +3232,17 @@ function App() {
                         }}
                       />
                       <figcaption>{attachment.name}</figcaption>
-                      <button type="button" title="移除图片" aria-label={`移除 ${attachment.name}`} onClick={() => setComposerAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index()))}><X size={12} /></button>
+                      <button
+                        type="button"
+                        title="移除图片"
+                        aria-label={`移除 ${attachment.name}`}
+                        onClick={() => commitComposerSnapshot({
+                          ...currentComposerSnapshot(),
+                          attachments: composerAttachments().filter((_, itemIndex) => itemIndex !== index()),
+                        })}
+                      >
+                        <X size={12} />
+                      </button>
                     </figure>
                   )}
                 </For>
@@ -2903,7 +3264,7 @@ function App() {
                         class="composer-queue-guide"
                         type="button"
                         disabled={index() === 0 && queued.guidance}
-                        title={sendingMessage() ? "在当前步骤结束后引导正在执行的任务" : "设为队列下一条"}
+                        title={currentSessionBusy() ? "在当前步骤结束后引导正在执行的任务" : "设为队列下一条"}
                         onClick={() => void guideQueuedMessage(queued.id)}
                       >
                         <ArrowUp size={13} />
@@ -2916,9 +3277,13 @@ function App() {
                 </For>
               </div>
             </Show>
-            <div class="composer-rich-input" onClick={(event) => {
+            <div
+              class="composer-rich-input"
+              classList={{ "starts-with-link": composerLinks().length > 0 && promptDraft().trim().length === 0 }}
+              onClick={(event) => {
               if (event.currentTarget === event.target) focusComposerEnd();
-            }}>
+              }}
+            >
               <div
                 ref={composerEditorRef}
                 class="composer-text-editor"
@@ -2930,12 +3295,13 @@ function App() {
                 spellcheck={false}
                 onInput={(event) => {
                   const value = composerEditorText(event.currentTarget);
-                  setPromptDraft(value);
+                  commitComposerSnapshot({ ...currentComposerSnapshot(), draft: value });
                   if (/\s$/.test(value)) absorbComposerURLs(value, "prefix");
                 }}
                 onBlur={(event) => absorbComposerURLs(composerEditorText(event.currentTarget), "prefix")}
                 onPaste={(event) => handleComposerPaste(event, "prefix")}
                 onKeyDown={(event) => {
+                  if (handleComposerHistoryShortcut(event)) return;
                   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
                     event.preventDefault();
                     void sendMessage();
@@ -2962,12 +3328,13 @@ function App() {
                   spellcheck={false}
                   onInput={(event) => {
                     const value = composerEditorText(event.currentTarget);
-                    setComposerTailDraftSignal(value);
+                    commitComposerSnapshot({ ...currentComposerSnapshot(), tail: value });
                     if (/\s$/.test(value)) absorbComposerURLs(value, "tail");
                   }}
                   onBlur={(event) => absorbComposerURLs(composerEditorText(event.currentTarget), "tail")}
                   onPaste={(event) => handleComposerPaste(event, "tail")}
                   onKeyDown={(event) => {
+                    if (handleComposerHistoryShortcut(event)) return;
                     if (event.key === "Backspace" && !composerEditorText(event.currentTarget) && composerLinks().length > 0) {
                       event.preventDefault();
                       removeComposerLink(composerLinks()[composerLinks().length - 1].url);
@@ -2999,9 +3366,27 @@ function App() {
                 </button>
                 <button
                   type="button"
+                  title="撤销输入 (Ctrl+Z)"
+                  aria-label="撤销输入"
+                  disabled={composerUndoDepth() === 0}
+                  onClick={undoComposerInput}
+                >
+                  <Undo2 size={16} />
+                </button>
+                <button
+                  type="button"
+                  title="重做输入 (Ctrl+Y)"
+                  aria-label="重做输入"
+                  disabled={composerRedoDepth() === 0}
+                  onClick={redoComposerInput}
+                >
+                  <Redo2 size={16} />
+                </button>
+                <button
+                  type="button"
                   class="access-toggle"
                   classList={{ active: fullAccess() }}
-                  disabled={sendingMessage()}
+                  disabled={currentSessionBusy()}
                   title={fullAccess() ? "完全访问已开启：命令/文件修改不再逐次确认" : "点击开启完全访问（不再弹审批框）"}
                   onClick={() => void toggleFullAccess()}
                 >
@@ -3012,7 +3397,7 @@ function App() {
                   type="button"
                   class="plan-toggle"
                   classList={{ active: planMode() }}
-                  disabled={sendingMessage()}
+                  disabled={currentSessionBusy()}
                   title="Plan 模式：先规划后执行（需高/超高推理强度）"
                   onClick={() => void togglePlanMode()}
                 >
@@ -3023,7 +3408,7 @@ function App() {
                   type="button"
                   class="team-toggle"
                   classList={{ active: teamMode() }}
-                  disabled={sendingMessage()}
+                  disabled={currentSessionBusy()}
                   title="AI 团队：规划、实现、测试、审阅和汇总使用可独立配置的模型"
                   onClick={() => void toggleTeamMode()}
                 >
@@ -3034,17 +3419,17 @@ function App() {
               <div>
                 <ModelRouteMenu
                   settings={runtimeSettings()}
-                  saving={savingRuntime() || sendingMessage()}
+                  saving={savingRuntime() || currentSessionBusy()}
                   onManage={() => openSettings("models")}
                   onSelect={(providerID, modelID) => void selectModelRoute(providerID, modelID)}
                 />
                 <ReasoningMenu
                   value={pendingReasoningLevel() ?? profile().id}
                   options={options()}
-                  running={updatingReasoning() || (sendingMessage() && pendingReasoningLevel() !== undefined)}
+                  running={updatingReasoning() || (currentSessionBusy() && pendingReasoningLevel() !== undefined)}
                   onChange={changeReasoning}
                 />
-                <Show when={sendingMessage()}>
+                <Show when={currentSessionBusy()}>
                   <button
                     class="queue-send-button"
                     type="button"
@@ -3058,13 +3443,13 @@ function App() {
                 </Show>
                 <button
                   class="send-button"
-                  classList={{ stop: sendingMessage() }}
+                  classList={{ stop: currentSessionBusy() }}
                   type="button"
-                  disabled={sendingMessage() ? !activeChatTaskID() : !canSend()}
-                  onClick={() => void (sendingMessage() ? stopMessage() : sendMessage())}
-                  title={sendingMessage() ? "停止生成" : "发送"}
+                  disabled={currentSessionBusy() ? !activeChatTaskID() : !canSend()}
+                  onClick={() => void (currentSessionBusy() ? stopMessage() : sendMessage())}
+                  title={currentSessionBusy() ? "停止生成" : "发送"}
                 >
-                  <Show when={sendingMessage()} fallback={<ArrowUp size={17} />}>
+                  <Show when={currentSessionBusy()} fallback={<ArrowUp size={17} />}>
                     <Square size={13} fill="currentColor" />
                   </Show>
                 </button>
@@ -3222,6 +3607,10 @@ function App() {
               turnCount: 0,
               summary: "Project: MHcode",
             }}
+            uiAppearance={uiAppearance()}
+            effectiveUIScale={effectiveUIScale()}
+            updateUIAppearance={updateUIAppearance}
+            resetUIAppearance={resetUIAppearance}
             refreshMCPServer={refreshMCPRuntime}
             refreshingMCPID={refreshingMCPID()}
             providerKeyDrafts={providerKeyDrafts()}

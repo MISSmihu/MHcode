@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/agent"
@@ -16,6 +17,61 @@ func TestChatTaskCancellationClassification(t *testing.T) {
 	cancel()
 	if !chatTaskWasCancelled(ctx, context.Canceled) {
 		t.Fatal("cancelled task must be reported as cancellation")
+	}
+}
+
+func TestChatTaskRunnerTracksSessionsIndependently(t *testing.T) {
+	_, cancelA := context.WithCancel(context.Background())
+	_, cancelB := context.WithCancel(context.Background())
+	t.Cleanup(cancelA)
+	t.Cleanup(cancelB)
+
+	taskA := &chatTask{id: "task-a", projectID: "project", sessionID: "session-a", cancel: cancelA, acceptingGuidance: true}
+	taskB := &chatTask{id: "task-b", projectID: "project", sessionID: "session-b", cancel: cancelB, acceptingGuidance: true}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{taskA.id: taskA, taskB.id: taskB}
+	app.chat.bySession = map[string]string{taskA.sessionID: taskA.id, taskB.sessionID: taskB.id}
+	app.chat.active = taskA
+
+	states := app.GetActiveChatTasks()
+	if len(states) != 2 {
+		t.Fatalf("active tasks = %d, want 2", len(states))
+	}
+	sessionIDs := []string{states[0].SessionID, states[1].SessionID}
+	sort.Strings(sessionIDs)
+	if sessionIDs[0] != "session-a" || sessionIDs[1] != "session-b" {
+		t.Fatalf("active sessions = %#v", sessionIDs)
+	}
+
+	app.finishChatTask(taskA)
+	states = app.GetActiveChatTasks()
+	if len(states) != 1 || states[0].TaskID != taskB.id {
+		t.Fatalf("finishing task A affected task B: %#v", states)
+	}
+	if err := app.requireSessionIdleChat(taskA.sessionID); err != nil {
+		t.Fatalf("finished session remained busy: %v", err)
+	}
+	if err := app.requireSessionIdleChat(taskB.sessionID); err == nil {
+		t.Fatal("running session was reported idle")
+	}
+}
+
+func TestApprovalServiceRoutesToOwningTask(t *testing.T) {
+	serviceA := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir()})
+	serviceB := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir()})
+	app := &App{}
+	taskA := &chatTask{id: "task-a", service: serviceA}
+	taskB := &chatTask{id: "task-b", service: serviceB}
+	app.chat.approvalOwners = map[string]*chatTask{"approval-a": taskA, "approval-b": taskB}
+
+	if got := app.approvalService("approval-b"); got != serviceB {
+		t.Fatalf("approval routed to %p, want %p", got, serviceB)
+	}
+	if got := app.approvalService("approval-b"); got != nil {
+		t.Fatal("approval ownership must be consumed once")
+	}
+	if got := app.approvalService("approval-a"); got != serviceA {
+		t.Fatalf("approval routed to %p, want %p", got, serviceA)
 	}
 }
 

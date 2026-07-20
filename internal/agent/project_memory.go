@@ -58,9 +58,13 @@ func (s *Service) buildProjectMemory() ProjectMemoryState {
 	}
 
 	manifest := s.projects.Snapshot()
+	activeProjectID := manifest.ActiveProjectID
+	if strings.TrimSpace(s.projectID) != "" {
+		activeProjectID = s.projectID
+	}
 	var active project.Project
 	for _, candidate := range manifest.Projects {
-		if candidate.ID == manifest.ActiveProjectID {
+		if candidate.ID == activeProjectID {
 			active = candidate
 			break
 		}
@@ -86,7 +90,7 @@ func (s *Service) buildProjectMemory() ProjectMemoryState {
 	sort.SliceStable(sessions, func(i, j int) bool { return sessions[i].UpdatedAt > sessions[j].UpdatedAt })
 	memories := make([]projectSessionMemory, 0, settings.MaxSessions)
 	for _, session := range sessions {
-		if session.ID == manifest.ActiveSessionID || (!settings.IncludeArchived && session.Archived) {
+		if session.ID == s.sessionID || (!settings.IncludeArchived && session.Archived) {
 			continue
 		}
 		store, err := eventlog.Open(filepath.Join(s.config.SessionsDir, active.ID, session.ID))

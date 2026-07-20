@@ -1095,22 +1095,35 @@
 .op-line.meta { color: var(--text-muted); }
 
 /* 文件产物卡片 */
-.op-file {
-  display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-  align-items: center;
-  min-height: 66px;
-  gap: 10px;
-  padding: 10px 12px;
+.op-file-artifact {
+  min-width: 0;
+  overflow: hidden;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
   border-radius: 8px;
 }
+
+.op-file {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto 16px;
+  align-items: center;
+  min-height: 48px;
+  gap: 8px;
+  padding: 6px 8px;
+  list-style: none;
+  cursor: pointer;
+}
+.op-file::-webkit-details-marker {
+  display: none;
+}
+.op-file:hover {
+  background: rgb(128 128 128 / 5%);
+}
 .op-file-icon {
   display: inline-grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   color: var(--accent);
   background: var(--accent-soft);
   border: 1px solid rgb(216 154 49 / 24%);
@@ -1161,8 +1174,6 @@
   border-radius: 0 6px 6px 0;
 }
 .op-file-actions .op-file-system {
-  width: 32px;
-  padding: 0;
   border-left: 0;
 }
 .op-file-actions button:hover:not(:disabled) {
@@ -1174,10 +1185,36 @@
   cursor: default;
 }
 .op-file-error {
-  grid-column: 2 / -1;
   color: var(--red);
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+
+.op-file-chevron {
+  color: var(--text-muted);
+  transition: transform .15s ease;
+}
+
+.op-file-artifact[open] .op-file-chevron {
+  transform: rotate(90deg);
+}
+
+.op-file-detail {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 10px 9px 46px;
+  border-top: 1px solid var(--border-color);
+}
+
+.op-file-detail code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: var(--mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 消息布局：用户右气泡 / AI 左操作流 */
@@ -1361,11 +1398,18 @@
   .op-user-stack { width: 90%; }
   .op-msg.assistant { padding-right: 0; }
   .op-file {
-    grid-template-columns: 34px minmax(0, 1fr);
+    grid-template-columns: 30px minmax(0, 1fr) 16px;
   }
   .op-file-actions {
     grid-column: 2;
     justify-self: start;
+  }
+  .op-file-chevron {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+  .op-file-detail {
+    padding-left: 46px;
   }
 }
 

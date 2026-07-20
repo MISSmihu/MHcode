@@ -32,7 +32,7 @@ type WebSearchTool struct {
 func (t WebSearchTool) Name() string { return "web_search" }
 
 func (t WebSearchTool) Description() string {
-	return "搜索公开互联网中的当前信息，返回标题、摘要和完整可引用链接。检索完成后应直接整理答案，并逐条列出来源标题与完整 URL。不要为了查看搜索结果而继续调用 browser；只有用户明确要求打开、读取或操作具体网页时才使用 browser。"
+	return "搜索公开互联网中的当前信息，返回标题、摘要和完整可引用链接。搜索摘要不是网页正文；需要核验具体页面、比较同类网站或分析用户给出的 URL 时，继续调用 read_webpage。仅在 read_webpage 提示页面依赖 JavaScript 或用户要求交互时使用 browser。最终答案应直接整理结论并列出实际使用的来源标题与完整 URL。"
 }
 
 func (t WebSearchTool) InputSchema() map[string]any {

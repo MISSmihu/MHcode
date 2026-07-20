@@ -44,6 +44,7 @@ type ReadRepositoryTool struct {
 	Policy     SandboxPolicy
 	Client     *http.Client
 	APIBaseURL string
+	Token      string
 }
 
 func (t ReadRepositoryTool) Name() string { return "read_repository" }
@@ -102,6 +103,9 @@ func (t ReadRepositoryTool) Execute(ctx context.Context, rawArgs json.RawMessage
 	apiBase := strings.TrimRight(strings.TrimSpace(t.APIBaseURL), "/")
 	if apiBase == "" {
 		apiBase = defaultGitHubAPIBase
+	}
+	if token := repositoryGitHubToken(t.Token, apiBase); token != "" {
+		client = withGitHubToken(client, token)
 	}
 
 	repository, apiErr := fetchGitHubRepository(ctx, client, apiBase, target)
@@ -558,7 +562,11 @@ func readRepositoryArchivePath(entries []repositoryArchiveEntry, target githubRe
 		}
 	}
 	if len(children) == 0 {
-		return "", fmt.Errorf("repository path %q was not found", requested)
+		candidates := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			candidates = append(candidates, entry.Path)
+		}
+		return "", repositoryPathNotFoundError(requested, candidates)
 	}
 	paths := make([]string, 0, len(children))
 	for childPath := range children {
@@ -753,6 +761,10 @@ func readGitRepositoryPath(
 	object := revision + ":" + target.Path
 	typeRaw, err := runRepositoryGit(ctx, repositoryDir, 64*1024, "cat-file", "-t", object)
 	if err != nil {
+		candidates := gitRepositoryPathCandidates(ctx, repositoryDir, revision)
+		if len(candidates) > 0 {
+			return "", repositoryPathNotFoundError(target.Path, candidates)
+		}
 		return "", fmt.Errorf("read repository path %q: %w", target.Path, err)
 	}
 	switch strings.TrimSpace(string(typeRaw)) {
@@ -852,6 +864,171 @@ func runRepositoryGit(ctx context.Context, directory string, limit int, args ...
 		return stdout.Bytes()[:limit], nil
 	}
 	return stdout.Bytes(), nil
+}
+
+func gitRepositoryPathCandidates(ctx context.Context, repositoryDir, revision string) []string {
+	raw, err := runRepositoryGit(ctx, repositoryDir, maximumRepositoryGitOutput, "ls-tree", "-r", "-t", "--name-only", revision)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	paths := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if candidate := cleanRepositoryPath(strings.TrimSpace(line)); candidate != "" {
+			paths = append(paths, candidate)
+		}
+	}
+	return paths
+}
+
+type repositoryPathSuggestion struct {
+	path  string
+	score int
+}
+
+func repositoryPathNotFoundError(requested string, candidates []string) error {
+	requested = cleanRepositoryPath(requested)
+	suggestions := repositoryPathSuggestions(requested, candidates, 5)
+	if len(suggestions) == 0 {
+		return fmt.Errorf("repository path %q was not found", requested)
+	}
+	var message strings.Builder
+	fmt.Fprintf(&message, "repository path %q was not found; similar paths:", requested)
+	for _, suggestion := range suggestions {
+		message.WriteString("\n- ")
+		message.WriteString(suggestion)
+	}
+	return errors.New(message.String())
+}
+
+func repositoryPathSuggestions(requested string, candidates []string, limit int) []string {
+	requested = strings.ToLower(cleanRepositoryPath(requested))
+	if requested == "" || limit <= 0 {
+		return nil
+	}
+	requestedBase := path.Base(requested)
+	requestedExt := strings.ToLower(path.Ext(requestedBase))
+	seen := make(map[string]bool, len(candidates))
+	ranked := make([]repositoryPathSuggestion, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = cleanRepositoryPath(candidate)
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		lowerCandidate := strings.ToLower(candidate)
+		score := repositoryPathEditDistance(requested, lowerCandidate) * 4
+		candidateBase := path.Base(lowerCandidate)
+		if candidateBase == requestedBase {
+			score -= 100
+		} else if strings.Contains(candidateBase, requestedBase) || strings.Contains(requestedBase, candidateBase) {
+			score -= 30
+		}
+		if requestedExt != "" && path.Ext(candidateBase) == requestedExt {
+			score -= 12
+		}
+		score -= repositoryCommonPathSegments(requested, lowerCandidate) * 18
+		ranked = append(ranked, repositoryPathSuggestion{path: candidate, score: score})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score == ranked[j].score {
+			return ranked[i].path < ranked[j].path
+		}
+		return ranked[i].score < ranked[j].score
+	})
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	result := make([]string, 0, len(ranked))
+	for _, item := range ranked {
+		result = append(result, item.path)
+	}
+	return result
+}
+
+func repositoryCommonPathSegments(left, right string) int {
+	leftParts := strings.Split(left, "/")
+	rightParts := strings.Split(right, "/")
+	limit := len(leftParts)
+	if len(rightParts) < limit {
+		limit = len(rightParts)
+	}
+	count := 0
+	for index := 0; index < limit && leftParts[index] == rightParts[index]; index++ {
+		count++
+	}
+	return count
+}
+
+func repositoryPathEditDistance(left, right string) int {
+	leftRunes := []rune(left)
+	rightRunes := []rune(right)
+	previous := make([]int, len(rightRunes)+1)
+	for index := range previous {
+		previous[index] = index
+	}
+	for leftIndex, leftRune := range leftRunes {
+		current := make([]int, len(rightRunes)+1)
+		current[0] = leftIndex + 1
+		for rightIndex, rightRune := range rightRunes {
+			cost := 0
+			if leftRune != rightRune {
+				cost = 1
+			}
+			current[rightIndex+1] = minInt(
+				current[rightIndex]+1,
+				previous[rightIndex+1]+1,
+				previous[rightIndex]+cost,
+			)
+		}
+		previous = current
+	}
+	return previous[len(rightRunes)]
+}
+
+func minInt(values ...int) int {
+	minimum := values[0]
+	for _, value := range values[1:] {
+		if value < minimum {
+			minimum = value
+		}
+	}
+	return minimum
+}
+
+type githubTokenTransport struct {
+	base  http.RoundTripper
+	token string
+}
+
+func (t githubTokenTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	clone := request.Clone(request.Context())
+	clone.Header = request.Header.Clone()
+	clone.Header.Set("Authorization", "Bearer "+t.token)
+	return t.base.RoundTrip(clone)
+}
+
+func withGitHubToken(client *http.Client, token string) *http.Client {
+	clone := *client
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	clone.Transport = githubTokenTransport{base: transport, token: token}
+	return &clone
+}
+
+func repositoryGitHubToken(explicit, apiBase string) string {
+	if token := strings.TrimSpace(explicit); token != "" {
+		return token
+	}
+	if !strings.EqualFold(strings.TrimRight(apiBase, "/"), defaultGitHubAPIBase) {
+		return ""
+	}
+	if token := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); token != "" {
+		return token
+	}
+	return strings.TrimSpace(os.Getenv("GH_TOKEN"))
 }
 
 func decodeGitHubContent(file githubContent, limit int) (string, error) {

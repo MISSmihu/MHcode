@@ -74,6 +74,7 @@ func (s *Service) openActiveSession() {
 		}
 	}
 	s.sessionID = sessionID
+	s.projectID = projectID
 	dir := filepath.Join(s.config.SessionsDir, projectID, sessionID)
 	store, err := eventlog.Open(dir)
 	if err != nil {
@@ -172,10 +173,18 @@ func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []to
 
 	// 更新活动会话的时间戳与标题（首轮用用户/助手内容作标题）。
 	if s.projects != nil {
-		projectID, sessionID := s.projects.ActiveIDs()
-		_ = projectID
+		projectID, sessionID := s.projectID, s.sessionID
+		if projectID == "" || sessionID == "" {
+			projectID, sessionID = s.projects.ActiveIDs()
+		}
 		if s.sessionState.TurnCount <= 1 {
-			_ = s.projects.SetSessionTitle(sessionID, truncateLabel(content))
+			if projectID != "" {
+				_ = s.projects.SetSessionTitleForProject(projectID, sessionID, truncateLabel(content))
+			} else {
+				_ = s.projects.SetSessionTitle(sessionID, truncateLabel(content))
+			}
+		} else if projectID != "" {
+			_ = s.projects.TouchSession(projectID, sessionID)
 		} else {
 			_ = s.projects.TouchActiveSession()
 		}
@@ -490,8 +499,41 @@ func (s *Service) GetSessionMessages() []SessionMessage {
 	if s.eventStore == nil {
 		return []SessionMessage{}
 	}
+	return sessionMessagesFromEventStore(s.eventStore)
+}
+
+// GetSessionMessagesForSession opens a fresh read view for a detached session.
+// The active Service may have opened its event log before a background task
+// appended new events, so this method intentionally does not reuse eventStore.
+func (s *Service) GetSessionMessagesForSession(sessionID string) []SessionMessage {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return s.GetSessionMessages()
+	}
+	s.stateMu.RLock()
+	projects := s.projects
+	sessionsDir := s.config.SessionsDir
+	s.stateMu.RUnlock()
+	if projects == nil || strings.TrimSpace(sessionsDir) == "" {
+		return []SessionMessage{}
+	}
+	projectID, _, ok := projects.FindSession(sessionID)
+	if !ok {
+		return []SessionMessage{}
+	}
+	store, err := eventlog.Open(filepath.Join(sessionsDir, projectID, sessionID))
+	if err != nil {
+		return []SessionMessage{}
+	}
+	return sessionMessagesFromEventStore(store)
+}
+
+func sessionMessagesFromEventStore(store *eventlog.Store) []SessionMessage {
+	if store == nil {
+		return []SessionMessage{}
+	}
 	out := make([]SessionMessage, 0, 16)
-	for _, ev := range s.eventStore.Events() {
+	for _, ev := range store.Events() {
 		switch ev.Type {
 		case eventlog.EventUserMessage:
 			out = append(out, SessionMessage{

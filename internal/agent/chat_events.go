@@ -39,6 +39,11 @@ type ContextCompressionEvent struct {
 
 type ChatEventSink func(ChatStreamEvent)
 
+type providerStreamOpenResult struct {
+	events <-chan protocol.StreamEvent
+	err    error
+}
+
 func emitChatEvent(sink ChatEventSink, event ChatStreamEvent) {
 	if sink != nil {
 		sink(event)
@@ -51,15 +56,47 @@ func collectProviderStream(
 	request protocol.ChatRequest,
 	sink ChatEventSink,
 ) (protocol.CompletionResult, error) {
-	events, err := provider.Stream(ctx, request)
-	if err != nil {
-		return protocol.CompletionResult{}, err
+	opened := make(chan providerStreamOpenResult, 1)
+	go func() {
+		events, err := provider.Stream(ctx, request)
+		opened <- providerStreamOpenResult{events: events, err: err}
+	}()
+
+	var events <-chan protocol.StreamEvent
+	select {
+	case <-ctx.Done():
+		go drainLateProviderStream(opened)
+		return protocol.CompletionResult{}, ctx.Err()
+	case result := <-opened:
+		if result.err != nil {
+			return protocol.CompletionResult{}, result.err
+		}
+		if result.events == nil {
+			return protocol.CompletionResult{}, errors.New("provider returned a nil event stream")
+		}
+		events = result.events
 	}
 
 	var content strings.Builder
 	var reasoning strings.Builder
 	result := protocol.CompletionResult{}
-	for event := range events {
+	for {
+		var event protocol.StreamEvent
+		var ok bool
+		select {
+		case <-ctx.Done():
+			go drainProviderStream(events)
+			return protocol.CompletionResult{}, ctx.Err()
+		case event, ok = <-events:
+			if !ok {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return protocol.CompletionResult{}, ctxErr
+				}
+				result.Content = content.String()
+				result.Reasoning = reasoning.String()
+				return result, nil
+			}
+		}
 		switch event.Type {
 		case "delta":
 			content.WriteString(event.Delta)
@@ -79,10 +116,16 @@ func collectProviderStream(
 			return protocol.CompletionResult{}, errors.New(event.Error)
 		}
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return protocol.CompletionResult{}, ctxErr
+}
+
+func drainLateProviderStream(opened <-chan providerStreamOpenResult) {
+	result := <-opened
+	if result.err == nil && result.events != nil {
+		drainProviderStream(result.events)
 	}
-	result.Content = content.String()
-	result.Reasoning = reasoning.String()
-	return result, nil
+}
+
+func drainProviderStream(events <-chan protocol.StreamEvent) {
+	for range events {
+	}
 }

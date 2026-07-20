@@ -22,6 +22,8 @@ import type {
   WorkbenchState,
 } from "./types";
 import type { SettingsCategory, ThemeMode, ProviderPreset } from "./ui-types";
+import type { UIAppearancePreferences, UIFontPreset, UIFontSmoothing, UIScaleMode } from "./ui-appearance";
+import { uiFontPresetOptions } from "./ui-appearance";
 import {
   sandboxOptions, filesystemOptions, approvalOptions, toolResultOptions,
   stablePrefixOptions, providerProtocolOptions, providerAPITypeOptions,
@@ -61,6 +63,10 @@ export type SettingsCenterProps = {
   mcpServers: WorkbenchState["mcpServers"];
   models: WorkbenchState["deepSeek"]["models"];
   projectMemory: WorkbenchState["projectMemory"];
+  uiAppearance: UIAppearancePreferences;
+  effectiveUIScale: number;
+  updateUIAppearance: (patch: Partial<UIAppearancePreferences>) => void;
+  resetUIAppearance: () => void;
   nudgeSidebarWidth: (direction: -1 | 1) => void;
   profile: WorkbenchState["reasoning"];
   refreshMCPServer: (serverID: string) => Promise<void> | void;
@@ -148,11 +154,15 @@ export function SettingsCenter(props: SettingsCenterProps) {
           </Match>
           <Match when={props.activeCategory === "appearance"}>
             <AppearanceSettingsPanel
+              effectiveUIScale={props.effectiveUIScale}
               nudgeSidebarWidth={props.nudgeSidebarWidth}
+              resetUIAppearance={props.resetUIAppearance}
               resetSidebarWidth={props.resetSidebarWidth}
               sidebarWidth={props.sidebarWidth}
               themeMode={props.themeMode}
               toggleTheme={props.toggleTheme}
+              uiAppearance={props.uiAppearance}
+              updateUIAppearance={props.updateUIAppearance}
             />
           </Match>
           <Match when={props.activeCategory === "config"}>
@@ -388,11 +398,15 @@ export function GeneralSettingsPanel(props: {
 }
 
 export function AppearanceSettingsPanel(props: {
+  effectiveUIScale: number;
   nudgeSidebarWidth: (direction: -1 | 1) => void;
+  resetUIAppearance: () => void;
   resetSidebarWidth: () => void;
   sidebarWidth: number;
   themeMode: ThemeMode;
   toggleTheme: () => void;
+  uiAppearance: UIAppearancePreferences;
+  updateUIAppearance: (patch: Partial<UIAppearancePreferences>) => void;
 }) {
   return (
     <div class="settings-page-body">
@@ -416,6 +430,136 @@ export function AppearanceSettingsPanel(props: {
           </button>
         </div>
       </PanelSection>
+
+      <SettingsSection title="界面缩放">
+        <SettingsCard>
+          <SettingsRow
+            title="缩放方式"
+            description={props.uiAppearance.scaleMode === "auto" ? "跟随当前窗口的可用布局空间" : "使用固定缩放比例"}
+            control={
+              <SelectControl
+                ariaLabel="界面缩放方式"
+                value={props.uiAppearance.scaleMode}
+                options={[{ value: "auto", label: "自动" }, { value: "manual", label: "手动" }]}
+                onChange={(value) => props.updateUIAppearance({ scaleMode: value as UIScaleMode })}
+              />
+            }
+          />
+          <SettingsRow
+            title="当前缩放"
+            description={`实际显示 ${Math.round(props.effectiveUIScale * 100)}%`}
+            control={
+              <div class="appearance-range-control">
+                <input
+                  type="range"
+                  min="80"
+                  max="130"
+                  step="5"
+                  value={props.uiAppearance.manualScale}
+                  disabled={props.uiAppearance.scaleMode === "auto"}
+                  aria-label="手动界面缩放"
+                  onInput={(event) => props.updateUIAppearance({ manualScale: Number(event.currentTarget.value) })}
+                />
+                <output>{props.uiAppearance.scaleMode === "auto" ? `${Math.round(props.effectiveUIScale * 100)}%` : `${props.uiAppearance.manualScale}%`}</output>
+              </div>
+            }
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="字体">
+        <SettingsCard>
+          <SettingsRow
+            title="界面字体"
+            description="应用于导航、设置、对话和输入区域"
+            control={
+              <SelectControl
+                ariaLabel="界面字体"
+                value={props.uiAppearance.fontPreset}
+                options={uiFontPresetOptions}
+                onChange={(value) => props.updateUIAppearance({ fontPreset: value as UIFontPreset })}
+              />
+            }
+          />
+          <Show when={props.uiAppearance.fontPreset === "custom"}>
+            <SettingsRow
+              title="自定义字体栈"
+              description="按 CSS font-family 顺序填写本机字体"
+              control={
+                <input
+                  class="settings-input appearance-font-input"
+                  value={props.uiAppearance.customFontFamily}
+                  placeholder={'例如："HarmonyOS Sans SC", "Microsoft YaHei UI", sans-serif'}
+                  spellcheck={false}
+                  onInput={(event) => props.updateUIAppearance({ customFontFamily: event.currentTarget.value })}
+                />
+              }
+            />
+          </Show>
+          <SettingsRow
+            title="界面字号"
+            description={`${props.uiAppearance.fontSize}px`}
+            control={
+              <div class="appearance-range-control">
+                <input type="range" min="12" max="18" step="1" value={props.uiAppearance.fontSize} aria-label="界面字号" onInput={(event) => props.updateUIAppearance({ fontSize: Number(event.currentTarget.value) })} />
+                <output>{props.uiAppearance.fontSize}px</output>
+              </div>
+            }
+          />
+          <SettingsRow
+            title="正文行高"
+            description={props.uiAppearance.lineHeight.toFixed(2)}
+            control={
+              <div class="appearance-range-control">
+                <input type="range" min="1.3" max="2" step="0.05" value={props.uiAppearance.lineHeight} aria-label="正文行高" onInput={(event) => props.updateUIAppearance({ lineHeight: Number(event.currentTarget.value) })} />
+                <output>{props.uiAppearance.lineHeight.toFixed(2)}</output>
+              </div>
+            }
+          />
+          <SettingsRow
+            title="字体平滑"
+            description={props.uiAppearance.fontSmoothing === "auto" ? "使用系统与 WebView2 默认渲染" : "使用抗锯齿渲染"}
+            control={
+              <SelectControl
+                ariaLabel="字体平滑"
+                value={props.uiAppearance.fontSmoothing}
+                options={[{ value: "auto", label: "系统默认" }, { value: "antialiased", label: "抗锯齿" }]}
+                onChange={(value) => props.updateUIAppearance({ fontSmoothing: value as UIFontSmoothing })}
+              />
+            }
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="代码字体">
+        <SettingsCard>
+          <SettingsRow
+            title="等宽字体栈"
+            description="应用于代码块、Diff、终端和路径"
+            control={
+              <input
+                class="settings-input appearance-font-input"
+                value={props.uiAppearance.codeFontFamily}
+                spellcheck={false}
+                onInput={(event) => props.updateUIAppearance({ codeFontFamily: event.currentTarget.value })}
+              />
+            }
+          />
+          <SettingsRow
+            title="代码字号"
+            description={`${props.uiAppearance.codeFontSize}px`}
+            control={
+              <div class="appearance-range-control">
+                <input type="range" min="11" max="17" step="1" value={props.uiAppearance.codeFontSize} aria-label="代码字号" onInput={(event) => props.updateUIAppearance({ codeFontSize: Number(event.currentTarget.value) })} />
+                <output>{props.uiAppearance.codeFontSize}px</output>
+              </div>
+            }
+          />
+        </SettingsCard>
+        <div class="settings-actions">
+          <button type="button" onClick={props.resetUIAppearance}>恢复字体与缩放默认值</button>
+        </div>
+      </SettingsSection>
 
       <PanelSection icon={<LayoutList size={16} />} title="侧栏">
         <SettingField label="左侧栏宽度" value={`${Math.round(props.sidebarWidth)}px`}>
@@ -3241,12 +3385,13 @@ export function SegmentedControl(props: {
 }
 
 export function SelectControl(props: {
+	ariaLabel?: string;
   value: string;
   options: Array<{ value: string; label: string }>;
   onChange: (value: string) => void;
 }) {
   return (
-    <select class="settings-select" value={props.value} onChange={(event) => props.onChange(event.currentTarget.value)}>
+    <select aria-label={props.ariaLabel} class="settings-select" value={props.value} onChange={(event) => props.onChange(event.currentTarget.value)}>
       <For each={props.options}>
         {(option) => <option value={option.value}>{option.label}</option>}
       </For>

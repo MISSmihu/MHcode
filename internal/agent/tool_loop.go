@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -225,7 +226,7 @@ func partialToolFailureContent(outcome toolLoopOutcome) string {
 }
 
 func hasUsablePartialToolResult(parts []tools.ResultPart) bool {
-	return hasSuccessfulRepositoryRead(parts) || hasWebSearchSources(parts)
+	return hasSuccessfulRepositoryRead(parts) || hasSuccessfulWebpageRead(parts) || hasWebSearchSources(parts)
 }
 
 func hasSuccessfulRepositoryRead(parts []tools.ResultPart) bool {
@@ -240,6 +241,22 @@ func hasSuccessfulRepositoryRead(parts []tools.ResultPart) bool {
 func isSuccessfulRepositoryRead(part tools.ResultPart) bool {
 	return part.Kind == tools.PartToolCall &&
 		part.Name == "read_repository" &&
+		part.Status != "error" &&
+		strings.TrimSpace(part.Output) != ""
+}
+
+func hasSuccessfulWebpageRead(parts []tools.ResultPart) bool {
+	for _, part := range parts {
+		if isSuccessfulWebpageRead(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSuccessfulWebpageRead(part tools.ResultPart) bool {
+	return part.Kind == tools.PartToolCall &&
+		part.Name == "read_webpage" &&
 		part.Status != "error" &&
 		strings.TrimSpace(part.Output) != ""
 }
@@ -299,8 +316,12 @@ func ensureWebSearchSourcesListed(content string, parts []tools.ResultPart) stri
 	missing := make([]tools.SearchSource, 0, len(sources))
 	for _, source := range sources {
 		title := strings.TrimSpace(source.Title)
-		hasTitle := title == "" || strings.Contains(content, title)
-		if !strings.Contains(content, source.URL) || !hasTitle {
+		hasURL := strings.Contains(content, source.URL)
+		hasTitle := sourceTitleIsMentioned(content, title)
+		// Search engines can return loosely related results. Only surface a URL
+		// automatically when the model has actually named that source; the full
+		// search record remains available in the activity stream for inspection.
+		if hasTitle && !hasURL {
 			missing = append(missing, source)
 		}
 	}
@@ -330,6 +351,14 @@ func ensureWebSearchSourcesListed(content string, parts []tools.ResultPart) stri
 		result.WriteString(">")
 	}
 	return result.String()
+}
+
+func sourceTitleIsMentioned(content, title string) bool {
+	title = strings.TrimSpace(title)
+	if utf8.RuneCountInString(title) < 4 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(content), strings.ToLower(title))
 }
 
 func compactFallbackSnippet(value string, maxRunes int) string {
@@ -362,6 +391,14 @@ func repositoryReadFallbackContent(part tools.ResultPart) string {
 	appendRepositoryFallbackSection(&content, "文件内容（截取）", fileContent, 4_000)
 	content.WriteString("\n\n完整原始结果仍保留在上方“读取仓库”记录中，可展开查看或直接重试整理。")
 	return content.String()
+}
+
+func webpageReadFallbackContent(part tools.ResultPart) string {
+	output := compactMultilineFallback(strings.TrimSpace(strings.ReplaceAll(part.Output, "\r\n", "\n")), 7_000)
+	if output == "" {
+		return ""
+	}
+	return "已读取网页正文。以下内容直接来自网页读取结果，可展开上方记录查看完整内容：\n\n" + output
 }
 
 func splitRepositoryFallbackOutput(output string) (metadata, readme, tree, entries, fileContent string) {
@@ -423,6 +460,11 @@ func emptyToolCompletionContent(parts []tools.ResultPart) string {
 		}
 	}
 	for _, part := range parts {
+		if isSuccessfulWebpageRead(part) {
+			return webpageReadFallbackContent(part)
+		}
+	}
+	for _, part := range parts {
 		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
 			return webSearchFallbackContent(part)
 		}
@@ -468,6 +510,7 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 	)
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
+		reg.Add(tools.ReadWebpageTool{Policy: policy})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
 	if s.config.OpenFile != nil || s.config.PreviewFile != nil {
@@ -528,6 +571,7 @@ func (s *Service) buildReadOnlyRegistry() *tools.Registry {
 	}
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
+		reg.Add(tools.ReadWebpageTool{Policy: policy})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
 	return reg
@@ -830,6 +874,11 @@ func (s *Service) runToolLoopWithCompletion(
 
 	executed := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			setOutcomeProgressStatus(&outcome, "cancelled")
+			emitOutcomeProgress(sink, outcome.Parts)
+			return outcome, err
+		}
 		stepReq := req
 		stepReq.Messages = fitToolLoopMessages(messages, req.TargetInputTokens)
 		if !toolsDisabled {
@@ -901,6 +950,11 @@ func (s *Service) runToolLoopWithCompletion(
 
 		// 逐个执行工具调用。
 		for _, call := range completion.ToolCalls {
+			if err := ctx.Err(); err != nil {
+				setOutcomeProgressStatus(&outcome, "cancelled")
+				emitOutcomeProgress(sink, outcome.Parts)
+				return outcome, err
+			}
 			if executed >= maxToolCalls {
 				// 达到上限：告知模型并结束。
 				note := fmt.Sprintf("已达到本轮工具调用上限（%d 次），停止继续调用。", maxToolCalls)
@@ -927,6 +981,11 @@ func (s *Service) runToolLoopWithCompletion(
 
 			if !guarded {
 				result, toolMsg = s.executeToolCall(ctx, reg, call)
+				if err := ctx.Err(); err != nil {
+					setOutcomeProgressStatus(&outcome, "cancelled")
+					emitOutcomeProgress(sink, outcome.Parts)
+					return outcome, err
+				}
 				guard.after(call, result, &toolMsg)
 			}
 			toolStatus := "completed"
@@ -1243,7 +1302,7 @@ func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
 	switch name {
 	case "search", "web_search":
 		key = "query"
-	case "read_repository":
+	case "read_repository", "read_webpage":
 		key = "url"
 	case "run_command":
 		key = "command"

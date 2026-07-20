@@ -472,6 +472,8 @@ export type ChatResult = {
 export type ChatTaskState = {
   taskId: string;
   startedAt: string;
+  projectId?: string;
+  sessionId?: string;
 };
 
 export type ChatAttachment = {
@@ -482,6 +484,8 @@ export type ChatAttachment = {
 
 export type ChatTaskEvent = {
   taskId: string;
+  projectId?: string;
+  sessionId?: string;
   type: "started" | "status" | "context_compression" | "delta" | "reasoning" | "usage" | "tool" | "completed" | "failed" | "cancelled" | string;
   delta?: string;
   message?: string;

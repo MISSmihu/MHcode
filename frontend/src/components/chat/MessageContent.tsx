@@ -259,6 +259,7 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
     case "list_dir": return "directory";
     case "search": return "search";
     case "web_search": return "web";
+    case "read_webpage": return "web";
     case "read_repository": return "repository";
     case "browser": return "browser";
     case "computer": return "computer";
@@ -342,6 +343,9 @@ function activityLabel(item: ActivityItem): string {
     case "search":
       return input ? `搜索了代码“${compactLabel(input)}”` : "搜索了代码";
     case "web":
+      if (tools.some((part) => part.name === "read_webpage")) {
+        return input ? `读取了网页 ${compactLabel(input)}` : "读取了网页正文";
+      }
       return input ? `搜索了网络“${compactLabel(input)}”` : "搜索了网络";
     case "repository":
       return input ? `读取了仓库 ${compactLabel(input)}` : "读取了代码仓库";
@@ -525,46 +529,59 @@ function FileCard(props: {
     }
   };
 
+  const runFromSummary = (event: MouseEvent, action: "preview" | "open" | "reveal") => {
+    event.preventDefault();
+    event.stopPropagation();
+    void run(action);
+  };
+
   return (
-    <div class="op-file" title={props.part.path}>
-      <span class="op-file-icon" aria-hidden="true">
-        <Show when={isHTML()} fallback={<FileCode2 size={18} />}>
-          <Globe2 size={18} />
-        </Show>
-      </span>
-      <span class="op-file-info">
-        <strong>{fileName()}</strong>
-        <small>{fileMeta(props.part)}</small>
-      </span>
-      <span class="op-file-actions">
-        <button
-          type="button"
-          disabled={Boolean(busyAction())}
-          onClick={() => void run(isHTML() ? "preview" : "open")}
-          title={isHTML() ? "在 MHcode 内置浏览器中预览" : "使用系统默认应用打开"}
-        >
-          <Show when={busyAction() === (isHTML() ? "preview" : "open")} fallback={isHTML() ? <Globe2 size={14} /> : <ExternalLink size={14} />}>
-            <LoaderCircle class="spinning" size={14} />
+    <details class="op-file-artifact" open={error() ? true : undefined}>
+      <summary class="op-file" title={props.part.path}>
+        <span class="op-file-icon" aria-hidden="true">
+          <Show when={isHTML()} fallback={<FileCode2 size={18} />}>
+            <Globe2 size={18} />
           </Show>
-          {isHTML() ? "预览" : "打开"}
-        </button>
-        <Show when={isHTML()}>
-          <button class="op-file-system" type="button" disabled={Boolean(busyAction())} onClick={() => void run("open")} title="使用系统浏览器打开" aria-label="使用系统浏览器打开">
-            <Show when={busyAction() === "open"} fallback={<ExternalLink size={15} />}>
+        </span>
+        <span class="op-file-info">
+          <strong>{fileName()}</strong>
+          <small>{fileMeta(props.part)}</small>
+        </span>
+        <span class="op-file-actions">
+          <button
+            type="button"
+            disabled={Boolean(busyAction())}
+            onClick={(event) => runFromSummary(event, isHTML() ? "preview" : "open")}
+            title={isHTML() ? "在 MHcode 内置浏览器中打开" : "使用系统默认应用打开"}
+          >
+            <Show when={busyAction() === (isHTML() ? "preview" : "open")} fallback={isHTML() ? <Globe2 size={14} /> : <ExternalLink size={14} />}>
+              <LoaderCircle class="spinning" size={14} />
+            </Show>
+            {isHTML() ? "内置打开" : "打开"}
+          </button>
+          <Show when={isHTML()}>
+            <button class="op-file-system" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "open")} title="使用系统浏览器打开">
+              <Show when={busyAction() === "open"} fallback={<ExternalLink size={14} />}>
+                <LoaderCircle class="spinning" size={14} />
+              </Show>
+              外部打开
+            </button>
+          </Show>
+          <button class="op-file-reveal" type="button" disabled={Boolean(busyAction())} onClick={(event) => runFromSummary(event, "reveal")} title="在文件夹中显示" aria-label="在文件夹中显示">
+            <Show when={busyAction() === "reveal"} fallback={<FolderOpen size={15} />}>
               <LoaderCircle class="spinning" size={15} />
             </Show>
           </button>
+        </span>
+        <ChevronRight class="op-file-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div class="op-file-detail">
+        <code title={props.part.path}>{props.part.path}</code>
+        <Show when={error()}>
+          <span class="op-file-error">{error()}</span>
         </Show>
-        <button class="op-file-reveal" type="button" disabled={Boolean(busyAction())} onClick={() => void run("reveal")} title="在文件夹中显示" aria-label="在文件夹中显示">
-          <Show when={busyAction() === "reveal"} fallback={<FolderOpen size={15} />}>
-            <LoaderCircle class="spinning" size={15} />
-          </Show>
-        </button>
-      </span>
-      <Show when={error()}>
-        <span class="op-file-error">{error()}</span>
-      </Show>
-    </div>
+      </div>
+    </details>
   );
 }
 

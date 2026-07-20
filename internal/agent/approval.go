@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MISSmihu/MHcode/internal/eventlog"
@@ -54,6 +55,8 @@ type pendingApproval struct {
 	fingerprint string
 }
 
+var globalApprovalSequence atomic.Uint64
+
 func newApprovalBroker() *approvalBroker {
 	return &approvalBroker{
 		pending:  make(map[string]pendingApproval),
@@ -66,6 +69,15 @@ func (b *approvalBroker) SetNotify(fn func(ApprovalRequest)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.notify = fn
+}
+
+func (b *approvalBroker) notification() func(ApprovalRequest) {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.notify
 }
 
 // hasNotify 是否已配置前端通知（无则表示无头/测试环境）。
@@ -90,7 +102,7 @@ func (b *approvalBroker) sessionAllowedFor(tool string, rawArgs json.RawMessage)
 func (b *approvalBroker) request(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error) {
 	b.mu.Lock()
 	b.seq++
-	req.ID = fmt.Sprintf("apr-%d-%d", b.seq, time.Now().UnixNano())
+	req.ID = fmt.Sprintf("apr-%d-%d-%d", b.seq, time.Now().UnixNano(), globalApprovalSequence.Add(1))
 	ch := make(chan ApprovalDecision, 1)
 	if req.Fingerprint == "" {
 		req.Fingerprint = approvalFingerprint(req.Tool, nil)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 )
@@ -72,4 +73,29 @@ func TestFailoverProviderRetriesStreamBeforeVisibleOutput(t *testing.T) {
 	if delta != "ok" || provider.ActiveRoute().Provider.ID != "two" {
 		t.Fatalf("delta=%q route=%#v", delta, provider.ActiveRoute())
 	}
+}
+
+func TestFailoverProviderStopsWhileCandidateStreamIsOpen(t *testing.T) {
+	stalled := make(chan protocol.StreamEvent)
+	provider := &failoverProvider{candidates: []routedProvider{{
+		route: chatRoute{Provider: ModelProviderSetting{ID: "one", Name: "one"}, ModelID: "one"},
+		provider: failoverProviderStub{name: "one", stream: func(protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+			return stalled, nil
+		}},
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	events, err := provider.Stream(ctx, protocol.ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case _, ok := <-events:
+		if ok {
+			t.Fatal("cancelled failover stream emitted an unexpected event")
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("failover stream did not close promptly after cancellation")
+	}
+	close(stalled)
 }

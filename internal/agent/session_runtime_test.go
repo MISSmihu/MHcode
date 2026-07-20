@@ -1,0 +1,223 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestSessionRuntimesKeepConversationStateIsolated(t *testing.T) {
+	base := t.TempDir()
+	service := NewService(ServiceConfig{
+		SkillsDir:    t.TempDir(),
+		SessionsDir:  filepath.Join(base, "sessions"),
+		ProjectsPath: filepath.Join(base, "projects.json"),
+	})
+	_, sessionA := service.ActiveSessionIDs()
+	if _, err := service.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	projectID, sessionB := service.ActiveSessionIDs()
+
+	runtimeA, err := service.NewSessionRuntime(sessionA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeB, err := service.NewSessionRuntime(sessionB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	appendTurn := func(runtime *Service, user, assistant string) {
+		defer wg.Done()
+		runtime.recordUserEvent(user)
+		runtime.sessionState.TurnCount = 1
+		runtime.recordAssistantAndCheckpoint(assistant, "test-model", nil)
+	}
+	wg.Add(2)
+	go appendTurn(runtimeA, "session-a-user", "session-a-assistant")
+	go appendTurn(runtimeB, "session-b-user", "session-b-assistant")
+	wg.Wait()
+
+	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionA), "session-a", "session-b")
+	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionB), "session-b", "session-a")
+	if gotProject, gotSession := service.ActiveSessionIDs(); gotProject != projectID || gotSession != sessionB {
+		t.Fatalf("background runtimes changed active pointers: project=%q session=%q", gotProject, gotSession)
+	}
+	if len(runtimeA.ListCheckpoints()) != 1 || len(runtimeB.ListCheckpoints()) != 1 {
+		t.Fatalf("checkpoint isolation failed: a=%d b=%d", len(runtimeA.ListCheckpoints()), len(runtimeB.ListCheckpoints()))
+	}
+
+	manifest := service.projects.Snapshot()
+	var titleA, titleB string
+	for _, project := range manifest.Projects {
+		for _, session := range project.Sessions {
+			switch session.ID {
+			case sessionA:
+				titleA = session.Title
+			case sessionB:
+				titleB = session.Title
+			}
+		}
+	}
+	if !strings.Contains(titleA, "session-a") || !strings.Contains(titleB, "session-b") {
+		t.Fatalf("background title updates crossed sessions: a=%q b=%q", titleA, titleB)
+	}
+}
+
+func TestSessionRuntimesUseIndependentApprovalBrokers(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	runtimeA, err := service.NewSessionRuntime("session-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeB, err := service.NewSessionRuntime("session-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestA := make(chan ApprovalRequest, 1)
+	requestB := make(chan ApprovalRequest, 1)
+	runtimeA.SetApprovalNotify(func(request ApprovalRequest) { requestA <- request })
+	runtimeB.SetApprovalNotify(func(request ApprovalRequest) { requestB <- request })
+
+	type approvalResult struct {
+		decision ApprovalDecision
+		err      error
+	}
+	resultA := make(chan approvalResult, 1)
+	resultB := make(chan approvalResult, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		decision, requestErr := runtimeA.approvals.request(ctx, ApprovalRequest{Tool: "write_file", Summary: "A"})
+		resultA <- approvalResult{decision: decision, err: requestErr}
+	}()
+	go func() {
+		decision, requestErr := runtimeB.approvals.request(ctx, ApprovalRequest{Tool: "run_command", Summary: "B"})
+		resultB <- approvalResult{decision: decision, err: requestErr}
+	}()
+
+	pendingA := <-requestA
+	pendingB := <-requestB
+	if pendingA.ID == pendingB.ID {
+		t.Fatalf("approval request IDs must be unique: %q", pendingA.ID)
+	}
+	if err := runtimeA.RespondApproval(pendingA.ID, pendingA.Tool, true, "once"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeB.RespondApproval(pendingB.ID, pendingB.Tool, false, "once"); err != nil {
+		t.Fatal(err)
+	}
+	if result := <-resultA; result.err != nil || !result.decision.Approved {
+		t.Fatalf("runtime A decision = %+v, err=%v", result.decision, result.err)
+	}
+	if result := <-resultB; result.err != nil || result.decision.Approved {
+		t.Fatalf("runtime B decision = %+v, err=%v", result.decision, result.err)
+	}
+}
+
+func TestSessionRuntimesSendModelRequestsConcurrently(t *testing.T) {
+	var requestsMu sync.Mutex
+	requestCount := 0
+	bothRequestsStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		requestsMu.Lock()
+		requestCount++
+		if requestCount == 2 {
+			close(bothRequestsStarted)
+		}
+		requestsMu.Unlock()
+
+		select {
+		case <-bothRequestsStarted:
+		case <-time.After(2 * time.Second):
+			http.Error(w, "requests were serialized", http.StatusGatewayTimeout)
+			return
+		}
+
+		reply := "reply-b"
+		if bytes.Contains(body, []byte("prompt-a")) {
+			reply = "reply-a"
+		}
+		writeOpenAIReply(w, requestIsStream(body), reply, "{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}")
+	}))
+	defer server.Close()
+
+	base := t.TempDir()
+	service := NewService(ServiceConfig{
+		SkillsDir:       t.TempDir(),
+		DeepSeekBaseURL: server.URL,
+		SessionsDir:     filepath.Join(base, "sessions"),
+		ProjectsPath:    filepath.Join(base, "projects.json"),
+	})
+	defer service.Close()
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	_, sessionA := service.ActiveSessionIDs()
+	if _, err := service.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	_, sessionB := service.ActiveSessionIDs()
+	runtimeA, err := service.NewSessionRuntime(sessionA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeB, err := service.NewSessionRuntime(sessionB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type chatResponse struct {
+		result ChatResult
+		err    error
+	}
+	responseA := make(chan chatResponse, 1)
+	responseB := make(chan chatResponse, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		result, sendErr := runtimeA.SendChatMessage(ctx, "prompt-a")
+		responseA <- chatResponse{result: result, err: sendErr}
+	}()
+	go func() {
+		result, sendErr := runtimeB.SendChatMessage(ctx, "prompt-b")
+		responseB <- chatResponse{result: result, err: sendErr}
+	}()
+
+	resultA := <-responseA
+	resultB := <-responseB
+	if resultA.err != nil || resultA.result.Content != "reply-a" {
+		t.Fatalf("session A result = %q, err=%v", resultA.result.Content, resultA.err)
+	}
+	if resultB.err != nil || resultB.result.Content != "reply-b" {
+		t.Fatalf("session B result = %q, err=%v", resultB.result.Content, resultB.err)
+	}
+	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionA), "prompt-a", "prompt-b")
+	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionB), "prompt-b", "prompt-a")
+}
+
+func assertSessionHistory(t *testing.T, history []SessionMessage, included, excluded string) {
+	t.Helper()
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want 2: %+v", len(history), history)
+	}
+	var content strings.Builder
+	for _, message := range history {
+		content.WriteString(message.Content)
+		content.WriteByte('\n')
+	}
+	if !strings.Contains(content.String(), included) || strings.Contains(content.String(), excluded) {
+		t.Fatalf("history isolation failed: %s", content.String())
+	}
+}

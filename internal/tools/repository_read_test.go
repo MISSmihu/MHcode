@@ -85,6 +85,53 @@ func TestReadRepositoryToolReadsBlobURL(t *testing.T) {
 	}
 }
 
+func TestRepositoryPathSuggestionsPreferMatchingBasenameAndParent(t *testing.T) {
+	suggestions := repositoryPathSuggestions("frontend/src/styles/styles.css", []string{
+		"README.md",
+		"frontend/src/styles/chat.css",
+		"frontend/src/styles.css",
+		"frontend/src/styles/polish.css",
+		"internal/tools/styles.css",
+	}, 3)
+	if len(suggestions) == 0 || suggestions[0] != "frontend/src/styles.css" {
+		t.Fatalf("suggestions=%v", suggestions)
+	}
+	err := repositoryPathNotFoundError("frontend/src/styles/styles.css", suggestions)
+	if !strings.Contains(err.Error(), "frontend/src/styles.css") {
+		t.Fatalf("error=%q", err)
+	}
+}
+
+func TestReadRepositoryToolUsesExplicitGitHubTokenWithoutLeakingIt(t *testing.T) {
+	const token = "github-test-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+token {
+			t.Fatalf("authorization=%q", request.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/repos/acme/demo":
+			_, _ = w.Write([]byte(`{"full_name":"acme/demo","default_branch":"main"}`))
+		case "/repos/acme/demo/contents/README.md":
+			content := base64.StdEncoding.EncodeToString([]byte("# private-looking public fixture"))
+			_ = json.NewEncoder(w).Encode(githubContent{Type: "file", Path: "README.md", SHA: "file123", Size: 32, Encoding: "base64", Content: content})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	tool := ReadRepositoryTool{Policy: toolsNetworkPolicy(), Client: server.Client(), APIBaseURL: server.URL, Token: token}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"url":"https://github.com/acme/demo","path":"README.md"}`))
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	serialized, _ := json.Marshal(result)
+	if strings.Contains(string(serialized), token) {
+		t.Fatalf("token leaked into result: %s", serialized)
+	}
+}
+
 func TestReadRepositoryToolRequiresNetworkPermission(t *testing.T) {
 	tool := ReadRepositoryTool{Policy: SandboxPolicy{NetworkAccess: false}}
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{"url":"https://github.com/acme/demo"}`))

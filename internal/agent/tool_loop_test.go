@@ -225,15 +225,11 @@ func TestWebSearchToolLoopFeedsSourcesIntoFinalCompletion(t *testing.T) {
 	if completionCalls != 2 || !strings.Contains(outcome.Content, "来源") {
 		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
 	}
-	for _, expectedURL := range []string{"https://weather.example/warning", "https://weather.example/forecast"} {
-		if !strings.Contains(outcome.Content, expectedURL) {
-			t.Fatalf("final answer missing source %q: %s", expectedURL, outcome.Content)
-		}
+	if !strings.Contains(outcome.Content, "https://weather.example/warning") {
+		t.Fatalf("final answer missing the source used by the model: %s", outcome.Content)
 	}
-	for _, expectedTitle := range []string{"Ningbo warning", "Forecast"} {
-		if !strings.Contains(outcome.Content, expectedTitle) {
-			t.Fatalf("final answer missing source title %q: %s", expectedTitle, outcome.Content)
-		}
+	if strings.Contains(outcome.Content, "https://weather.example/forecast") {
+		t.Fatalf("final answer must not append an unused search result: %s", outcome.Content)
 	}
 	foundSources := false
 	for _, part := range outcome.Parts {
@@ -382,7 +378,7 @@ func TestToolLoopSuppressesUnrequestedExternalBrowserAfterSearch(t *testing.T) {
 					t.Fatalf("suppression feedback missing %q: %s", expected, feedback)
 				}
 			}
-			return protocol.CompletionResult{Content: "宁波预警信息已整理。"}, nil
+			return protocol.CompletionResult{Content: "宁波预警信息已整理。\n\n来源：\n- Ningbo warning\n  https://weather.example/warning"}, nil
 		}
 	}
 
@@ -481,8 +477,18 @@ func TestWebSearchToolLoopRetriesFinalSynthesisWithoutRepeatingSearch(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(outcome.Content, "search result synthesized") || !strings.Contains(outcome.Content, "https://github.com/example/project") || completionCalls != 3 || searchRequests != 1 {
+	if !strings.Contains(outcome.Content, "search result synthesized") || strings.Contains(outcome.Content, "https://github.com/example/project") || completionCalls != 3 || searchRequests != 1 {
 		t.Fatalf("content=%q completionCalls=%d searchRequests=%d", outcome.Content, completionCalls, searchRequests)
+	}
+	foundStructuredSource := false
+	for _, part := range outcome.Parts {
+		if part.Kind == tools.PartWebSearch && len(part.Sources) == 1 && part.Sources[0].URL == "https://github.com/example/project" {
+			foundStructuredSource = true
+			break
+		}
+	}
+	if !foundStructuredSource {
+		t.Fatalf("search source should remain available in structured activity: %+v", outcome.Parts)
 	}
 	foundRetryStatus := false
 	for _, event := range events {
@@ -517,6 +523,24 @@ func TestWebSearchFailureFallsBackToSourceSummaries(t *testing.T) {
 	emptyCompletion := emptyToolCompletionContent(outcome.Parts)
 	if emptyCompletion != content {
 		t.Fatalf("empty completion fallback differs from provider failure fallback:\nempty: %s\nerror: %s", emptyCompletion, content)
+	}
+}
+
+func TestEnsureWebSearchSourcesListedOnlyAddsSourcesUsedByTheAnswer(t *testing.T) {
+	parts := []tools.ResultPart{{
+		Kind: tools.PartWebSearch,
+		Sources: []tools.SearchSource{
+			{Title: "Relevant Pitch Tool", URL: "https://example.com/pitch"},
+			{Title: "Unrelated AI Directory", URL: "https://example.com/directory"},
+		},
+	}}
+	content := "建议使用 Relevant Pitch Tool，它支持直接调整歌曲音高。"
+	result := ensureWebSearchSourcesListed(content, parts)
+	if !strings.Contains(result, "https://example.com/pitch") {
+		t.Fatalf("used source URL missing: %q", result)
+	}
+	if strings.Contains(result, "https://example.com/directory") {
+		t.Fatalf("unrelated source must not be appended: %q", result)
 	}
 }
 
@@ -818,13 +842,13 @@ func TestToolRegistryIncludesNetworkToolsOnlyWithNetworkAccess(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
 	svc.runtimeSettings.WorkspaceRoot = t.TempDir()
 	svc.runtimeSettings.NetworkAccess = false
-	for _, name := range []string{"read_repository", "web_search"} {
+	for _, name := range []string{"read_repository", "read_webpage", "web_search"} {
 		if _, ok := svc.buildToolRegistry().Get(name); ok {
 			t.Fatalf("network-disabled registry must not expose %s", name)
 		}
 	}
 	svc.runtimeSettings.NetworkAccess = true
-	for _, name := range []string{"read_repository", "web_search"} {
+	for _, name := range []string{"read_repository", "read_webpage", "web_search"} {
 		if _, ok := svc.buildToolRegistry().Get(name); !ok {
 			t.Fatalf("network-enabled registry must expose %s", name)
 		}

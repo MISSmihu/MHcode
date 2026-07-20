@@ -12,10 +12,13 @@ type WailsAppBinding = {
   SendDeepSeekMessage: (prompt: string) => Promise<ChatResult>;
   StartChatMessage?: (prompt: string) => Promise<string>;
   StartChatMessageWithAttachments?: (prompt: string, attachments: ChatAttachment[]) => Promise<string>;
+  StartChatMessageForSession?: (sessionID: string, prompt: string) => Promise<string>;
+  StartChatMessageForSessionWithAttachments?: (sessionID: string, prompt: string, attachments: ChatAttachment[]) => Promise<string>;
   GuideChatMessage?: (taskID: string, guidanceID: string, prompt: string) => Promise<boolean>;
   GuideChatMessageWithAttachments?: (taskID: string, guidanceID: string, prompt: string, attachments: ChatAttachment[]) => Promise<boolean>;
   StopChatMessage?: (taskID: string) => Promise<boolean>;
   GetActiveChatTask?: () => Promise<ChatTaskState | null>;
+  GetActiveChatTasks?: () => Promise<ChatTaskState[]>;
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
   SaveModelProviderAPIKey: (providerID: string, apiKey: string) => Promise<WorkbenchState>;
@@ -34,6 +37,7 @@ type WailsAppBinding = {
   ListSessions?: () => Promise<SessionInfo[]>;
   GetProjectTree?: () => Promise<ProjectNode[]>;
   GetSessionMessages?: () => Promise<SessionMessage[]>;
+  GetSessionMessagesForSession?: (sessionID: string) => Promise<SessionMessage[]>;
   CreateProject?: (name: string, workspaceRoot: string) => Promise<WorkbenchState>;
   SwitchProject?: (projectID: string) => Promise<WorkbenchState>;
   SetProjectPinned?: (projectID: string, pinned: boolean) => Promise<WorkbenchState>;
@@ -338,7 +342,17 @@ export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
 }
 
 export async function startChatMessage(prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
+	return startChatMessageForSession("", prompt, attachments);
+}
+
+export async function startChatMessageForSession(sessionID: string, prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
   const binding = wailsBinding();
+  if (binding?.StartChatMessageForSessionWithAttachments) {
+    return binding.StartChatMessageForSessionWithAttachments(sessionID, prompt, attachments);
+  }
+  if (binding?.StartChatMessageForSession && attachments.length === 0) {
+    return binding.StartChatMessageForSession(sessionID, prompt);
+  }
   if (binding?.StartChatMessageWithAttachments) {
     return binding.StartChatMessageWithAttachments(prompt, attachments);
   }
@@ -412,6 +426,15 @@ export async function getActiveChatTask(): Promise<ChatTaskState | null> {
     return binding.GetActiveChatTask();
   }
   return fallbackActiveChatTaskID ? { taskId: fallbackActiveChatTaskID, startedAt: new Date().toISOString() } : null;
+}
+
+export async function getActiveChatTasks(): Promise<ChatTaskState[]> {
+  const binding = wailsBinding();
+  if (binding?.GetActiveChatTasks) {
+    return binding.GetActiveChatTasks();
+  }
+  const task = await getActiveChatTask();
+  return task ? [task] : [];
 }
 
 export function onChatTaskEvent(handler: (event: ChatTaskEvent) => void): () => void {
@@ -762,6 +785,14 @@ export async function getSessionMessages(): Promise<SessionMessage[]> {
     return binding.GetSessionMessages();
   }
   return [];
+}
+
+export async function getSessionMessagesForSession(sessionID: string): Promise<SessionMessage[]> {
+  const binding = wailsBinding();
+  if (binding?.GetSessionMessagesForSession) {
+    return binding.GetSessionMessagesForSession(sessionID);
+  }
+  return getSessionMessages();
 }
 
 export async function createProject(name: string, workspaceRoot: string): Promise<WorkbenchState> {

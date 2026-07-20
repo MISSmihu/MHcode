@@ -162,6 +162,9 @@ type Service struct {
 	usageStore      UsageStore
 	usageLedger     UsageLedgerState
 	providerFactory func(chatRoute) (protocol.Provider, error)
+	// projectID is kept alongside sessionID so a background runtime can update
+	// its own metadata without changing the application's active session.
+	projectID string
 }
 
 func (s *Service) beginActivity(action string) (func(), error) {
@@ -1441,7 +1444,8 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- Prefer read_file line ranges and expected_sha256 for edits. Move a text file as copy_file followed by delete_file so both changes remain approval-aware and rewindable.",
 		"- When the user asks to open or preview a workspace file, call open_file. Never substitute run_command, start, xdg-open, open, or PowerShell for this action.",
 		"- When the user provides a public GitHub repository, tree, or blob URL, call read_repository and inspect the real repository tree or file content before answering. Never substitute web_search snippets for repository source.",
-		"- For current public web information that is not a source repository, call web_search first and preserve source links. Use browser only to open or interact with a specific page.",
+		"- When the user provides a non-GitHub webpage URL, call read_webpage and inspect its actual content before answering. Never claim that a search snippet is page content.",
+		"- For current public web information that is not a source repository, call web_search first and preserve source links. For comparisons or recommendations, first inspect the supplied page with read_webpage, then search using the concrete capability, product category, and important terms discovered there instead of generic words such as 'similar'. Read the most relevant result pages with read_webpage before synthesizing, exclude unrelated search results, and list only sources actually used in the answer. Use browser only when static reading reports JavaScript-only content or the user asks to interact with a page.",
 		"- For website navigation or page interaction, use the browser tool. Read a snapshot before clicking, reuse its selectors, and never launch a browser through run_command.",
 		"- For another desktop application, use computer only when it is enabled. List allowed windows first, take a screenshot before coordinate clicks, and keep all input scoped to the selected window ID.",
 		"- For UI work, prioritize usable screens, clear state, responsive layout, and controls that match the existing design system.",

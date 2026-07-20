@@ -189,6 +189,22 @@ func (s *Store) Project(projectID string) (Project, bool) {
 	return cloneManifest(Manifest{Projects: []Project{*p}}).Projects[0], true
 }
 
+// FindSession returns the project and detached session that owns sessionID.
+// It does not change the active project/session pointers, which is important
+// while background Agent tasks are running for more than one conversation.
+func (s *Store) FindSession(sessionID string) (projectID string, session Session, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, project := range s.manifest.Projects {
+		for _, candidate := range project.Sessions {
+			if candidate.ID == strings.TrimSpace(sessionID) {
+				return project.ID, candidate, true
+			}
+		}
+	}
+	return "", Session{}, false
+}
+
 // ActiveIDs 返回当前活动的项目 ID 与会话 ID。
 func (s *Store) ActiveIDs() (projectID, sessionID string) {
 	s.mu.Lock()
@@ -445,6 +461,26 @@ func (s *Store) SetSessionTitle(sessionID, title string) error {
 	return s.save()
 }
 
+// SetSessionTitleForProject updates a session without relying on the mutable
+// active-session pointer. Background conversations use this variant.
+func (s *Store) SetSessionTitleForProject(projectID, sessionID, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := s.findProject(strings.TrimSpace(projectID))
+	if project == nil {
+		return fmt.Errorf("项目不存在: %s", projectID)
+	}
+	session := project.findSession(strings.TrimSpace(sessionID))
+	if session == nil {
+		return fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	if strings.TrimSpace(title) != "" {
+		session.Title = title
+	}
+	session.UpdatedAt = nowRFC3339()
+	return s.save()
+}
+
 // TouchActiveSession 刷新活动会话的更新时间（每轮对话后调用）。
 func (s *Store) TouchActiveSession() error {
 	s.mu.Lock()
@@ -458,6 +494,22 @@ func (s *Store) TouchActiveSession() error {
 		return nil
 	}
 	sess.UpdatedAt = nowRFC3339()
+	return s.save()
+}
+
+// TouchSession updates a non-active session's timestamp without switching it.
+func (s *Store) TouchSession(projectID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := s.findProject(strings.TrimSpace(projectID))
+	if project == nil {
+		return fmt.Errorf("项目不存在: %s", projectID)
+	}
+	session := project.findSession(strings.TrimSpace(sessionID))
+	if session == nil {
+		return fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	session.UpdatedAt = nowRFC3339()
 	return s.save()
 }
 

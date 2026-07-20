@@ -88,7 +88,7 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(_ context.Context) {
-	a.cancelActiveChatTask("")
+	a.cancelAllChatTasks()
 	if a.terminal != nil {
 		a.terminal.SetNotify(nil)
 		a.terminal.Close()
@@ -285,6 +285,9 @@ func (a *App) ForkFromMessage(messageEventID string) (agent.WorkbenchState, erro
 
 // RespondApproval 由前端在用户点击审批弹窗后调用。
 func (a *App) RespondApproval(id string, tool string, approved bool, scope string) error {
+	if runtime := a.approvalService(id); runtime != nil {
+		return runtime.RespondApproval(id, tool, approved, scope)
+	}
 	return a.service.RespondApproval(id, tool, approved, scope)
 }
 
@@ -304,6 +307,10 @@ func (a *App) GetProjectTree() []agent.ProjectNode { return a.service.GetProject
 // GetSessionMessages 返回当前活动会话的历史消息（供启动/切换会话时恢复对话）。
 func (a *App) GetSessionMessages() []agent.SessionMessage {
 	return a.service.GetSessionMessages()
+}
+
+func (a *App) GetSessionMessagesForSession(sessionID string) []agent.SessionMessage {
+	return a.service.GetSessionMessagesForSession(sessionID)
 }
 
 func (a *App) CreateProject(name string, workspaceRoot string) (agent.WorkbenchState, error) {

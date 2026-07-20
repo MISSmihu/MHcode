@@ -130,8 +130,19 @@ func (s *Service) runTeamTurn(
 	artifacts := make([]teamArtifact, 0, 8)
 	aggregate := cache.UsageMetrics{}
 	planStarted := false
+	cancelResult := func() (ChatResult, error) {
+		cancelErr := ctx.Err()
+		if cancelErr == nil {
+			cancelErr = context.Canceled
+		}
+		s.finishTeamRun("cancelled", "用户已停止团队任务", sink)
+		return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, cancelErr
+	}
 
 	run := func(role string, attempt int, prior []teamArtifact) (teamArtifact, error) {
+		if err := ctx.Err(); err != nil {
+			return teamArtifact{role: role}, err
+		}
 		roleSettings := teamRoleSettings(settings, role)
 		artifact, err := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, maxToolCalls, prior, sink)
 		if artifact.route.Provider.ID != "" {
@@ -150,6 +161,9 @@ func (s *Service) runTeamTurn(
 		var err error
 		plan, err = run(TeamRolePlanner, 1, nil)
 		if err != nil {
+			if ctx.Err() != nil {
+				return cancelResult()
+			}
 			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "规划角色暂不可用，团队将直接进入实现", Model: primary.ModelID})
 		}
 	}
@@ -165,6 +179,9 @@ func (s *Service) runTeamTurn(
 		}
 		approved, err := s.requestPlanApproval(ctx, plan.content)
 		if err != nil {
+			if ctx.Err() != nil {
+				return cancelResult()
+			}
 			err = s.failStartedPlan(planStarted, err)
 			s.finishTeamRun("failed", err.Error(), sink)
 			return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID}, err
@@ -199,6 +216,9 @@ func (s *Service) runTeamTurn(
 
 	implementation, err := run(TeamRoleImplementer, 1, artifacts)
 	if err != nil {
+		if ctx.Err() != nil {
+			return cancelResult()
+		}
 		err = s.failStartedPlan(planStarted, err)
 		s.finishTeamRun("failed", err.Error(), sink)
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
@@ -211,18 +231,27 @@ func (s *Service) runTeamTurn(
 			continue
 		}
 		artifact, roleErr := run(role, 1, artifacts)
+		if ctx.Err() != nil {
+			return cancelResult()
+		}
 		if roleErr == nil {
 			latestChecks[role] = artifact
 		}
 	}
 
 	for round := 1; round <= settings.MaxReviewRounds && teamNeedsRevision(latestChecks); round++ {
+		if ctx.Err() != nil {
+			return cancelResult()
+		}
 		feedback := reviewArtifacts(latestChecks)
 		revisionContext := append(append([]teamArtifact(nil), artifacts...), teamArtifact{
 			role: TeamRoleReviewer, content: "需要修订：\n" + feedback, verdict: "changes_required",
 		})
 		implementation, err = run(TeamRoleImplementer, round+1, revisionContext)
 		if err != nil {
+			if ctx.Err() != nil {
+				return cancelResult()
+			}
 			err = s.failStartedPlan(planStarted, err)
 			s.finishTeamRun("failed", err.Error(), sink)
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
@@ -234,6 +263,9 @@ func (s *Service) runTeamTurn(
 				continue
 			}
 			artifact, roleErr := run(role, round+1, artifacts)
+			if ctx.Err() != nil {
+				return cancelResult()
+			}
 			if roleErr == nil {
 				latestChecks[role] = artifact
 			}
@@ -243,6 +275,9 @@ func (s *Service) runTeamTurn(
 	var final teamArtifact
 	if roleEnabled(settings, TeamRoleSynthesizer) {
 		final, err = run(TeamRoleSynthesizer, 1, artifacts)
+	}
+	if ctx.Err() != nil {
+		return cancelResult()
 	}
 	answer := strings.TrimSpace(final.content)
 	if err != nil || answer == "" {
@@ -320,6 +355,13 @@ func (s *Service) runTeamRole(
 	}
 	artifact.verdict = teamVerdict(role, artifact.content)
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			s.cancelTeamRole(role, attempt, route, artifact, sink)
+			if ctx.Err() != nil {
+				return artifact, ctx.Err()
+			}
+			return artifact, err
+		}
 		s.failTeamRoleWithArtifact(role, attempt, route, artifact, err, sink)
 		return artifact, err
 	}
@@ -442,8 +484,13 @@ func teamArtifactPart(artifact teamArtifact, attempt int, err error) tools.Resul
 	status := "completed"
 	summary := compactTeamText(artifact.content, 1800)
 	if err != nil {
-		status = "error"
-		summary = err.Error()
+		if errors.Is(err, context.Canceled) {
+			status = "cancelled"
+			summary = "已取消"
+		} else {
+			status = "error"
+			summary = err.Error()
+		}
 	}
 	return tools.ResultPart{
 		Kind:       tools.PartTeamRole,
@@ -591,6 +638,21 @@ func (s *Service) completeTeamRole(role string, attempt int, route chatRoute, ar
 	state.FinishedAt = time.Now().Format(time.RFC3339Nano)
 	s.setTeamRoleState(state)
 	emitChatEvent(sink, ChatStreamEvent{Type: "team", Message: fmt.Sprintf("%s角色已完成", state.Label), Model: route.ModelID, Team: teamEvent(s.teamState.RunID, state)})
+}
+
+func (s *Service) cancelTeamRole(role string, attempt int, route chatRoute, artifact teamArtifact, sink ChatEventSink) {
+	state := s.teamRoleState(role)
+	state.Status = "cancelled"
+	state.ProviderID = route.Provider.ID
+	state.Model = route.ModelID
+	state.Attempt = attempt
+	state.Verdict = artifact.verdict
+	state.Summary = compactTeamText(artifact.content, 1200)
+	state.Error = ""
+	state.Usage = artifact.usage
+	state.FinishedAt = time.Now().Format(time.RFC3339Nano)
+	s.setTeamRoleState(state)
+	emitChatEvent(sink, ChatStreamEvent{Type: "team", Message: fmt.Sprintf("%s角色已取消", state.Label), Model: route.ModelID, Team: teamEvent(s.teamState.RunID, state)})
 }
 
 func (s *Service) failTeamRole(role string, attempt int, err error, sink ChatEventSink) {
