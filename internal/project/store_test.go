@@ -75,6 +75,68 @@ func TestProjectPinRenameAndPersistence(t *testing.T) {
 	}
 }
 
+func TestProjectSessionIdentityRejectsAmbiguousBareID(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "projects.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnsureBootstrap(t.TempDir(), "first"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.CreateProject("second", t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store.mu.Lock()
+	firstID := store.manifest.Projects[0].ID
+	sharedSessionID := "sess-shared"
+	store.manifest.Projects[0].Sessions[0].ID = sharedSessionID
+	store.manifest.Projects[1].Sessions[0].ID = sharedSessionID
+	store.manifest.ActiveProjectID = second.ID
+	store.manifest.ActiveSessionID = sharedSessionID
+	err = store.save()
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if projectID, _, ok := store.FindSession(sharedSessionID); ok || projectID != "" {
+		t.Fatalf("ambiguous bare session ID resolved to project %q", projectID)
+	}
+	if err := store.SwitchProjectSession(firstID, sharedSessionID); err != nil {
+		t.Fatalf("switch exact project/session: %v", err)
+	}
+	if projectID, sessionID := store.ActiveIDs(); projectID != firstID || sessionID != sharedSessionID {
+		t.Fatalf("active identity = %q/%q", projectID, sessionID)
+	}
+	if err := store.SetArchivedForProject(second.ID, sharedSessionID, true); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := store.ProjectSession(firstID, sharedSessionID)
+	archivedSecond, _ := store.ProjectSession(second.ID, sharedSessionID)
+	if first.Archived || !archivedSecond.Archived {
+		t.Fatalf("archive crossed projects: first=%v second=%v", first.Archived, archivedSecond.Archived)
+	}
+	if err := store.SetSessionTitleForProject(second.ID, sharedSessionID, "second conversation"); err != nil {
+		t.Fatal(err)
+	}
+	first, _ = store.ProjectSession(firstID, sharedSessionID)
+	renamedSecond, _ := store.ProjectSession(second.ID, sharedSessionID)
+	if first.Title == renamedSecond.Title || renamedSecond.Title != "second conversation" {
+		t.Fatalf("rename crossed projects: first=%q second=%q", first.Title, renamedSecond.Title)
+	}
+	if _, _, err := store.DeleteSession(sharedSessionID); err == nil {
+		t.Fatal("ambiguous bare session ID should not be deleted")
+	}
+	if _, err := store.DeleteProjectSession(second.ID, sharedSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.ProjectSession(firstID, sharedSessionID); !ok {
+		t.Fatal("exact delete removed the other project's session")
+	}
+}
+
 func TestArchiveProjectSessionsCreatesActiveReplacement(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "projects.json"))
 	if err != nil {

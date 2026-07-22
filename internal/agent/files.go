@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
@@ -14,6 +16,7 @@ const (
 	maxWorkspacePreviewFileBytes = 16 << 20
 	maxWorkspacePreviewBytes     = 2 << 20
 	maxWorkspacePreviewLines     = 5000
+	maxWorkspaceDirectoryEntries = 1000
 )
 
 type WorkspaceFilePreview struct {
@@ -27,6 +30,108 @@ type WorkspaceFilePreview struct {
 	Truncated  bool   `json:"truncated"`
 	Binary     bool   `json:"binary"`
 	TooLarge   bool   `json:"tooLarge"`
+}
+
+type WorkspaceDirectoryListing struct {
+	Path      string                    `json:"path"`
+	Entries   []WorkspaceDirectoryEntry `json:"entries"`
+	Truncated bool                      `json:"truncated"`
+}
+
+type WorkspaceDirectoryEntry struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	IsDirectory bool   `json:"isDirectory"`
+	IsSymlink   bool   `json:"isSymlink"`
+	Size        int64  `json:"size,omitempty"`
+}
+
+// ListWorkspaceDirectory returns one bounded directory level. Loading folders
+// lazily keeps large repositories responsive and avoids walking generated trees.
+func (s *Service) ListWorkspaceDirectory(path string) (WorkspaceDirectoryListing, error) {
+	s.stateMu.RLock()
+	workspaceRoot := strings.TrimSpace(s.runtimeSettings.WorkspaceRoot)
+	policy := s.sandboxPolicy()
+	s.stateMu.RUnlock()
+	if workspaceRoot == "" {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("请先选择项目工作区")
+	}
+
+	relative := filepath.Clean(filepath.FromSlash(strings.TrimSpace(path)))
+	if relative == "" || relative == "." {
+		relative = "."
+	}
+	if filepath.IsAbs(relative) {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("目录路径必须相对于当前工作区")
+	}
+	// The explorer is always project-scoped, even when the Agent itself has an
+	// unrestricted filesystem policy.
+	policy.FilesystemAccess = "read-only"
+	policy.ExtraWritableRoots = nil
+	abs, err := policy.ResolveReadPath(relative)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, err
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("无法访问工作区: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("目录不存在或无法访问: %w", err)
+	}
+	if within, withinErr := pathutil.Within(resolvedRoot, resolvedPath); withinErr != nil || !within {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("目录超出当前工作区")
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("无法读取目录信息: %w", err)
+	}
+	if !info.IsDir() {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("目标不是目录")
+	}
+
+	directory, err := os.Open(resolvedPath)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("无法打开目录: %w", err)
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(maxWorkspaceDirectoryEntries + 1)
+	if err != nil {
+		return WorkspaceDirectoryListing{}, fmt.Errorf("无法列出目录: %w", err)
+	}
+	truncated := len(entries) > maxWorkspaceDirectoryEntries
+	if truncated {
+		entries = entries[:maxWorkspaceDirectoryEntries]
+	}
+
+	displayPath := ""
+	if relative != "." {
+		displayPath = filepath.ToSlash(relative)
+	}
+	result := make([]WorkspaceDirectoryEntry, 0, len(entries))
+	for _, entry := range entries {
+		entryInfo, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		entryPath := filepath.ToSlash(filepath.Join(displayPath, entry.Name()))
+		isSymlink := entryInfo.Mode()&os.ModeSymlink != 0
+		result = append(result, WorkspaceDirectoryEntry{
+			Name:        entry.Name(),
+			Path:        entryPath,
+			IsDirectory: entryInfo.IsDir() && !isSymlink,
+			IsSymlink:   isSymlink,
+			Size:        entryInfo.Size(),
+		})
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].IsDirectory != result[j].IsDirectory {
+			return result[i].IsDirectory
+		}
+		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+	})
+	return WorkspaceDirectoryListing{Path: displayPath, Entries: result, Truncated: truncated}, nil
 }
 
 // ResolveWorkspaceFile validates a UI-requested artifact path against the

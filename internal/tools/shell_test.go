@@ -54,6 +54,16 @@ func TestRunCommandEcho(t *testing.T) {
 	if !strings.Contains(res.Parts[0].Output, "mhcode-ok") {
 		t.Fatalf("输出应含 mhcode-ok: %q", res.Parts[0].Output)
 	}
+	part := res.Parts[0]
+	if part.WorkingDirectory == "" || part.WorkingDirectory != policy.WorkspaceRoot {
+		t.Fatalf("working directory = %q, want %q", part.WorkingDirectory, policy.WorkspaceRoot)
+	}
+	if part.ExitCode == nil || *part.ExitCode != 0 {
+		t.Fatalf("exit code = %#v, want 0", part.ExitCode)
+	}
+	if part.StartedAt == "" || part.CompletedAt == "" || part.DurationMs < 1 {
+		t.Fatalf("execution metadata is incomplete: %#v", part)
+	}
 }
 
 func TestRunCommandRejectsDestructiveOperationByDefault(t *testing.T) {

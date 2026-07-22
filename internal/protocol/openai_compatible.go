@@ -39,15 +39,16 @@ var defaultOpenAICompatibleHTTPClient = &http.Client{
 }
 
 type OpenAICompatibleProvider struct {
-	BaseURL       string
-	APIKey        string
-	ProviderID    string
-	DisplayName   string
-	APIType       string
-	HTTPClient    *http.Client
-	AllowNoAuth   bool
-	ExtraHeaders  string
-	ExtraBodyJSON string
+	BaseURL          string
+	APIKey           string
+	ProviderID       string
+	DisplayName      string
+	APIType          string
+	HTTPClient       *http.Client
+	AllowNoAuth      bool
+	ExtraHeaders     string
+	ExtraBodyJSON    string
+	ReasoningProfile string
 }
 
 func (p OpenAICompatibleProvider) Name() string {
@@ -105,19 +106,25 @@ func (p OpenAICompatibleProvider) Stream(ctx context.Context, request ChatReques
 		return nil, errors.New("OpenAI-compatible model is required")
 	}
 
+	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Effort != "" {
+		temperature = 0
+	}
 	body := openAIChatRequest{
-		Model:         request.Model,
-		Messages:      openAIMessagesFromProtocol(request.Messages),
-		Temperature:   request.Temperature,
-		Stream:        true,
-		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
-		Tools:         request.Tools,
+		Model:           request.Model,
+		Messages:        openAIMessagesFromProtocol(request.Messages),
+		Temperature:     temperature,
+		ReasoningEffort: reasoning.Effort,
+		Stream:          true,
+		StreamOptions:   &openAIStreamOptions{IncludeUsage: true},
+		Tools:           request.Tools,
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "temperature", "reasoning_effort", "stream", "stream_options", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -154,18 +161,24 @@ func (p OpenAICompatibleProvider) Complete(ctx context.Context, request ChatRequ
 		return CompletionResult{}, errors.New("OpenAI-compatible model is required")
 	}
 
+	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Effort != "" {
+		temperature = 0
+	}
 	body := openAIChatRequest{
-		Model:       request.Model,
-		Messages:    openAIMessagesFromProtocol(request.Messages),
-		Temperature: request.Temperature,
-		Stream:      false,
-		Tools:       request.Tools,
+		Model:           request.Model,
+		Messages:        openAIMessagesFromProtocol(request.Messages),
+		Temperature:     temperature,
+		ReasoningEffort: reasoning.Effort,
+		Stream:          false,
+		Tools:           request.Tools,
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "temperature", "reasoning_effort", "stream", "tools"))
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -188,6 +201,7 @@ func (p OpenAICompatibleProvider) Complete(ctx context.Context, request ChatRequ
 	msg := payload.Choices[0].Message
 	result := CompletionResult{
 		Content:   msg.Content,
+		Reasoning: msg.ReasoningContent,
 		ToolCalls: msg.ToolCalls,
 	}
 	if payload.Usage != nil {
@@ -335,6 +349,9 @@ func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events cha
 			return
 		}
 		for _, choice := range chunk.Choices {
+			if choice.Delta.ReasoningContent != "" {
+				events <- StreamEvent{Type: "reasoning", Delta: choice.Delta.ReasoningContent}
+			}
 			if choice.Delta.Content != "" {
 				events <- StreamEvent{Type: "delta", Delta: choice.Delta.Content}
 			}
@@ -524,20 +541,22 @@ func positiveIntFromAny(value any) int {
 }
 
 type openAIChatRequest struct {
-	Model         string               `json:"model"`
-	Messages      []openAIMessage      `json:"messages"`
-	Temperature   float64              `json:"temperature,omitempty"`
-	Stream        bool                 `json:"stream"`
-	StreamOptions *openAIStreamOptions `json:"stream_options,omitempty"`
-	Tools         []ToolDefinition     `json:"tools,omitempty"`
+	Model           string               `json:"model"`
+	Messages        []openAIMessage      `json:"messages"`
+	Temperature     float64              `json:"temperature,omitempty"`
+	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
+	Stream          bool                 `json:"stream"`
+	StreamOptions   *openAIStreamOptions `json:"stream_options,omitempty"`
+	Tools           []ToolDefinition     `json:"tools,omitempty"`
 }
 
 type openAIMessage struct {
-	Role       string     `json:"role"`
-	Content    any        `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role             string     `json:"role"`
+	Content          any        `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
 }
 
 type openAIContentPart struct {
@@ -570,11 +589,12 @@ func openAIMessagesFromProtocol(messages []Message) []openAIMessage {
 			content = parts
 		}
 		converted = append(converted, openAIMessage{
-			Role:       message.Role,
-			Content:    content,
-			ToolCalls:  message.ToolCalls,
-			ToolCallID: message.ToolCallID,
-			Name:       message.Name,
+			Role:             message.Role,
+			Content:          content,
+			ReasoningContent: message.ReasoningContent,
+			ToolCalls:        message.ToolCalls,
+			ToolCallID:       message.ToolCallID,
+			Name:             message.Name,
 		})
 	}
 	return converted
@@ -587,8 +607,9 @@ type openAIStreamOptions struct {
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string                `json:"content"`
-			ToolCalls []streamToolCallDelta `json:"tool_calls"`
+			Content          string                `json:"content"`
+			ReasoningContent string                `json:"reasoning_content"`
+			ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -599,8 +620,9 @@ type openAIStreamChunk struct {
 type openAICompletionResponse struct {
 	Choices []struct {
 		Message struct {
-			Content   string     `json:"content"`
-			ToolCalls []ToolCall `json:"tool_calls"`
+			Content          string     `json:"content"`
+			ReasoningContent string     `json:"reasoning_content"`
+			ToolCalls        []ToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`

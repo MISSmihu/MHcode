@@ -32,6 +32,8 @@ type pendingRequest struct {
 	typeID string
 }
 
+const embeddedBrowserExecutable = "mhcode-webview2"
+
 type tabSession struct {
 	mu                   sync.RWMutex
 	runMu                sync.Mutex
@@ -81,9 +83,12 @@ type Service struct {
 }
 
 func New(profileDir, downloadsDir string) *Service {
+	nativeSurface := newNativeBrowserSurface()
 	executables := FindExecutables()
 	executable := ""
-	if len(executables) > 0 {
+	if _, embedded := nativeSurface.(embeddedNativeBrowserSurface); embedded {
+		executable = embeddedBrowserExecutable
+	} else if len(executables) > 0 {
 		executable = executables[0]
 	}
 	return &Service{
@@ -94,7 +99,7 @@ func New(profileDir, downloadsDir string) *Service {
 		tabs:          map[string]*tabSession{},
 		targets:       map[target.ID]string{},
 		downloads:     map[string]Download{},
-		nativeSurface: newNativeBrowserSurface(),
+		nativeSurface: nativeSurface,
 	}
 }
 
@@ -170,22 +175,38 @@ func (s *Service) Open(ctx context.Context, rawURL string) (State, error) {
 		return s.State(), err
 	}
 
+	id := newID("tab")
 	s.mu.Lock()
 	rootCtx := s.rootCtx
-	useRootTarget := s.nativeReady && !s.rootTargetClaimed && s.rootTargetID != ""
+	embeddedSurface, embedded := s.nativeSurface.(embeddedNativeBrowserSurface)
+	embedded = embedded && s.nativeReady
+	useRootTarget := !embedded && s.nativeReady && !s.rootTargetClaimed && s.rootTargetID != ""
 	if useRootTarget {
 		s.rootTargetClaimed = true
 	}
 	s.mu.Unlock()
+
 	tabCtx := rootCtx
 	cancel := func() {}
-	if !useRootTarget {
+	embeddedTargetID := target.ID("")
+	if embedded {
+		markerURL := embeddedTabMarkerURL(id)
+		if err := embeddedSurface.CreateTab(id, markerURL); err != nil {
+			return s.State(), s.setError(fmt.Errorf("create embedded browser tab: %w", err))
+		}
+		embeddedTargetID, err = waitForEmbeddedTarget(ctx, rootCtx, markerURL)
+		if err != nil {
+			embeddedSurface.CloseTab(id)
+			return s.State(), s.setError(fmt.Errorf("connect embedded browser tab: %w", err))
+		}
+		tabCtx, cancel = chromedp.NewContext(rootCtx, chromedp.WithTargetID(embeddedTargetID))
+	} else if !useRootTarget {
 		tabCtx, cancel = chromedp.NewContext(rootCtx)
 	}
-	id := newID("tab")
 	tab := &tabSession{
 		ctx:      tabCtx,
 		cancel:   cancel,
+		targetID: embeddedTargetID,
 		requests: map[network.RequestID]pendingRequest{},
 		state: Tab{
 			ID:             id,
@@ -273,9 +294,14 @@ func (s *Service) CloseTab(tabID string) State {
 		s.rootTargetClaimed = false
 	}
 	nextTab := s.tabs[s.activeTabID]
+	embeddedSurface, embedded := s.nativeSurface.(embeddedNativeBrowserSurface)
+	embedded = embedded && s.nativeReady
 	s.mu.Unlock()
+	if embedded {
+		embeddedSurface.CloseTab(tabID)
+	}
 	if tab != nil {
-		if tab.isRoot {
+		if tab.isRoot && !embedded {
 			go func() {
 				tab.runMu.Lock()
 				defer tab.runMu.Unlock()
@@ -396,7 +422,8 @@ func (s *Service) ensureStarted(ctx context.Context) error {
 	if !settings.Enabled {
 		return fmt.Errorf("内置浏览器已在设置中关闭")
 	}
-	if len(executables) == 0 {
+	_, hasEmbeddedSurface := s.nativeSurface.(embeddedNativeBrowserSurface)
+	if len(executables) == 0 && !(hasEmbeddedSurface && settings.NativePresentation) {
 		return s.setError(fmt.Errorf("未找到可用的 Microsoft Edge、Google Chrome 或 Chromium"))
 	}
 	if err := os.MkdirAll(s.profileDir, 0o700); err != nil {
@@ -404,6 +431,13 @@ func (s *Service) ensureStarted(ctx context.Context) error {
 	}
 	if err := os.MkdirAll(s.downloadsDir, 0o755); err != nil {
 		return s.setError(fmt.Errorf("创建浏览器下载目录失败: %w", err))
+	}
+
+	if embeddedSurface, embedded := s.nativeSurface.(embeddedNativeBrowserSurface); embedded && settings.NativePresentation {
+		if err := s.startEmbeddedBrowser(ctx, embeddedSurface, settings); err != nil {
+			return s.setError(fmt.Errorf("start embedded WebView2 browser: %w", err))
+		}
+		return nil
 	}
 
 	attempts := make([]string, 0, len(executables)*2)
@@ -444,6 +478,90 @@ func (s *Service) ensureStarted(ctx context.Context) error {
 	diagnostic := strings.Join(attempts, "; ")
 	log.Printf("managed browser startup failed: %s", diagnostic)
 	return s.setError(errors.New(browserStartupMessage(diagnostic)))
+}
+
+func (s *Service) startEmbeddedBrowser(
+	ctx context.Context,
+	surface embeddedNativeBrowserSurface,
+	settings Settings,
+) error {
+	endpoint, err := surface.Start(embeddedBrowserOptions{
+		ProfileDir: s.profileDir,
+		AdditionalBrowserArgs: []string{
+			"--disable-crash-reporter",
+			"--disable-session-crashed-bubble",
+			"--disable-sync",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-blink-features=AutomationControlled",
+		},
+		DeveloperToolsEnabled:  settings.DeveloperCDPAccess,
+		PasswordManagerEnabled: settings.PasswordManagerEnabled,
+		AutofillContactEnabled: settings.AutofillContactEnabled,
+	})
+	if err != nil {
+		return err
+	}
+
+	allocatorCtx, allocatorCancel := chromedp.NewRemoteAllocator(context.Background(), endpoint)
+	rootCtx, rootCancel := chromedp.NewContext(allocatorCtx, chromedp.WithErrorf(browserProtocolErrorf))
+	chromedp.ListenBrowser(rootCtx, s.handleBrowserEvent)
+	err = chromedp.Run(rootCtx,
+		network.Enable(),
+		page.Enable(),
+		target.SetDiscoverTargets(true),
+		browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).
+			WithDownloadPath(s.downloadsDir).
+			WithEventsEnabled(true),
+	)
+	if err != nil {
+		rootCancel()
+		allocatorCancel()
+		surface.Close()
+		return fmt.Errorf("connect to embedded WebView2: %w", err)
+	}
+
+	rootTargetID := target.ID("")
+	if details := chromedp.FromContext(rootCtx); details != nil && details.Target != nil {
+		rootTargetID = details.Target.TargetID
+	}
+	s.mu.Lock()
+	s.executable = embeddedBrowserExecutable
+	s.allocatorCtx = allocatorCtx
+	s.allocatorCancel = allocatorCancel
+	s.rootCtx = rootCtx
+	s.rootCancel = rootCancel
+	s.activeProfileDir = s.profileDir
+	s.temporaryProfileDir = ""
+	s.lastError = ""
+	s.nativeReady = true
+	s.nativeInsets = nativeWindowInsets{}
+	s.nativeInsetsMeasured = true
+	s.rootTargetID = rootTargetID
+	s.rootTargetClaimed = true
+	s.mu.Unlock()
+
+	permissionCtx, permissionCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer permissionCancel()
+	if err := s.applyPermissions(permissionCtx); err != nil {
+		rootCancel()
+		allocatorCancel()
+		surface.Close()
+		s.mu.Lock()
+		s.allocatorCtx = nil
+		s.allocatorCancel = nil
+		s.rootCtx = nil
+		s.rootCancel = nil
+		s.activeProfileDir = ""
+		s.nativeReady = false
+		s.nativeInsets = nativeWindowInsets{}
+		s.nativeInsetsMeasured = false
+		s.rootTargetID = ""
+		s.rootTargetClaimed = false
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (s *Service) startBrowser(
@@ -783,12 +901,17 @@ func (s *Service) ShowNativeSurface(ctx context.Context, tabID string, bounds Na
 	ready := s.nativeReady
 	insets := s.nativeInsets
 	measured := s.nativeInsetsMeasured
+	_, embedded := s.nativeSurface.(embeddedNativeBrowserSurface)
 	s.mu.RUnlock()
 	if !ready {
 		return false, nil
 	}
 	if err := s.bringTabToFront(tab); err != nil {
 		return false, err
+	}
+	if embedded {
+		insets = nativeWindowInsets{}
+		measured = true
 	}
 	if !measured {
 		if nextInsets, measureErr := measureNativeWindowInsets(ctx, tab); measureErr == nil {
@@ -818,6 +941,15 @@ func (s *Service) HideNativeSurface() error {
 func (s *Service) bringTabToFront(tab *tabSession) error {
 	if tab == nil {
 		return fmt.Errorf("浏览标签页不存在")
+	}
+	s.mu.RLock()
+	embeddedSurface, embedded := s.nativeSurface.(embeddedNativeBrowserSurface)
+	embedded = embedded && s.nativeReady
+	s.mu.RUnlock()
+	if embedded {
+		if err := embeddedSurface.ActivateTab(tab.state.ID); err != nil {
+			return err
+		}
 	}
 	tab.runMu.Lock()
 	defer tab.runMu.Unlock()
@@ -973,6 +1105,9 @@ func FindExecutables() []string {
 }
 
 func browserEngineName(executable string) string {
+	if executable == embeddedBrowserExecutable {
+		return "WebView2 embedded"
+	}
 	name := strings.ToLower(filepath.Base(executable))
 	switch {
 	case strings.Contains(name, "edge"):
@@ -992,6 +1127,32 @@ func browserProtocolErrorf(format string, args ...any) {
 		return
 	}
 	log.Printf("browser CDP: %s", message)
+}
+
+func embeddedTabMarkerURL(tabID string) string {
+	return "about:blank#mhcode-embedded-tab-" + tabID
+}
+
+func waitForEmbeddedTarget(parent, rootCtx context.Context, markerURL string) (target.ID, error) {
+	waitCtx, cancel := operationContext(parent, rootCtx, 10*time.Second)
+	defer cancel()
+	for {
+		targets, err := chromedp.Targets(waitCtx)
+		if err == nil {
+			for _, info := range targets {
+				if info != nil && string(info.Type) == "page" && info.URL == markerURL {
+					return info.TargetID, nil
+				}
+			}
+		} else if waitCtx.Err() != nil {
+			return "", waitCtx.Err()
+		}
+		select {
+		case <-waitCtx.Done():
+			return "", fmt.Errorf("embedded WebView2 target %q was not discovered: %w", markerURL, waitCtx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func newID(prefix string) string {

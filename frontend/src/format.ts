@@ -238,6 +238,11 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
       ],
     },
     team: defaultTeamSettings(),
+    update: {
+      autoCheck: true,
+      autoDownload: false,
+      channel: "stable",
+    },
     workspace: {
       configured: true,
       dependenciesEnabled: true,
@@ -316,6 +321,10 @@ export function settingsCategoryDescription(category: SettingsCategory) {
       return "查看当前用户和个性化摘要。";
     case "shortcuts":
       return "查看常用键盘快捷键。";
+    case "about":
+      return "查看版本与构建信息，并管理自动更新。";
+    case "automation":
+      return "让 Agent 按计划在指定项目与会话中执行任务。";
     case "archive":
       return "查看已归档的对话。";
   }
@@ -584,6 +593,7 @@ export function providerFromPreset(preset: ProviderPreset, existing?: ModelProvi
     balanceUrl: preset.balanceUrl ?? existing?.balanceUrl ?? "",
     extraHeaders: existing?.extraHeaders ?? "",
     extraBodyJson: existing?.extraBodyJson ?? "",
+    reasoningProfile: existing?.reasoningProfile ?? "auto",
     enabled: existing?.enabled ?? true,
     apiKeyConfigured: existing?.apiKeyConfigured ?? false,
     defaultModelId: existing?.defaultModelId ?? "",
@@ -612,6 +622,7 @@ export function createEmptyProvider(providers: ModelProviderSetting[]): ModelPro
     balanceUrl: "",
     extraHeaders: "",
     extraBodyJson: "",
+    reasoningProfile: "auto",
     enabled: true,
     apiKeyConfigured: false,
     defaultModelId: "",

@@ -112,6 +112,27 @@ func TestArchiveSession(t *testing.T) {
 	}
 }
 
+func TestRenameProjectSession(t *testing.T) {
+	base := t.TempDir()
+	svc := NewService(ServiceConfig{
+		SkillsDir:    t.TempDir(),
+		SessionsDir:  filepath.Join(base, "sessions"),
+		ProjectsPath: filepath.Join(base, "projects.json"),
+	})
+	projectID, sessionID := svc.ActiveSessionIDs()
+	state, err := svc.RenameProjectSession(projectID, sessionID, "  renamed conversation  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions := svc.ListSessions()
+	if state.ActiveSessionID != sessionID || len(sessions) != 1 || sessions[0].Title != "renamed conversation" {
+		t.Fatalf("renamed sessions = %#v", sessions)
+	}
+	if _, err := svc.RenameProjectSession(projectID, sessionID, "  "); err == nil {
+		t.Fatal("empty title should be rejected")
+	}
+}
+
 // TestPersistenceAcrossReopen 验证项目清单重开后仍在。
 func TestPersistenceAcrossReopen(t *testing.T) {
 	base := t.TempDir()

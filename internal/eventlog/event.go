@@ -16,6 +16,7 @@ const (
 	EventCheckpoint       EventType = "checkpoint"
 	EventBranchMarker     EventType = "branch_marker"
 	EventPlanUpdate       EventType = "plan_update"
+	EventTeamCheckpoint   EventType = "team_checkpoint"
 )
 
 // Event 是事件日志的一条记录。所有事件 append-only，靠 ParentID 串成树。
@@ -36,6 +37,7 @@ type EventPayload struct {
 	Role        string              `json:"role,omitempty"`
 	Content     string              `json:"content,omitempty"`
 	Model       string              `json:"model,omitempty"`
+	DurationMs  int64               `json:"durationMs,omitempty"`
 	Parts       []MessagePart       `json:"parts,omitempty"`
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 
@@ -57,6 +59,10 @@ type EventPayload struct {
 	TurnIndex  int                   `json:"turnIndex,omitempty"`
 	PlanSteps  []MessageProgressStep `json:"planSteps,omitempty"`
 	PlanStatus string                `json:"planStatus,omitempty"`
+
+	// team_checkpoint stores a content-addressed JSON checkpoint so repeated
+	// role transitions do not inflate events.jsonl.
+	TeamCheckpointHash string `json:"teamCheckpointHash,omitempty"`
 }
 
 type MessageAttachment struct {
@@ -67,31 +73,36 @@ type MessageAttachment struct {
 
 // MessagePart 对齐前端/tools 的结构化片段，供 Timeline 与重建对话使用。
 type MessagePart struct {
-	Kind         string                `json:"kind"`
-	Text         string                `json:"text,omitempty"`
-	Path         string                `json:"path,omitempty"`
-	Patch        string                `json:"patch,omitempty"`
-	Additions    int                   `json:"additions,omitempty"`
-	Deletions    int                   `json:"deletions,omitempty"`
-	LineCount    int                   `json:"lineCount,omitempty"`
-	Created      bool                  `json:"created,omitempty"`
-	FileAction   string                `json:"fileAction,omitempty"`
-	Name         string                `json:"name,omitempty"`
-	Status       string                `json:"status,omitempty"`
-	Input        string                `json:"input,omitempty"`
-	Output       string                `json:"output,omitempty"`
-	Steps        []MessageProgressStep `json:"steps,omitempty"`
-	TaskStatus   string                `json:"taskStatus,omitempty"`
-	ChangedFiles int                   `json:"changedFiles,omitempty"`
-	Query        string                `json:"query,omitempty"`
-	Sources      []MessageSearchSource `json:"sources,omitempty"`
-	Role         string                `json:"role,omitempty"`
-	RoleLabel    string                `json:"roleLabel,omitempty"`
-	ProviderID   string                `json:"providerId,omitempty"`
-	Model        string                `json:"model,omitempty"`
-	Summary      string                `json:"summary,omitempty"`
-	Verdict      string                `json:"verdict,omitempty"`
-	Attempt      int                   `json:"attempt,omitempty"`
+	Kind             string                `json:"kind"`
+	Text             string                `json:"text,omitempty"`
+	Path             string                `json:"path,omitempty"`
+	Patch            string                `json:"patch,omitempty"`
+	Additions        int                   `json:"additions,omitempty"`
+	Deletions        int                   `json:"deletions,omitempty"`
+	LineCount        int                   `json:"lineCount,omitempty"`
+	Created          bool                  `json:"created,omitempty"`
+	FileAction       string                `json:"fileAction,omitempty"`
+	Name             string                `json:"name,omitempty"`
+	Status           string                `json:"status,omitempty"`
+	Input            string                `json:"input,omitempty"`
+	Output           string                `json:"output,omitempty"`
+	WorkingDirectory string                `json:"workingDirectory,omitempty"`
+	ExitCode         *int                  `json:"exitCode,omitempty"`
+	StartedAt        string                `json:"startedAt,omitempty"`
+	CompletedAt      string                `json:"completedAt,omitempty"`
+	DurationMs       int64                 `json:"durationMs,omitempty"`
+	Steps            []MessageProgressStep `json:"steps,omitempty"`
+	TaskStatus       string                `json:"taskStatus,omitempty"`
+	ChangedFiles     int                   `json:"changedFiles,omitempty"`
+	Query            string                `json:"query,omitempty"`
+	Sources          []MessageSearchSource `json:"sources,omitempty"`
+	Role             string                `json:"role,omitempty"`
+	RoleLabel        string                `json:"roleLabel,omitempty"`
+	ProviderID       string                `json:"providerId,omitempty"`
+	Model            string                `json:"model,omitempty"`
+	Summary          string                `json:"summary,omitempty"`
+	Verdict          string                `json:"verdict,omitempty"`
+	Attempt          int                   `json:"attempt,omitempty"`
 }
 
 type MessageProgressStep struct {

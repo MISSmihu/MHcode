@@ -78,22 +78,38 @@ type ChatTaskEvent struct {
 }
 
 func (a *App) StartChatMessage(prompt string) (string, error) {
-	return a.startChatMessageForSession("", prompt, nil)
+	return a.startChatMessageForProjectSession("", "", prompt, nil)
 }
 
 func (a *App) StartChatMessageWithAttachments(prompt string, attachments []agent.ChatAttachment) (string, error) {
-	return a.startChatMessageForSession("", prompt, attachments)
+	return a.startChatMessageForProjectSession("", "", prompt, attachments)
 }
 
 func (a *App) StartChatMessageForSession(sessionID, prompt string) (string, error) {
-	return a.startChatMessageForSession(sessionID, prompt, nil)
+	return a.startChatMessageForProjectSession("", sessionID, prompt, nil)
 }
 
 func (a *App) StartChatMessageForSessionWithAttachments(sessionID, prompt string, attachments []agent.ChatAttachment) (string, error) {
-	return a.startChatMessageForSession(sessionID, prompt, attachments)
+	return a.startChatMessageForProjectSession("", sessionID, prompt, attachments)
 }
 
-func (a *App) startChatMessageForSession(sessionID, prompt string, attachments []agent.ChatAttachment) (string, error) {
+func (a *App) StartChatMessageForProjectSession(projectID, sessionID, prompt string) (string, error) {
+	return a.startChatMessageForProjectSession(projectID, sessionID, prompt, nil)
+}
+
+func (a *App) StartChatMessageForProjectSessionWithAttachments(projectID, sessionID, prompt string, attachments []agent.ChatAttachment) (string, error) {
+	return a.startChatMessageForProjectSession(projectID, sessionID, prompt, attachments)
+}
+
+func (a *App) startChatMessageForProjectSession(projectID, sessionID, prompt string, attachments []agent.ChatAttachment) (string, error) {
+	return a.startChatMessageForProjectSessionRoute(projectID, sessionID, prompt, attachments, "", "")
+}
+
+func (a *App) startChatMessageForProjectSessionRoute(projectID, sessionID, prompt string, attachments []agent.ChatAttachment, providerID, modelID string) (string, error) {
+	return a.startChatMessageForProjectSessionRouteRegistered(projectID, sessionID, prompt, attachments, providerID, modelID, nil)
+}
+
+func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessionID, prompt string, attachments []agent.ChatAttachment, providerID, modelID string, registered func(string)) (string, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" && len(attachments) == 0 {
 		return "", errors.New("消息内容不能为空")
@@ -102,17 +118,24 @@ func (a *App) startChatMessageForSession(sessionID, prompt string, attachments [
 	if a.service == nil {
 		return "", errors.New("Agent 服务尚未初始化")
 	}
-	projectID, activeSessionID := a.service.ActiveSessionIDs()
+	activeProjectID, activeSessionID := a.service.ActiveSessionIDs()
 	if strings.TrimSpace(sessionID) == "" {
 		sessionID = activeSessionID
 	}
+	if strings.TrimSpace(projectID) == "" && sessionID == activeSessionID {
+		projectID = activeProjectID
+	}
+	projectID = strings.TrimSpace(projectID)
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return "", errors.New("当前没有可用会话")
 	}
-	runtime, runtimeErr := a.service.NewSessionRuntime(sessionID)
+	runtime, runtimeErr := a.service.NewProjectSessionRuntime(projectID, sessionID)
 	if runtimeErr != nil {
 		return "", runtimeErr
+	}
+	if err := runtime.SetEphemeralModelRoute(providerID, modelID); err != nil {
+		return "", err
 	}
 	// The requested session is authoritative. This matters when the user
 	// switches to a session owned by another project while another task runs.
@@ -151,13 +174,14 @@ func (a *App) startChatMessageForSession(sessionID, prompt string, attachments [
 	if a.chat.approvalOwners == nil {
 		a.chat.approvalOwners = make(map[string]*chatTask)
 	}
-	if a.chat.bySession[sessionID] != "" {
+	sessionKey := chatSessionKey(projectID, sessionID)
+	if a.chat.bySession[sessionKey] != "" {
 		a.chat.mu.Unlock()
 		cancel()
 		return "", errors.New("当前会话已有任务正在运行，请切换会话或将消息加入队列")
 	}
 	a.chat.tasks[task.id] = task
-	a.chat.bySession[sessionID] = task.id
+	a.chat.bySession[sessionKey] = task.id
 	a.chat.active = task
 	a.chat.mu.Unlock()
 	runtime.SetApprovalNotify(func(request agent.ApprovalRequest) {
@@ -171,6 +195,9 @@ func (a *App) startChatMessageForSession(sessionID, prompt string, attachments [
 			wruntime.EventsEmit(a.ctx, "approval:request", request)
 		}
 	})
+	if registered != nil {
+		registered(task.id)
+	}
 
 	go a.runChatTask(ctx, task, prompt, attachments)
 	return task.id, nil
@@ -252,10 +279,33 @@ func (a *App) requireIdleChat(action string) error {
 func (a *App) requireSessionIdleChat(sessionID string) error {
 	a.chat.mu.Lock()
 	defer a.chat.mu.Unlock()
-	if a.chat.bySession[strings.TrimSpace(sessionID)] != "" {
-		return fmt.Errorf("该会话已有对话任务正在运行")
+	sessionID = strings.TrimSpace(sessionID)
+	for _, task := range a.chat.tasks {
+		if task != nil && task.sessionID == sessionID {
+			return fmt.Errorf("该会话已有对话任务正在运行")
+		}
 	}
 	return nil
+}
+
+func (a *App) requireProjectSessionIdleChat(projectID, sessionID string) error {
+	a.chat.mu.Lock()
+	defer a.chat.mu.Unlock()
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	if taskID := a.chat.bySession[chatSessionKey(projectID, sessionID)]; taskID != "" {
+		return fmt.Errorf("该会话已有对话任务正在运行")
+	}
+	for _, task := range a.chat.tasks {
+		if task != nil && task.projectID == projectID && task.sessionID == sessionID {
+			return fmt.Errorf("该会话已有对话任务正在运行")
+		}
+	}
+	return nil
+}
+
+func chatSessionKey(projectID, sessionID string) string {
+	return strings.TrimSpace(projectID) + "\x00" + strings.TrimSpace(sessionID)
 }
 
 func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, attachments []agent.ChatAttachment) {
@@ -297,6 +347,7 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 		guidance, ok := a.takeNextChatGuidance(task)
 		if !ok {
 			task.cancel()
+			a.reloadCompletedChatTask(task)
 			a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "completed", Model: result.Model, Result: &result})
 			return
 		}
@@ -319,15 +370,26 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 	a.finishChatTask(task)
 	wasCancelled := chatTaskWasCancelled(ctx, err)
 	task.cancel()
+	a.reloadCompletedChatTask(task)
 
 	if err != nil {
 		if wasCancelled {
-			a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "cancelled", Message: "已停止生成"})
+			a.emitChatTaskEvent(ChatTaskEvent{
+				TaskID: task.id, Type: "cancelled", Message: "已停止生成",
+				Model: result.Model, Result: &result,
+			})
 			return
 		}
 		a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "failed", Message: err.Error(), Model: result.Model, Result: &result})
 		return
 	}
+}
+
+func (a *App) reloadCompletedChatTask(task *chatTask) {
+	if a.service == nil || task == nil {
+		return
+	}
+	_, _, _ = a.service.ReloadProjectSessionIfActive(task.projectID, task.sessionID)
 }
 
 func (a *App) takeNextChatGuidance(task *chatTask) (chatGuidance, bool) {
@@ -406,8 +468,9 @@ func removeChatTaskLocked(runner *chatTaskRunner, task *chatTask) {
 	if runner.tasks != nil {
 		delete(runner.tasks, task.id)
 	}
-	if runner.bySession != nil && runner.bySession[task.sessionID] == task.id {
-		delete(runner.bySession, task.sessionID)
+	key := chatSessionKey(task.projectID, task.sessionID)
+	if runner.bySession != nil && runner.bySession[key] == task.id {
+		delete(runner.bySession, key)
 	}
 	for requestID, owner := range runner.approvalOwners {
 		if owner == task {
@@ -453,6 +516,16 @@ func (a *App) emitChatTaskEvent(event ChatTaskEvent) {
 			}
 		}
 		a.chat.mu.Unlock()
+	}
+	if a.automations != nil {
+		switch event.Type {
+		case "completed":
+			a.automations.CompleteChatTask(event.TaskID, "completed", "Agent 已完成自动化任务")
+		case "failed":
+			a.automations.CompleteChatTask(event.TaskID, "failed", event.Message)
+		case "cancelled":
+			a.automations.CompleteChatTask(event.TaskID, "cancelled", event.Message)
+		}
 	}
 	if a.ctx != nil {
 		wruntime.EventsEmit(a.ctx, "chat:task", event)

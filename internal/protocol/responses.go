@@ -18,16 +18,29 @@ type responsesRequest struct {
 	Input        []responsesInputItem `json:"input"`
 	Stream       bool                 `json:"stream"`
 	Tools        []responsesTool      `json:"tools,omitempty"`
+	Reasoning    *responsesReasoning  `json:"reasoning,omitempty"`
+}
+
+type responsesReasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type responsesInputItem struct {
-	Type      string             `json:"type,omitempty"`
-	Role      string             `json:"role,omitempty"`
-	Content   []responsesContent `json:"content,omitempty"`
-	CallID    string             `json:"call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	Arguments string             `json:"arguments,omitempty"`
-	Output    string             `json:"output,omitempty"`
+	Type             string             `json:"type,omitempty"`
+	ID               string             `json:"id,omitempty"`
+	Role             string             `json:"role,omitempty"`
+	Content          []responsesContent `json:"content,omitempty"`
+	Summary          []responsesSummary `json:"summary,omitempty"`
+	EncryptedContent string             `json:"encrypted_content,omitempty"`
+	CallID           string             `json:"call_id,omitempty"`
+	Name             string             `json:"name,omitempty"`
+	Arguments        string             `json:"arguments,omitempty"`
+	Output           string             `json:"output,omitempty"`
+}
+
+type responsesSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
 }
 
 type responsesContent struct {
@@ -50,12 +63,14 @@ type responsesResponse struct {
 }
 
 type responsesOutputItem struct {
-	Type      string             `json:"type"`
-	ID        string             `json:"id,omitempty"`
-	CallID    string             `json:"call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	Arguments string             `json:"arguments,omitempty"`
-	Content   []responsesContent `json:"content,omitempty"`
+	Type             string             `json:"type"`
+	ID               string             `json:"id,omitempty"`
+	CallID           string             `json:"call_id,omitempty"`
+	Name             string             `json:"name,omitempty"`
+	Arguments        string             `json:"arguments,omitempty"`
+	Content          []responsesContent `json:"content,omitempty"`
+	Summary          []responsesSummary `json:"summary,omitempty"`
+	EncryptedContent string             `json:"encrypted_content,omitempty"`
 }
 
 type responsesUsage struct {
@@ -84,6 +99,7 @@ func (p OpenAICompatibleProvider) streamResponses(ctx context.Context, request C
 		return nil, err
 	}
 	instructions, input := responsesInputFromProtocol(request.Messages)
+	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
 	body := responsesRequest{
 		Model:        request.Model,
 		Instructions: instructions,
@@ -91,11 +107,14 @@ func (p OpenAICompatibleProvider) streamResponses(ctx context.Context, request C
 		Stream:       true,
 		Tools:        responsesToolsFromProtocol(request.Tools),
 	}
+	if reasoning.Effort != "" {
+		body.Reasoning = &responsesReasoning{Effort: reasoning.Effort}
+	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "reasoning", "stream", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +140,7 @@ func (p OpenAICompatibleProvider) completeResponses(ctx context.Context, request
 		return CompletionResult{}, err
 	}
 	instructions, input := responsesInputFromProtocol(request.Messages)
+	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
 	body := responsesRequest{
 		Model:        request.Model,
 		Instructions: instructions,
@@ -128,11 +148,14 @@ func (p OpenAICompatibleProvider) completeResponses(ctx context.Context, request
 		Stream:       false,
 		Tools:        responsesToolsFromProtocol(request.Tools),
 	}
+	if reasoning.Effort != "" {
+		body.Reasoning = &responsesReasoning{Effort: reasoning.Effort}
+	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "reasoning", "stream", "tools"))
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -190,6 +213,9 @@ func responsesInputFromProtocol(messages []Message) (string, []responsesInputIte
 				input = append(input, responsesInputItem{Type: "message", Role: "user", Content: content})
 			}
 		default:
+			if message.Role == "assistant" {
+				input = append(input, responsesContinuationItems(message.Continuation)...)
+			}
 			contentType := "input_text"
 			if message.Role == "assistant" {
 				contentType = "output_text"
@@ -284,6 +310,9 @@ func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- Str
 			if completion.Usage != nil {
 				events <- StreamEvent{Type: "usage", Usage: completion.Usage}
 			}
+			if completion.Continuation != nil {
+				events <- StreamEvent{Type: "continuation", Continuation: completion.Continuation}
+			}
 			events <- StreamEvent{Type: "finish", FinishReason: "stop"}
 			events <- StreamEvent{Type: "done"}
 			return
@@ -307,7 +336,17 @@ func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- Str
 func completionFromResponses(response responsesResponse) CompletionResult {
 	result := CompletionResult{}
 	var text strings.Builder
+	reasoningItems := make([]responsesInputItem, 0, 2)
 	for _, item := range response.Output {
+		if item.Type == "reasoning" {
+			reasoningItems = append(reasoningItems, responsesInputItem{
+				Type:             item.Type,
+				ID:               item.ID,
+				Summary:          item.Summary,
+				EncryptedContent: item.EncryptedContent,
+			})
+			continue
+		}
 		if call, ok := toolCallFromResponsesItem(item); ok {
 			result.ToolCalls = append(result.ToolCalls, call)
 			continue
@@ -322,6 +361,11 @@ func completionFromResponses(response responsesResponse) CompletionResult {
 		}
 	}
 	result.Content = text.String()
+	if len(result.ToolCalls) > 0 && len(reasoningItems) > 0 {
+		if encoded, err := json.Marshal(reasoningItems); err == nil {
+			result.Continuation = &ProviderContinuation{Protocol: "openai-responses", Data: encoded}
+		}
+	}
 	if response.Usage != nil {
 		cached := response.Usage.InputTokensDetails.CachedTokens
 		miss := response.Usage.InputTokens - cached
@@ -337,6 +381,17 @@ func completionFromResponses(response responsesResponse) CompletionResult {
 		}
 	}
 	return result
+}
+
+func responsesContinuationItems(continuation *ProviderContinuation) []responsesInputItem {
+	if continuation == nil || continuation.Protocol != "openai-responses" || len(continuation.Data) == 0 {
+		return nil
+	}
+	var items []responsesInputItem
+	if json.Unmarshal(continuation.Data, &items) != nil {
+		return nil
+	}
+	return items
 }
 
 func toolCallFromResponsesItem(item responsesOutputItem) (ToolCall, bool) {

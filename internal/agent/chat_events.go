@@ -106,6 +106,8 @@ func collectProviderStream(
 			emitChatEvent(sink, ChatStreamEvent{Type: "reasoning", Delta: event.Delta})
 		case "tool_calls":
 			result.ToolCalls = append(result.ToolCalls, event.ToolCalls...)
+		case "continuation":
+			result.Continuation = event.Continuation
 		case "usage":
 			result.Usage = event.Usage
 			emitChatEvent(sink, ChatStreamEvent{Type: "usage", Usage: event.Usage})

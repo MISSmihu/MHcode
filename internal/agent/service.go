@@ -44,6 +44,8 @@ type ServiceConfig struct {
 }
 
 type WorkbenchState struct {
+	ActiveProjectID     string                   `json:"activeProjectId"`
+	ActiveSessionID     string                   `json:"activeSessionId"`
 	Reasoning           ReasoningProfile         `json:"reasoning"`
 	ReasoningOptions    []ReasoningProfile       `json:"reasoningOptions"`
 	CacheTarget         float64                  `json:"cacheTarget"`
@@ -74,11 +76,12 @@ type ConfigFilesState struct {
 }
 
 type ChatResult struct {
-	Content   string             `json:"content"`
-	Reasoning string             `json:"reasoning,omitempty"`
-	Model     string             `json:"model"`
-	Usage     cache.UsageMetrics `json:"usage"`
-	State     WorkbenchState     `json:"state"`
+	Content    string             `json:"content"`
+	Reasoning  string             `json:"reasoning,omitempty"`
+	Model      string             `json:"model"`
+	DurationMs int64              `json:"durationMs,omitempty"`
+	Usage      cache.UsageMetrics `json:"usage"`
+	State      WorkbenchState     `json:"state"`
 	// Parts 是结构化消息片段（text/diff/tool_call），供前端富渲染。
 	// 无工具调用的普通对话此字段为空，前端回退纯文本渲染。
 	Parts []tools.ResultPart `json:"parts,omitempty"`
@@ -155,6 +158,7 @@ type Service struct {
 	planMode        bool // Plan 两段式开关（默认关，用户显式开启）
 	planState       PlanState
 	teamState       TeamState
+	teamResume      *teamRunCheckpoint
 	projects        *project.Store
 	mcpManager      *mcp.Manager
 	projectMemory   ProjectMemoryState
@@ -204,6 +208,7 @@ type turnSnapshot struct {
 	metricsHistory []cache.UsageMetrics
 	changeStart    int
 	planState      PlanState
+	teamResume     *teamRunCheckpoint
 }
 
 func (s *Service) captureTurnSnapshot() turnSnapshot {
@@ -216,6 +221,7 @@ func (s *Service) captureTurnSnapshot() turnSnapshot {
 		metricsHistory: append([]cache.UsageMetrics(nil), s.metricsHistory...),
 		changeStart:    len(s.turnChanges),
 		planState:      clonePlanState(s.planState),
+		teamResume:     cloneTeamRunCheckpoint(s.teamResume),
 	}
 }
 
@@ -244,6 +250,7 @@ func (s *Service) rollbackTurn(snapshot turnSnapshot) error {
 	s.metrics = snapshot.metrics
 	s.metricsHistory = snapshot.metricsHistory
 	s.planState = snapshot.planState
+	s.teamResume = cloneTeamRunCheckpoint(snapshot.teamResume)
 	if snapshot.changeStart <= len(s.turnChanges) {
 		s.turnChanges = s.turnChanges[:snapshot.changeStart]
 	}
@@ -334,10 +341,11 @@ func (s *Service) SetReasoningLevel(level ReasoningLevel) (WorkbenchState, error
 		return s.WorkbenchState(), err
 	}
 	defer release()
-	if _, ok := ReasoningProfileFor(level); !ok {
+	profile, ok := ReasoningProfileFor(level)
+	if !ok {
 		return WorkbenchState{}, &UnknownReasoningLevelError{Level: level}
 	}
-	s.reasoning = level
+	s.reasoning = profile.ID
 	s.invalidateProviderSession("推理强度已切换；下一轮会保留历史并使用新的稳定前缀。")
 	return s.workbenchStateLocked(), nil
 }
@@ -587,12 +595,25 @@ func (s *Service) SendChatGuidanceWithAttachmentsAndEvents(ctx context.Context, 
 }
 
 type chatTurnKindKey struct{}
+type chatTurnStartedAtKey struct{}
 
 const chatTurnGuidance = "guidance"
 
 func isGuidanceChatTurn(ctx context.Context) bool {
 	value, _ := ctx.Value(chatTurnKindKey{}).(string)
 	return value == chatTurnGuidance
+}
+
+func chatTurnDurationMs(ctx context.Context) int64 {
+	startedAt, _ := ctx.Value(chatTurnStartedAtKey{}).(time.Time)
+	if startedAt.IsZero() {
+		return 0
+	}
+	duration := time.Since(startedAt).Milliseconds()
+	if duration < 1 {
+		return 1
+	}
+	return duration
 }
 
 type chatRoute struct {
@@ -607,6 +628,15 @@ func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatR
 }
 
 func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachments []ChatAttachment, sink ChatEventSink) (result ChatResult, err error) {
+	turnStartedAt := time.Now()
+	ctx = context.WithValue(ctx, chatTurnStartedAtKey{}, turnStartedAt)
+	defer func() {
+		duration := time.Since(turnStartedAt).Milliseconds()
+		if duration < 1 {
+			duration = 1
+		}
+		result.DurationMs = duration
+	}()
 	release, err := s.beginChatTurn()
 	if err != nil {
 		return ChatResult{State: s.WorkbenchState()}, err
@@ -630,11 +660,15 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errors.New("当前 DeepSeek 原生协议不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
 	}
 	preview := s.contextPreviewForInput(prompt)
-	thinkingMode, reasoningEffort := s.thinkingConfigForProvider(route.Provider)
+	thinkingMode, reasoningEffort := s.thinkingConfigForRoute(route)
 	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
 	turn := s.captureTurnSnapshot()
 	defer func() {
 		if err == nil {
+			return
+		}
+		if errors.Is(err, errTeamRunPaused) {
+			result.State = s.workbenchStateLocked()
 			return
 		}
 		failedPlan := clonePlanState(s.planState)
@@ -648,6 +682,17 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		}
 		result.State = s.workbenchStateLocked()
 	}()
+	resumeTeamRun := s.teamModeEnabled() && !isGuidanceChatTurn(ctx) && s.teamResume != nil && isTeamResumePrompt(prompt)
+	if s.teamResume != nil && !resumeTeamRun && !isGuidanceChatTurn(ctx) {
+		abandoned := cloneTeamRunCheckpoint(s.teamResume)
+		abandoned.Status = "abandoned"
+		abandoned.Team.Active = false
+		abandoned.Team.Status = "abandoned"
+		abandoned.Team.CurrentRole = ""
+		if checkpointErr := s.persistTeamRunCheckpoint(abandoned); checkpointErr != nil {
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, checkpointErr
+		}
+	}
 	s.turnChanges = s.turnChanges[:turn.changeStart]
 	s.sessionMessages = append(s.sessionMessages, protocol.Message{
 		Role:        "user",
@@ -679,11 +724,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	}
 
 	baseRequest := protocol.ChatRequest{
-		Model:           route.ModelID,
-		Temperature:     s.temperatureForReasoning(),
-		Messages:        requestMessages,
-		ThinkingMode:    thinkingMode,
-		ReasoningEffort: reasoningEffort,
+		Model:          route.ModelID,
+		Temperature:    s.temperatureForReasoning(),
+		Messages:       requestMessages,
+		ReasoningLevel: string(s.reasoning),
 		Metadata: map[string]string{
 			"reasoning_level":   string(s.reasoning),
 			"context_window":    fmt.Sprintf("%d", compression.Budget.WindowTokens),
@@ -699,6 +743,9 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if s.teamModeEnabled() && !isGuidanceChatTurn(ctx) {
 		if !profile.Budget.Planner {
 			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errTeamModeRequiresPlanner
+		}
+		if resumeTeamRun {
+			ctx = withTeamResumeTurn(ctx)
 		}
 		return s.runTeamTurn(ctx, baseRequest, maxToolCalls, route, prefixDiagnostic, requestMessages, baseMessageCount, sink)
 	}
@@ -731,7 +778,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
-	s.recordAssistantAndCheckpoint(answer, route.ModelID, nil)
+	s.recordAssistantAndCheckpoint(answer, route.ModelID, nil, chatTurnDurationMs(ctx))
 	s.markChatProviderStatus(route.Provider.ID, "ok", fmt.Sprintf("试聊成功，%s / %s 流式通道正常。", route.Provider.Name, route.ModelID))
 
 	return ChatResult{
@@ -923,11 +970,17 @@ func (s *Service) workbenchStateWithPreview(preview RequestContext) WorkbenchSta
 	index := s.loadSkillsIndex()
 	snapshots := s.mcpSnapshots()
 	runtimeSettings := s.stateRuntimeSettings()
+	reasoningOptions := s.reasoningProfilesForRuntime(runtimeSettings)
+	if !reasoningProfilesContain(reasoningOptions, profile.ID) && len(reasoningOptions) > 0 {
+		profile = reasoningOptions[len(reasoningOptions)-1]
+	}
 	teamState := cloneTeamState(s.teamState)
 	teamState.Enabled = runtimeSettings.Team.Enabled
 	return WorkbenchState{
+		ActiveProjectID:     s.projectID,
+		ActiveSessionID:     s.sessionID,
 		Reasoning:           profile,
-		ReasoningOptions:    ReasoningProfiles(),
+		ReasoningOptions:    reasoningOptions,
 		CacheTarget:         runtimeSettings.CacheTargetPercent / 100,
 		UsageMetrics:        s.metrics,
 		CacheHitRate:        s.metrics.CacheHitRate(),
@@ -952,6 +1005,40 @@ func (s *Service) workbenchStateWithPreview(preview RequestContext) WorkbenchSta
 		ProjectMemory: s.projectMemory,
 		UsageLedger:   s.usageLedger,
 	}
+}
+
+func (s *Service) reasoningProfilesForRuntime(settings RuntimeSettings) []ReasoningProfile {
+	provider, _, ok := findModelProvider(settings.Model.Providers, settings.Model.SelectedProviderID)
+	if !ok {
+		return ReasoningProfiles()
+	}
+	modelID := s.selectModelForProvider(settings, provider)
+	levels := protocol.SupportedReasoningLevelsWithProfile(
+		provider.ReasoningProfile,
+		provider.Protocol,
+		provider.BaseURL,
+		modelID,
+	)
+	profiles := make([]ReasoningProfile, 0, len(levels))
+	for _, level := range levels {
+		profile, found := ReasoningProfileFor(ReasoningLevel(level))
+		if found {
+			profiles = append(profiles, profile)
+		}
+	}
+	if len(profiles) == 0 {
+		return ReasoningProfiles()
+	}
+	return profiles
+}
+
+func reasoningProfilesContain(profiles []ReasoningProfile, level ReasoningLevel) bool {
+	for _, profile := range profiles {
+		if profile.ID == level {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) ensureProviderSession(route chatRoute, preview RequestContext, thinkingMode string, reasoningEffort string) {
@@ -1029,6 +1116,7 @@ func (s *Service) resetDeepSeekSession(reason string) {
 	s.metricsHistory = nil
 	s.planState = PlanState{}
 	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
+	s.teamResume = nil
 }
 
 func (s *Service) invalidateProviderSession(reason string) {
@@ -1273,7 +1361,7 @@ func (s *Service) selectDeepSeekModel() string {
 		return provider.DefaultModelID
 	}
 	preferred := "deepseek-v4-flash"
-	if s.reasoning == ReasoningHigh || s.reasoning == ReasoningUltra {
+	if s.reasoning == ReasoningHigh || s.reasoning == ReasoningXHigh || s.reasoning == ReasoningMax {
 		preferred = "deepseek-v4-pro"
 	}
 	for _, model := range s.deepSeekState.Models {
@@ -1300,33 +1388,37 @@ func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, erro
 		client.BaseURL = route.Provider.BaseURL
 		client.ExtraHeaders = route.Provider.ExtraHeaders
 		client.ExtraBodyJSON = route.Provider.ExtraBodyJSON
+		client.ReasoningProfile = route.Provider.ReasoningProfile
 		return client, nil
 	case "openai-compatible", "local":
 		return protocol.OpenAICompatibleProvider{
-			BaseURL:       route.Provider.BaseURL,
-			APIKey:        route.APIKey,
-			ProviderID:    route.Provider.ID,
-			DisplayName:   route.Provider.Name,
-			APIType:       route.Provider.APIType,
-			AllowNoAuth:   route.AllowNoAuth || route.Provider.Protocol == "local",
-			ExtraHeaders:  route.Provider.ExtraHeaders,
-			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
+			BaseURL:          route.Provider.BaseURL,
+			APIKey:           route.APIKey,
+			ProviderID:       route.Provider.ID,
+			DisplayName:      route.Provider.Name,
+			APIType:          route.Provider.APIType,
+			AllowNoAuth:      route.AllowNoAuth || route.Provider.Protocol == "local",
+			ExtraHeaders:     route.Provider.ExtraHeaders,
+			ExtraBodyJSON:    route.Provider.ExtraBodyJSON,
+			ReasoningProfile: route.Provider.ReasoningProfile,
 		}, nil
 	case "anthropic", "anthropic-compatible":
 		return protocol.AnthropicProvider{
-			BaseURL:       route.Provider.BaseURL,
-			APIKey:        route.APIKey,
-			ProviderID:    route.Provider.ID,
-			ExtraHeaders:  route.Provider.ExtraHeaders,
-			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
+			BaseURL:          route.Provider.BaseURL,
+			APIKey:           route.APIKey,
+			ProviderID:       route.Provider.ID,
+			ExtraHeaders:     route.Provider.ExtraHeaders,
+			ExtraBodyJSON:    route.Provider.ExtraBodyJSON,
+			ReasoningProfile: route.Provider.ReasoningProfile,
 		}, nil
 	case "gemini":
 		return protocol.GeminiProvider{
-			BaseURL:       route.Provider.BaseURL,
-			APIKey:        route.APIKey,
-			ProviderID:    route.Provider.ID,
-			ExtraHeaders:  route.Provider.ExtraHeaders,
-			ExtraBodyJSON: route.Provider.ExtraBodyJSON,
+			BaseURL:          route.Provider.BaseURL,
+			APIKey:           route.APIKey,
+			ProviderID:       route.Provider.ID,
+			ExtraHeaders:     route.Provider.ExtraHeaders,
+			ExtraBodyJSON:    route.Provider.ExtraBodyJSON,
+			ReasoningProfile: route.Provider.ReasoningProfile,
 		}, nil
 	default:
 		return nil, fmt.Errorf("当前协议暂未接入聊天发送：%s", route.Provider.Protocol)
@@ -1369,7 +1461,7 @@ func (s *Service) chatProviderWithFallback(primary chatRoute, sink ChatEventSink
 }
 
 func (s *Service) adoptProviderRoute(route chatRoute) {
-	thinkingMode, reasoningEffort := s.thinkingConfigForProvider(route.Provider)
+	thinkingMode, reasoningEffort := s.thinkingConfigForRoute(route)
 	s.sessionState.ProviderID = route.Provider.ID
 	s.sessionState.ProviderName = route.Provider.Name
 	s.sessionState.Protocol = route.Provider.Protocol
@@ -1378,37 +1470,21 @@ func (s *Service) adoptProviderRoute(route chatRoute) {
 	s.sessionState.ReasoningEffort = reasoningEffort
 }
 
-func (s *Service) thinkingConfigForProvider(provider ModelProviderSetting) (string, string) {
-	if provider.Protocol != "deepseek-official" {
-		return "", ""
-	}
-	return s.deepSeekThinkingConfig()
-}
-
-func (s *Service) deepSeekThinkingConfig() (string, string) {
-	return s.deepSeekThinkingMode(), s.deepSeekReasoningEffort()
-}
-
-func (s *Service) deepSeekThinkingMode() string {
-	if s.reasoning == ReasoningHigh || s.reasoning == ReasoningUltra {
-		return "enabled"
-	}
-	return "disabled"
-}
-
-func (s *Service) deepSeekReasoningEffort() string {
-	switch s.reasoning {
-	case ReasoningHigh:
-		return "high"
-	case ReasoningUltra:
-		return "max"
-	default:
-		return ""
-	}
+func (s *Service) thinkingConfigForRoute(route chatRoute) (string, string) {
+	resolved := protocol.ResolveReasoningOptionsWithProfile(
+		route.Provider.ReasoningProfile,
+		route.Provider.Protocol,
+		route.Provider.BaseURL,
+		route.ModelID,
+		string(s.reasoning),
+	)
+	return resolved.Mode, resolved.Effort
 }
 
 func (s *Service) temperatureForReasoning() float64 {
 	switch s.reasoning {
+	case ReasoningNone:
+		return 0.1
 	case ReasoningLow:
 		return 0.1
 	case ReasoningMedium:
@@ -1451,7 +1527,7 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- For UI work, prioritize usable screens, clear state, responsive layout, and controls that match the existing design system.",
 		"",
 		"Reasoning route:",
-		stableSection(ctx, "reasoning", "ultra:strict-stable-prefix"),
+		stableSection(ctx, "reasoning", "max:strict-stable-prefix"),
 		"- Low means lightweight answers and minimal tool use.",
 		"- Medium means ordinary code changes with focused context.",
 		"- High means multi-file debugging and broader verification.",

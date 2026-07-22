@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -18,12 +19,13 @@ const DefaultAnthropicBaseURL = "https://api.anthropic.com"
 const anthropicVersion = "2023-06-01"
 
 type AnthropicProvider struct {
-	BaseURL       string
-	APIKey        string
-	ProviderID    string
-	HTTPClient    *http.Client
-	ExtraHeaders  string
-	ExtraBodyJSON string
+	BaseURL          string
+	APIKey           string
+	ProviderID       string
+	HTTPClient       *http.Client
+	ExtraHeaders     string
+	ExtraBodyJSON    string
+	ReasoningProfile string
 }
 
 func (p AnthropicProvider) Name() string {
@@ -97,20 +99,26 @@ func (p AnthropicProvider) Stream(ctx context.Context, request ChatRequest) (<-c
 	if len(messages) == 0 {
 		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
 	}
+	reasoning := reasoningOptionsForRequest("anthropic", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Mode != "" {
+		temperature = 0
+	}
 	body := anthropicMessagesRequest{
 		Model:       request.Model,
-		MaxTokens:   4096,
+		MaxTokens:   anthropicMaxTokens(reasoning),
 		System:      system,
 		Messages:    messages,
 		Stream:      true,
-		Temperature: request.Temperature,
+		Temperature: temperature,
 		Tools:       anthropicToolsFromProtocol(request.Tools),
 	}
+	applyAnthropicReasoning(&body, reasoning)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "max_tokens", "messages", "output_config", "system", "temperature", "thinking", "stream", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -153,20 +161,26 @@ func (p AnthropicProvider) Complete(ctx context.Context, request ChatRequest) (C
 	if len(messages) == 0 {
 		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
 	}
+	reasoning := reasoningOptionsForRequest("anthropic", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Mode != "" {
+		temperature = 0
+	}
 	body := anthropicMessagesRequest{
 		Model:       request.Model,
-		MaxTokens:   4096,
+		MaxTokens:   anthropicMaxTokens(reasoning),
 		System:      system,
 		Messages:    messages,
 		Stream:      false,
-		Temperature: request.Temperature,
+		Temperature: temperature,
 		Tools:       anthropicToolsFromProtocol(request.Tools),
 	}
+	applyAnthropicReasoning(&body, reasoning)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "system", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "max_tokens", "messages", "output_config", "system", "temperature", "thinking", "stream", "tools"))
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -236,7 +250,7 @@ func anthropicMessagesFromProtocol(messages []Message) (string, []anthropicMessa
 				systemParts = append(systemParts, content)
 			}
 		case "assistant":
-			blocks := make([]anthropicContentBlock, 0, len(message.ToolCalls)+1)
+			blocks := anthropicContinuationBlocks(message.Continuation)
 			if content != "" {
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: content})
 			}
@@ -309,6 +323,24 @@ func anthropicToolsFromProtocol(tools []ToolDefinition) []anthropicTool {
 	return converted
 }
 
+func anthropicMaxTokens(reasoning ReasoningOptions) int {
+	const visibleOutputReserve = 4096
+	if reasoning.BudgetTokens > 0 {
+		return reasoning.BudgetTokens + visibleOutputReserve
+	}
+	return visibleOutputReserve
+}
+
+func applyAnthropicReasoning(body *anthropicMessagesRequest, reasoning ReasoningOptions) {
+	if body == nil || reasoning.Mode == "" {
+		return
+	}
+	body.Thinking = &anthropicThinking{Type: reasoning.Mode, BudgetTokens: reasoning.BudgetTokens}
+	if reasoning.Effort != "" {
+		body.OutputConfig = &anthropicOutputConfig{Effort: reasoning.Effort}
+	}
+}
+
 func normalizedJSONObject(raw json.RawMessage) json.RawMessage {
 	if len(raw) == 0 {
 		return json.RawMessage(`{}`)
@@ -325,6 +357,7 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	toolUses := map[int]*anthropicToolUseAccumulator{}
+	thinkingBlocks := map[int]*anthropicContentBlock{}
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -349,6 +382,10 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 		}
 		switch chunk.Type {
 		case "content_block_start":
+			if chunk.ContentBlock.Type == "thinking" || chunk.ContentBlock.Type == "redacted_thinking" {
+				block := chunk.ContentBlock
+				thinkingBlocks[chunk.Index] = &block
+			}
 			if chunk.ContentBlock.Type == "tool_use" {
 				toolUses[chunk.Index] = &anthropicToolUseAccumulator{
 					ID:    chunk.ContentBlock.ID,
@@ -362,6 +399,14 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 			}
 			if chunk.Delta.Thinking != "" {
 				events <- StreamEvent{Type: "reasoning", Delta: chunk.Delta.Thinking}
+				if block := thinkingBlocks[chunk.Index]; block != nil {
+					block.Thinking += chunk.Delta.Thinking
+				}
+			}
+			if chunk.Delta.Signature != "" {
+				if block := thinkingBlocks[chunk.Index]; block != nil {
+					block.Signature += chunk.Delta.Signature
+				}
 			}
 			if chunk.Delta.PartialJSON != "" {
 				if accumulator := toolUses[chunk.Index]; accumulator != nil {
@@ -402,6 +447,9 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 				return
 			}
 		case "message_stop":
+			if continuation := anthropicStreamContinuation(thinkingBlocks); continuation != nil {
+				events <- StreamEvent{Type: "continuation", Continuation: continuation}
+			}
 			events <- StreamEvent{Type: "done"}
 			return
 		}
@@ -411,6 +459,24 @@ func parseAnthropicStream(ctx context.Context, body io.Reader, events chan<- Str
 		return
 	}
 	events <- StreamEvent{Type: "done"}
+}
+
+func anthropicStreamContinuation(blocks map[int]*anthropicContentBlock) *ProviderContinuation {
+	if len(blocks) == 0 {
+		return nil
+	}
+	indices := make([]int, 0, len(blocks))
+	for index := range blocks {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	ordered := make([]anthropicContentBlock, 0, len(indices))
+	for _, index := range indices {
+		if blocks[index] != nil {
+			ordered = append(ordered, *blocks[index])
+		}
+	}
+	return anthropicContinuation(ordered)
 }
 
 func anthropicAPIError(resp *http.Response) error {
@@ -437,13 +503,24 @@ type anthropicModelsResponse struct {
 }
 
 type anthropicMessagesRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	System      string             `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Stream      bool               `json:"stream"`
-	Temperature float64            `json:"temperature,omitempty"`
-	Tools       []anthropicTool    `json:"tools,omitempty"`
+	Model        string                 `json:"model"`
+	MaxTokens    int                    `json:"max_tokens"`
+	System       string                 `json:"system,omitempty"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Stream       bool                   `json:"stream"`
+	Temperature  float64                `json:"temperature,omitempty"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -455,6 +532,8 @@ type anthropicContentBlock struct {
 	Type      string                `json:"type"`
 	Text      string                `json:"text,omitempty"`
 	Thinking  string                `json:"thinking,omitempty"`
+	Signature string                `json:"signature,omitempty"`
+	Data      string                `json:"data,omitempty"`
 	ID        string                `json:"id,omitempty"`
 	Name      string                `json:"name,omitempty"`
 	Input     json.RawMessage       `json:"input,omitempty"`
@@ -508,7 +587,36 @@ func anthropicCompletionFromBlocks(blocks []anthropicContentBlock) CompletionRes
 	}
 	result.Content = content.String()
 	result.Reasoning = reasoning.String()
+	result.Continuation = anthropicContinuation(blocks)
 	return result
+}
+
+func anthropicContinuation(blocks []anthropicContentBlock) *ProviderContinuation {
+	continuation := make([]anthropicContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type == "thinking" || block.Type == "redacted_thinking" {
+			continuation = append(continuation, block)
+		}
+	}
+	if len(continuation) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(continuation)
+	if err != nil {
+		return nil
+	}
+	return &ProviderContinuation{Protocol: "anthropic", Data: encoded}
+}
+
+func anthropicContinuationBlocks(continuation *ProviderContinuation) []anthropicContentBlock {
+	if continuation == nil || continuation.Protocol != "anthropic" || len(continuation.Data) == 0 {
+		return nil
+	}
+	var blocks []anthropicContentBlock
+	if json.Unmarshal(continuation.Data, &blocks) != nil {
+		return nil
+	}
+	return blocks
 }
 
 type anthropicToolUseAccumulator struct {
@@ -526,6 +634,7 @@ type anthropicStreamEvent struct {
 		Type        string `json:"type"`
 		Text        string `json:"text"`
 		Thinking    string `json:"thinking"`
+		Signature   string `json:"signature"`
 		PartialJSON string `json:"partial_json"`
 	} `json:"delta"`
 	Message *struct {

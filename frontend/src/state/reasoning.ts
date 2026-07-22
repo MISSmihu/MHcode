@@ -1,15 +1,28 @@
 import type { ReasoningLevel, ReasoningOption } from "../types";
 
-export const defaultReasoningLevel: ReasoningLevel = "ultra";
+export const defaultReasoningLevel: ReasoningLevel = "max";
 
 export const reasoningLabels: Record<ReasoningLevel, string> = {
-  low: "低",
+  none: "关闭",
+  low: "轻度",
   medium: "中",
   high: "高",
-  ultra: "超高",
+  xhigh: "很高",
+  max: "极高",
 };
 
 export const reasoningOptions: ReasoningOption[] = [
+  {
+    id: "none",
+    label: reasoningLabels.none,
+    description: "不请求模型进行额外推理",
+    budget: {
+      maxToolCalls: 3,
+      contextPolicy: "minimal",
+      cachePolicy: "reuse-prefix",
+      planner: false,
+    },
+  },
   {
     id: "low",
     label: reasoningLabels.low,
@@ -44,8 +57,19 @@ export const reasoningOptions: ReasoningOption[] = [
     },
   },
   {
-    id: "ultra",
-    label: reasoningLabels.ultra,
+    id: "xhigh",
+    label: reasoningLabels.xhigh,
+    description: "大型实现、深入排查、多阶段验证",
+    budget: {
+      maxToolCalls: 24,
+      contextPolicy: "full-relevant",
+      cachePolicy: "strict-stable-prefix",
+      planner: true,
+    },
+  },
+  {
+    id: "max",
+    label: reasoningLabels.max,
     description: "协议设计、Agent 架构、发布级检查",
     budget: {
       maxToolCalls: 32,

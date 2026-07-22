@@ -73,6 +73,89 @@ func TestSessionRuntimesKeepConversationStateIsolated(t *testing.T) {
 	}
 }
 
+func TestProjectSessionSwitchKeepsTwoNewConversationsDistinct(t *testing.T) {
+	base := t.TempDir()
+	service := NewService(ServiceConfig{
+		SkillsDir:    t.TempDir(),
+		SessionsDir:  filepath.Join(base, "sessions"),
+		ProjectsPath: filepath.Join(base, "projects.json"),
+	})
+	firstProjectID, firstSessionID := service.ActiveSessionIDs()
+	firstRuntime, err := service.NewProjectSessionRuntime(firstProjectID, firstSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRuntime.recordUserEvent("first-project-history")
+	firstRuntime.recordAssistantAndCheckpoint("first-project-reply", "test-model", nil)
+
+	if _, err := service.CreateProject("second", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	secondProjectID, secondSessionID := service.ActiveSessionIDs()
+	if firstProjectID == secondProjectID || firstSessionID == secondSessionID {
+		t.Fatalf("new project reused identity: %q/%q and %q/%q", firstProjectID, firstSessionID, secondProjectID, secondSessionID)
+	}
+
+	state, err := service.SwitchProjectSession(firstProjectID, firstSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ActiveProjectID != firstProjectID || state.ActiveSessionID != firstSessionID {
+		t.Fatalf("state identity = %q/%q", state.ActiveProjectID, state.ActiveSessionID)
+	}
+	history, err := service.GetSessionMessagesForProjectSession(firstProjectID, firstSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSessionHistory(t, history, "first-project", "second-project")
+
+	if _, err := service.GetSessionMessagesForProjectSession(secondProjectID, firstSessionID); err == nil {
+		t.Fatal("mismatched project/session lookup should fail instead of returning empty history")
+	}
+	historyAfterFailure, err := service.GetSessionMessagesForProjectSession(firstProjectID, firstSessionID)
+	if err != nil || len(historyAfterFailure) != len(history) {
+		t.Fatalf("valid history changed after failed lookup: before=%d after=%d err=%v", len(history), len(historyAfterFailure), err)
+	}
+}
+
+func TestActiveServiceReloadsDetachedRuntimeBeforeMessageFork(t *testing.T) {
+	base := t.TempDir()
+	service := NewService(ServiceConfig{
+		SkillsDir:    t.TempDir(),
+		SessionsDir:  filepath.Join(base, "sessions"),
+		ProjectsPath: filepath.Join(base, "projects.json"),
+	})
+	projectID, sessionID := service.ActiveSessionIDs()
+	runtime, err := service.NewProjectSessionRuntime(projectID, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.recordUserEvent("detached user message")
+	runtime.sessionState.TurnCount = 1
+	runtime.recordAssistantAndCheckpoint("detached reply", "test-model", nil)
+
+	if checkpoints := service.ListCheckpoints(); len(checkpoints) != 0 {
+		t.Fatalf("main service unexpectedly observed detached head before reload: %#v", checkpoints)
+	}
+	state, reloaded, err := service.ReloadProjectSessionIfActive(projectID, sessionID)
+	if err != nil || !reloaded {
+		t.Fatalf("reload active=%v err=%v", reloaded, err)
+	}
+	if state.ActiveProjectID != projectID || state.ActiveSessionID != sessionID || len(service.ListCheckpoints()) != 1 {
+		t.Fatalf("reloaded state=%#v checkpoints=%#v", state, service.ListCheckpoints())
+	}
+	history := service.GetSessionMessages()
+	if len(history) != 2 || history[0].Content != "detached user message" {
+		t.Fatalf("reloaded history=%#v", history)
+	}
+	if _, err := service.ForkFromMessageForProjectSession(projectID, sessionID, history[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if forked := service.GetSessionMessages(); len(forked) != 0 {
+		t.Fatalf("fork retained replaced detached messages: %#v", forked)
+	}
+}
+
 func TestSessionRuntimesUseIndependentApprovalBrokers(t *testing.T) {
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
 	runtimeA, err := service.NewSessionRuntime("session-a")

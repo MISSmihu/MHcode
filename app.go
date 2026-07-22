@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/MISSmihu/MHcode/internal/agent"
+	"github.com/MISSmihu/MHcode/internal/appupdate"
+	"github.com/MISSmihu/MHcode/internal/automation"
 	"github.com/MISSmihu/MHcode/internal/browserengine"
 	"github.com/MISSmihu/MHcode/internal/computercontrol"
 	"github.com/MISSmihu/MHcode/internal/storage"
@@ -28,6 +30,8 @@ type App struct {
 	chat              chatTaskRunner
 	terminal          *terminal.Manager
 	git               workspacegit.Service
+	updater           *appupdate.Service
+	automations       *automation.Service
 	runtimeSettingsMu sync.RWMutex
 	runtimeSettings   agent.RuntimeSettings
 }
@@ -38,11 +42,22 @@ func NewApp() *App {
 	if usageStoreErr != nil {
 		usageStoreError = usageStoreErr.Error()
 	}
+	automations, automationErr := automation.New(automationTasksPath())
+	if automationErr != nil {
+		automations, _ = automation.New("")
+	}
 	app := &App{
 		preview:  newWorkspacePreviewServer(),
 		browser:  browserengine.New(browserProfileDir(), browserDownloadsDir()),
 		computer: computercontrol.New(),
 		terminal: terminal.NewManager(),
+		updater: appupdate.New(appupdate.Options{
+			CurrentVersion: appVersion,
+			Commit:         appCommit,
+			BuildDate:      appBuildDate,
+			CacheDir:       updateCacheDir(),
+		}),
+		automations: automations,
 	}
 	app.service = agent.NewService(agent.ServiceConfig{
 		SkillsDir:              "skills",
@@ -62,6 +77,19 @@ func NewApp() *App {
 		UsageStore:             usageStore,
 		UsageStoreError:        usageStoreError,
 	})
+	if app.automations != nil {
+		app.automations.SetRunner(func(task automation.Task) (string, error) {
+			return app.startChatMessageForProjectSessionRouteRegistered(
+				task.ProjectID,
+				task.SessionID,
+				task.Prompt,
+				nil,
+				task.ProviderID,
+				task.ModelID,
+				func(chatTaskID string) { app.automations.AttachChatTask(task.ID, chatTaskID) },
+			)
+		})
+	}
 	initialSettings := app.service.WorkbenchState().RuntimeSettings
 	app.setRuntimeSettings(initialSettings)
 	_ = app.configureBrowser(initialSettings)
@@ -70,6 +98,22 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	if a.automations != nil {
+		a.automations.SetNotify(func(state automation.State) {
+			wruntime.EventsEmit(ctx, "automation:state", state)
+		})
+		a.automations.Start(ctx)
+	}
+	if a.updater != nil {
+		a.updater.SetNotify(func(state appupdate.State) {
+			wruntime.EventsEmit(ctx, "update:state", state)
+		})
+		wruntime.EventsEmit(ctx, "update:state", a.updater.State())
+		settings := a.runtimeSettingsSnapshot().Update
+		if settings.AutoCheck {
+			go a.checkForUpdatesOnStartup(ctx, settings.AutoDownload)
+		}
+	}
 	if a.terminal != nil {
 		a.terminal.SetNotify(func(state terminal.SessionState) {
 			wruntime.EventsEmit(ctx, "terminal:update", state)
@@ -89,6 +133,13 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) shutdown(_ context.Context) {
 	a.cancelAllChatTasks()
+	if a.automations != nil {
+		a.automations.SetNotify(nil)
+		a.automations.Stop()
+	}
+	if a.updater != nil {
+		a.updater.SetNotify(nil)
+	}
 	if a.terminal != nil {
 		a.terminal.SetNotify(nil)
 		a.terminal.Close()
@@ -277,10 +328,19 @@ func (a *App) SwitchBranch(leafID string) (agent.WorkbenchState, error) {
 
 // ForkFromMessage 从指定历史消息创建一条保留旧对话的新分支。
 func (a *App) ForkFromMessage(messageEventID string) (agent.WorkbenchState, error) {
-	if err := a.requireIdleChat("分叉对话"); err != nil {
+	projectID, sessionID := a.service.ActiveSessionIDs()
+	return a.ForkFromMessageForProjectSession(projectID, sessionID, messageEventID)
+}
+
+// ForkFromMessageForProjectSession pins the rewind to the conversation that
+// supplied the message. Background tasks in other conversations may continue.
+func (a *App) ForkFromMessageForProjectSession(projectID, sessionID, messageEventID string) (agent.WorkbenchState, error) {
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	if err := a.requireProjectSessionIdleChat(projectID, sessionID); err != nil {
 		return a.service.WorkbenchState(), err
 	}
-	return a.service.ForkFromMessage(messageEventID)
+	return a.service.ForkFromMessageForProjectSession(projectID, sessionID, messageEventID)
 }
 
 // RespondApproval 由前端在用户点击审批弹窗后调用。
@@ -311,6 +371,10 @@ func (a *App) GetSessionMessages() []agent.SessionMessage {
 
 func (a *App) GetSessionMessagesForSession(sessionID string) []agent.SessionMessage {
 	return a.service.GetSessionMessagesForSession(sessionID)
+}
+
+func (a *App) GetSessionMessagesForProjectSession(projectID, sessionID string) ([]agent.SessionMessage, error) {
+	return a.service.GetSessionMessagesForProjectSession(projectID, sessionID)
 }
 
 func (a *App) CreateProject(name string, workspaceRoot string) (agent.WorkbenchState, error) {
@@ -370,14 +434,38 @@ func (a *App) NewSession() (agent.WorkbenchState, error) {
 func (a *App) SwitchSession(sessionID string) (agent.WorkbenchState, error) {
 	return a.service.SwitchSession(sessionID)
 }
+func (a *App) SwitchProjectSession(projectID, sessionID string) (agent.WorkbenchState, error) {
+	previousRoot := a.runtimeSettingsSnapshot().WorkspaceRoot
+	state, err := a.service.SwitchProjectSession(projectID, sessionID)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+		a.resetPreviewIfWorkspaceChanged(previousRoot, state.RuntimeSettings.WorkspaceRoot)
+	}
+	return state, err
+}
+func (a *App) RenameSession(sessionID, title string) (agent.WorkbenchState, error) {
+	return a.service.RenameSession(sessionID, title)
+}
+func (a *App) RenameProjectSession(projectID, sessionID, title string) (agent.WorkbenchState, error) {
+	return a.service.RenameProjectSession(projectID, sessionID, title)
+}
 func (a *App) ArchiveSession(sessionID string, archived bool) (agent.WorkbenchState, error) {
 	return a.service.ArchiveSession(sessionID, archived)
+}
+func (a *App) ArchiveProjectSession(projectID, sessionID string, archived bool) (agent.WorkbenchState, error) {
+	return a.service.ArchiveProjectSession(projectID, sessionID, archived)
 }
 func (a *App) DeleteSession(sessionID string) (agent.WorkbenchState, error) {
 	if err := a.requireIdleChat("删除会话"); err != nil {
 		return a.service.WorkbenchState(), err
 	}
 	return a.service.DeleteSession(sessionID)
+}
+func (a *App) DeleteProjectSession(projectID, sessionID string) (agent.WorkbenchState, error) {
+	if err := a.requireProjectSessionIdleChat(projectID, sessionID); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	return a.service.DeleteProjectSession(projectID, sessionID)
 }
 
 // SelectDirectory 弹出系统目录选择框，供"添加项目"选工作区根。
@@ -409,6 +497,12 @@ func (a *App) OpenWorkspaceFile(path string) error {
 // right-side file panel. The agent service enforces the active workspace.
 func (a *App) ReadWorkspaceFile(path string) (agent.WorkspaceFilePreview, error) {
 	return a.service.ReadWorkspaceFile(path)
+}
+
+// ListWorkspaceDirectory returns one project-scoped directory level for the
+// right-side file explorer.
+func (a *App) ListWorkspaceDirectory(path string) (agent.WorkspaceDirectoryListing, error) {
+	return a.service.ListWorkspaceDirectory(path)
 }
 
 // PreviewWorkspaceFile returns a loopback URL for the embedded browser. The
@@ -513,6 +607,14 @@ func projectsPath() string {
 	return filepath.Join(configDir, "MHcode", "projects.json")
 }
 
+func automationTasksPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "mhcode-automations.json"
+	}
+	return filepath.Join(configDir, "MHcode", "automations.json")
+}
+
 func temporaryWorkspaceRoot() string {
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		return filepath.Join(home, "MHcodeProject")
@@ -529,6 +631,14 @@ func usageDatabasePath() string {
 		return "mhcode.db"
 	}
 	return filepath.Join(configDir, "MHcode", "mhcode.db")
+}
+
+func updateCacheDir() string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		return filepath.Join(os.TempDir(), "MHcode", "updates")
+	}
+	return filepath.Join(cacheDir, "MHcode", "updates")
 }
 
 func browserProfileDir() string {

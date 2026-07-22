@@ -296,8 +296,108 @@ func TestTeamModeCancellationStopsBeforeNextRole(t *testing.T) {
 	if implementerCalls != 0 {
 		t.Fatalf("implementer started after cancellation: %d calls", implementerCalls)
 	}
-	if state := svc.WorkbenchState().Team; state.Status != "cancelled" || state.Active {
+	if state := svc.WorkbenchState().Team; state.Status != "paused" || state.Active || state.CurrentRole != TeamRolePlanner {
 		t.Fatalf("team state after cancellation = %#v", state)
+	}
+	if svc.teamResume == nil || svc.teamResume.NextRole != TeamRolePlanner {
+		t.Fatalf("team checkpoint after cancellation = %#v", svc.teamResume)
+	}
+}
+
+func TestTeamModeResumeSkipsCompletedRoles(t *testing.T) {
+	svc, workspace, script := newTeamTestService(t, false)
+	// The resume behavior is independent from path canonicalization. Using the
+	// unrestricted test policy avoids managed Windows sandboxes that deny
+	// EvalSymlinks for go test's short-lived TempDir.
+	svc.runtimeSettings.FilesystemAccess = "unrestricted"
+	started := make(chan struct{})
+	script.blockRole = TeamRoleReviewer
+	script.blockStarted = started
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.SendChatMessage(ctx, "创建文件并在审阅时暂停")
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("reviewer did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, errTeamRunPaused) {
+			t.Fatalf("pause error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("team pause did not return promptly")
+	}
+
+	script.mu.Lock()
+	beforeResume := make(map[string]int, len(script.calls))
+	for role, calls := range script.calls {
+		beforeResume[role] = calls
+	}
+	script.blockRole = ""
+	script.blockStarted = nil
+	script.mu.Unlock()
+	if beforeResume[TeamRolePlanner] == 0 || beforeResume[TeamRoleImplementer] == 0 || beforeResume[TeamRoleTester] == 0 || beforeResume[TeamRoleReviewer] == 0 {
+		t.Fatalf("unexpected calls before resume: %#v", beforeResume)
+	}
+	if state := svc.WorkbenchState().Team; state.Status != "paused" || state.CurrentRole != TeamRoleReviewer {
+		t.Fatalf("paused reviewer state = %#v", state)
+	}
+
+	// Simulate reopening the conversation: both the checkpoint and the pause
+	// message must be reconstructed from the append-only event log.
+	svc.teamResume = nil
+	svc.teamState = TeamState{Enabled: true, Status: "idle"}
+	svc.rebuildSessionFromEvents()
+	if svc.teamResume == nil || svc.teamResume.NextRole != TeamRoleReviewer || svc.teamState.Status != "paused" {
+		t.Fatalf("restored team checkpoint = %#v, state=%#v", svc.teamResume, svc.teamState)
+	}
+	pauseMessageRestored := false
+	for _, message := range svc.GetSessionMessages() {
+		if message.Role == "assistant" && strings.Contains(message.Content, "发送“继续”") {
+			pauseMessageRestored = true
+			break
+		}
+	}
+	if !pauseMessageRestored {
+		t.Fatal("pause assistant message was not restored")
+	}
+
+	result, err := svc.SendChatMessage(context.Background(), "继续")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State.Team.Status != "completed" || result.State.Team.Active {
+		t.Fatalf("resumed team result = %#v", result.State.Team)
+	}
+	if result.Content != "团队已完成实现、测试与审阅。" {
+		t.Fatalf("resumed content = %q", result.Content)
+	}
+	if data, err := os.ReadFile(filepath.Join(workspace, "generated.txt")); err != nil || strings.ReplaceAll(string(data), "\r\n", "\n") != "first\n" {
+		t.Fatalf("resumed file = %q, err=%v", data, err)
+	}
+
+	script.mu.Lock()
+	afterResume := make(map[string]int, len(script.calls))
+	for role, calls := range script.calls {
+		afterResume[role] = calls
+	}
+	script.mu.Unlock()
+	if afterResume[TeamRolePlanner] != beforeResume[TeamRolePlanner] || afterResume[TeamRoleImplementer] != beforeResume[TeamRoleImplementer] || afterResume[TeamRoleTester] != beforeResume[TeamRoleTester] {
+		t.Fatalf("completed roles were replayed: %#v", afterResume)
+	}
+	if afterResume[TeamRoleReviewer] != beforeResume[TeamRoleReviewer]+1 || afterResume[TeamRoleSynthesizer] != beforeResume[TeamRoleSynthesizer]+1 {
+		t.Fatalf("resume did not continue from reviewer: %#v", afterResume)
+	}
+	if svc.teamResume != nil {
+		t.Fatalf("completed checkpoint remained resumable: %#v", svc.teamResume)
 	}
 }
 

@@ -1,8 +1,12 @@
 import {
   Check,
+  ChevronDown,
+  ChevronRight,
   ExternalLink,
   FileCode2,
+  Folder,
   FolderOpen,
+  GitBranch,
   ListFilter,
   Pilcrow,
   RefreshCw,
@@ -14,6 +18,7 @@ import { For, Match, Show, Suspense, Switch, createEffect, createMemo, createSig
 import {
   getGitReviewDiff,
   getGitStatus,
+  listWorkspaceDirectory,
   openWorkspaceFile,
   readWorkspaceFile,
   revealWorkspaceFile,
@@ -23,6 +28,8 @@ import type {
   GitDiff,
   GitFileStatus,
   GitStatus,
+  WorkspaceDirectoryEntry,
+  WorkspaceDirectoryListing,
   WorkspaceFilePreview,
   WorkspaceFileRequest,
   WorkspaceFileView,
@@ -41,6 +48,13 @@ type ReviewPanelProps = {
   onClose: () => void;
 };
 
+type ReviewRailMode = "project" | "changes";
+
+type WorkspaceTreeRow = {
+  entry: WorkspaceDirectoryEntry;
+  depth: number;
+};
+
 export function ReviewPanel(props: ReviewPanelProps) {
   const [status, setStatus] = createSignal<GitStatus>();
   const [diff, setDiff] = createSignal<GitDiff>();
@@ -50,6 +64,11 @@ export function ReviewPanel(props: ReviewPanelProps) {
   const [requestedLine, setRequestedLine] = createSignal<number>();
   const [stagedDiff, setStagedDiff] = createSignal(false);
   const [filter, setFilter] = createSignal("");
+  const [railMode, setRailMode] = createSignal<ReviewRailMode>("project");
+  const [directoryListings, setDirectoryListings] = createSignal<Record<string, WorkspaceDirectoryListing>>({});
+  const [expandedDirectories, setExpandedDirectories] = createSignal<Set<string>>(new Set([""]));
+  const [loadingDirectories, setLoadingDirectories] = createSignal<Set<string>>(new Set());
+  const [treeError, setTreeError] = createSignal("");
   const [ignoreWhitespace, setIgnoreWhitespace] = createSignal(false);
   const [wordDiff, setWordDiff] = createSignal(true);
   const [wrapLines, setWrapLines] = createSignal(false);
@@ -71,7 +90,7 @@ export function ReviewPanel(props: ReviewPanelProps) {
     return wordDiff() ? decorateWordDifferences(rows) : rows;
   });
   const diffStats = createMemo(() => countDiffChanges(diff()?.patch ?? ""));
-  const hasChangeRail = createMemo(() => Boolean(status()?.available && (status()?.files.length ?? 0) > 0));
+  const projectRows = createMemo(() => flattenWorkspaceRows(directoryListings(), expandedDirectories()));
 
   createEffect(() => {
     const open = props.open;
@@ -88,6 +107,9 @@ export function ReviewPanel(props: ReviewPanelProps) {
       setPreview(undefined);
       setDiff(undefined);
       setSelectedPath("");
+      setDirectoryListings({});
+      setExpandedDirectories(new Set([""]));
+      setLoadingDirectories(new Set<string>());
       return;
     }
     if (activeWorkspace !== workspaceRoot) {
@@ -97,15 +119,32 @@ export function ReviewPanel(props: ReviewPanelProps) {
       setPreview(undefined);
       setDiff(undefined);
       setFilter("");
+      setRailMode("project");
+      setDirectoryListings({});
+      setExpandedDirectories(new Set([""]));
+      setLoadingDirectories(new Set<string>());
     }
     setBusy(true);
     setError("");
+    setTreeError("");
     let nextStatus: GitStatus | undefined;
-    try {
-      nextStatus = await getGitStatus();
-      setStatus(nextStatus);
-    } catch {
+    const [statusResult, directoryResult] = await Promise.allSettled([
+      getGitStatus(),
+      listWorkspaceDirectory(""),
+    ]);
+    if (statusResult.status === "fulfilled") {
+      nextStatus = statusResult.value;
+      setStatus(statusResult.value);
+    } else {
       setStatus(undefined);
+    }
+    if (directoryResult.status === "fulfilled") {
+      setDirectoryListings((current) => ({ ...current, "": directoryResult.value }));
+    } else {
+      setTreeError(errorText(directoryResult.reason));
+    }
+    if (request?.view === "changes" && (nextStatus?.files.length ?? 0) > 0) {
+      setRailMode("changes");
     }
     const path = request?.path.trim() || previousPath || nextStatus?.files[0]?.path || "";
     if (!path) {
@@ -117,6 +156,49 @@ export function ReviewPanel(props: ReviewPanelProps) {
     }
     await loadFile(path, request?.view ?? "file", nextStatus, request?.line, false);
     setBusy(false);
+  }
+
+  async function toggleDirectory(entry: WorkspaceDirectoryEntry) {
+    if (!entry.isDirectory || entry.isSymlink) return;
+    const expanded = expandedDirectories();
+    if (expanded.has(entry.path)) {
+      const next = new Set(expanded);
+      next.delete(entry.path);
+      setExpandedDirectories(next);
+      return;
+    }
+    const next = new Set(expanded);
+    next.add(entry.path);
+    setExpandedDirectories(next);
+    if (directoryListings()[entry.path]) return;
+
+    const loading = new Set(loadingDirectories());
+    loading.add(entry.path);
+    setLoadingDirectories(loading);
+    setTreeError("");
+    try {
+      const listing = await listWorkspaceDirectory(entry.path);
+      setDirectoryListings((current) => ({ ...current, [entry.path]: listing }));
+    } catch (cause) {
+      const collapsed = new Set(expandedDirectories());
+      collapsed.delete(entry.path);
+      setExpandedDirectories(collapsed);
+      setTreeError(errorText(cause));
+    } finally {
+      const finished = new Set(loadingDirectories());
+      finished.delete(entry.path);
+      setLoadingDirectories(finished);
+    }
+  }
+
+  function openProjectEntry(entry: WorkspaceDirectoryEntry) {
+    if (entry.isDirectory) {
+      void toggleDirectory(entry);
+      return;
+    }
+    if (!entry.isSymlink) {
+      void loadFile(entry.path, "file", status());
+    }
   }
 
   async function loadFile(
@@ -246,7 +328,7 @@ export function ReviewPanel(props: ReviewPanelProps) {
         </header>
 
         <Show when={props.workspaceRoot.trim()} fallback={<div class="review-empty">请先选择项目工作区</div>}>
-          <div class="review-layout" classList={{ "file-only": !hasChangeRail() }}>
+          <div class="review-layout">
             <section class="review-diff-surface">
               <div class="review-diff-toolbar">
                 <div class="review-file-heading">
@@ -274,7 +356,7 @@ export function ReviewPanel(props: ReviewPanelProps) {
                 <Switch fallback={
                   <div class="review-preview-empty">
                     <FileCode2 size={22} />
-                    <strong>在对话中点击文件名</strong>
+                    <strong>选择项目文件</strong>
                     <span>文件会在这里打开，不需要 Git 仓库。</span>
                   </div>
                 }>
@@ -320,31 +402,105 @@ export function ReviewPanel(props: ReviewPanelProps) {
               </Show>
             </section>
 
-            <Show when={hasChangeRail()}>
-              <aside class="review-file-rail">
-                <div class="review-file-summary">
-                  <div><strong>更改的文件</strong><span>{status()?.files.length ?? 0}</span></div>
+            <aside class="review-file-rail">
+              <div class="review-rail-tabs" role="tablist" aria-label="项目文件与 Git 更改">
+                <button
+                  type="button"
+                  role="tab"
+                  classList={{ active: railMode() === "project" }}
+                  aria-selected={railMode() === "project"}
+                  onClick={() => setRailMode("project")}
+                >
+                  <Folder size={13} />项目
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  classList={{ active: railMode() === "changes" }}
+                  aria-selected={railMode() === "changes"}
+                  onClick={() => setRailMode("changes")}
+                >
+                  <GitBranch size={13} />更改
+                  <Show when={(status()?.files.length ?? 0) > 0}><span>{status()?.files.length}</span></Show>
+                </button>
+              </div>
+
+              <Show when={railMode() === "project"} fallback={
+                <div class="review-rail-content changes">
+                  <div class="review-file-summary">
+                    <div><strong>Git 更改</strong><span>{status()?.files.length ?? 0}</span></div>
+                  </div>
+                  <label class="review-file-filter">
+                    <Search size={13} />
+                    <input value={filter()} placeholder="筛选更改" spellcheck={false} onInput={(event) => setFilter(event.currentTarget.value)} />
+                  </label>
+                  <div class="review-file-list">
+                    <For each={filteredFiles()} fallback={
+                      <div class="review-clean"><Check size={15} />{status()?.available ? "工作区没有文件更改" : "此项目没有可显示的 Git 更改"}</div>
+                    }>
+                      {(file) => (
+                        <div class="review-file-row" classList={{ active: pathsEqual(file.path, selectedPath()), conflict: file.conflicted }}>
+                          <button type="button" class="review-file-select" title={file.path} onClick={() => void loadFile(file.path, "changes", status())}>
+                            <span class={`review-file-code ${file.untracked ? "untracked" : file.conflicted ? "conflict" : file.staged ? "staged" : "modified"}`}>
+                              {file.untracked ? "N" : file.conflicted ? "!" : file.staged && !file.modified ? "A" : "M"}
+                            </span>
+                            <span><strong>{fileName(file.path)}</strong><small>{fileDirectory(file.path)}</small></span>
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                  </div>
                 </div>
-                <label class="review-file-filter">
-                  <Search size={13} />
-                  <input value={filter()} placeholder="筛选文件" spellcheck={false} onInput={(event) => setFilter(event.currentTarget.value)} />
-                </label>
-                <div class="review-file-list">
-                  <For each={filteredFiles()} fallback={<div class="review-clean"><Check size={15} />没有匹配文件</div>}>
-                    {(file) => (
-                      <div class="review-file-row" classList={{ active: pathsEqual(file.path, selectedPath()), conflict: file.conflicted }}>
-                        <button type="button" class="review-file-select" title={file.path} onClick={() => void loadFile(file.path, "changes", status())}>
-                          <span class={`review-file-code ${file.untracked ? "untracked" : file.conflicted ? "conflict" : file.staged ? "staged" : "modified"}`}>
-                            {file.untracked ? "N" : file.conflicted ? "!" : file.staged && !file.modified ? "A" : "M"}
+              }>
+                <div class="review-rail-content project">
+                  <div class="review-file-summary">
+                    <div><strong title={props.workspaceRoot}>{workspaceName(props.workspaceRoot)}</strong><span>{projectRows().length}</span></div>
+                  </div>
+                  <div class="review-file-list review-project-tree" role="tree" aria-label="项目文件">
+                  <For each={projectRows()} fallback={
+                    <div class="review-clean">
+                      <Show when={!treeError()} fallback={<span>{treeError()}</span>}>
+                        <Folder size={15} />项目目录为空
+                      </Show>
+                    </div>
+                  }>
+                    {(row) => {
+                      const expanded = () => expandedDirectories().has(row.entry.path);
+                      const loading = () => loadingDirectories().has(row.entry.path);
+                      return (
+                        <button
+                          type="button"
+                          class="review-tree-row"
+                          classList={{ active: pathsEqual(row.entry.path, selectedPath()), directory: row.entry.isDirectory, symlink: row.entry.isSymlink }}
+                          style={`--tree-indent:${row.depth * 14}px`}
+                          title={row.entry.isSymlink ? `${row.entry.path}（符号链接不在项目树中展开）` : row.entry.path}
+                          role="treeitem"
+                          aria-expanded={row.entry.isDirectory ? expanded() : undefined}
+                          onClick={() => openProjectEntry(row.entry)}
+                        >
+                          <span class="review-tree-chevron">
+                            <Show when={loading()} fallback={row.entry.isDirectory ? (expanded() ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : null}>
+                              <RefreshCw class="spinning" size={12} />
+                            </Show>
                           </span>
-                          <span><strong>{fileName(file.path)}</strong><small>{fileDirectory(file.path)}</small></span>
+                          <Show when={row.entry.isDirectory} fallback={<FileCode2 size={14} />}>
+                            {expanded() ? <FolderOpen size={14} /> : <Folder size={14} />}
+                          </Show>
+                          <span>{row.entry.name}</span>
                         </button>
-                      </div>
-                    )}
+                      );
+                    }}
                   </For>
+                  <Show when={directoryListings()[""]?.truncated}>
+                    <div class="review-tree-note">根目录项目过多，仅显示前 1000 项</div>
+                  </Show>
+                  <Show when={treeError() && projectRows().length > 0}>
+                    <div class="review-tree-note error">{treeError()}</div>
+                  </Show>
+                  </div>
                 </div>
-              </aside>
-            </Show>
+              </Show>
+            </aside>
           </div>
         </Show>
         <Show when={error()}><div class="review-error" role="alert">{error()}</div></Show>
@@ -408,6 +564,29 @@ function fileDirectory(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   return index >= 0 ? normalized.slice(0, index) : "项目根目录";
+}
+
+function flattenWorkspaceRows(
+  listings: Record<string, WorkspaceDirectoryListing>,
+  expanded: Set<string>,
+): WorkspaceTreeRow[] {
+  const rows: WorkspaceTreeRow[] = [];
+  const append = (directory: string, depth: number) => {
+    if (depth > 64) return;
+    for (const entry of listings[directory]?.entries ?? []) {
+      rows.push({ entry, depth });
+      if (entry.isDirectory && expanded.has(entry.path)) {
+        append(entry.path, depth + 1);
+      }
+    }
+  };
+  append("", 0);
+  return rows;
+}
+
+function workspaceName(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  return normalized.split("/").pop() || "项目文件";
 }
 
 function errorText(error: unknown): string {

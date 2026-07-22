@@ -12,6 +12,25 @@ import (
 
 const legacySearchFailureMessage = "网络搜索已完成，但上游模型在整理结果时连接失败。搜索来源已经保留，请展开搜索记录查看；也可以直接重试本条消息。"
 
+func TestSessionMessagesRestoreTimingAndToolMetadata(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	exitCode := 0
+	svc.recordAssistantAndCheckpoint("done", "test-model", []tools.ResultPart{{
+		Kind: tools.PartToolCall, Name: "run_command", Status: "ok", Input: "go test ./...", Output: "ok",
+		WorkingDirectory: `C:\workspace`, ExitCode: &exitCode,
+		StartedAt: "2026-07-22T10:00:00Z", CompletedAt: "2026-07-22T10:00:02Z", DurationMs: 2_000,
+	}}, 12_450)
+
+	history := svc.GetSessionMessages()
+	if len(history) != 1 || history[0].DurationMs != 12_450 || len(history[0].Parts) != 1 {
+		t.Fatalf("restored message metadata = %#v", history)
+	}
+	part := history[0].Parts[0]
+	if part.WorkingDirectory != `C:\workspace` || part.ExitCode == nil || *part.ExitCode != 0 || part.DurationMs != 2_000 {
+		t.Fatalf("restored tool metadata = %#v", part)
+	}
+}
+
 func TestGetSessionMessagesUpgradesLegacyWebSearchFailure(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
 	_, err := svc.eventStore.Append(eventlog.EventPayload{

@@ -1,5 +1,5 @@
 import MarkdownIt from "markdown-it";
-import hljs from "highlight.js/lib/common";
+import { escapeCodeHTML, highlightCodeBlock } from "./code-highlighting";
 import { parseWorkspacePathCandidate } from "./workspace-path";
 
 // 单例 markdown 渲染器：代码块走 highlight.js 语法高亮，其余走标准 CommonMark。
@@ -9,28 +9,15 @@ const md: MarkdownIt = new MarkdownIt({
   html: false,
   linkify: true,
   breaks: false,
-  highlight(code, lang): string {
-    const language = lang && hljs.getLanguage(lang) ? lang : "";
-    let body: string;
-    try {
-      body = language
-        ? hljs.highlight(code, { language, ignoreIllegals: true }).value
-        : escapeHtml(code);
-    } catch {
-      body = escapeHtml(code);
-    }
-    const label = language || "text";
-    // data-code 保存原始文本供“复制”按钮读取（base64 避免属性中的引号/换行问题）。
-    const raw = encodeCodePayload(code);
-    return (
-      `<figure class="code-block" data-lang="${escapeAttr(label)}" data-code="${raw}">` +
-      `<figcaption><span class="code-lang">${escapeHtml(label)}</span>` +
-      `<button type="button" class="code-copy" data-role="copy">复制</button></figcaption>` +
-      `<pre class="hljs"><code>${body}</code></pre>` +
-      `</figure>`
-    );
-  },
 });
+
+md.renderer.rules.fence = (tokens, idx) => {
+  const token = tokens[idx];
+  const languageHint = token.info.trim().split(/\s+/)[0] ?? "";
+  return renderCodeBlock(token.content, languageHint);
+};
+
+md.renderer.rules.code_block = (tokens, idx) => renderCodeBlock(tokens[idx].content, "");
 
 md.renderer.rules.code_inline = (tokens, idx) => {
   const content = tokens[idx].content;
@@ -65,6 +52,8 @@ export function handleCodeCopyClick(event: MouseEvent): void {
   if (!button) {
     return;
   }
+  event.preventDefault();
+  event.stopPropagation();
   const figure = button.closest<HTMLElement>(".code-block");
   const payload = figure?.getAttribute("data-code");
   if (!payload) {
@@ -74,6 +63,19 @@ export function handleCodeCopyClick(event: MouseEvent): void {
   void navigator.clipboard?.writeText(text).then(
     () => flashCopyLabel(button, "已复制"),
     () => flashCopyLabel(button, "复制失败"),
+  );
+}
+
+function renderCodeBlock(code: string, languageHint: string): string {
+  const highlighted = highlightCodeBlock(code, languageHint);
+  const label = highlighted.language || "text";
+  const raw = encodeCodePayload(code);
+  return (
+    `<details class="code-block" data-lang="${escapeAttr(label)}" data-code="${raw}">` +
+    `<summary><span class="code-lang">${escapeHtml(label)}</span>` +
+    `<button type="button" class="code-copy" data-role="copy">复制</button></summary>` +
+    `<pre class="hljs"><code>${highlighted.html}</code></pre>` +
+    `</details>\n`
   );
 }
 
@@ -89,10 +91,7 @@ function flashCopyLabel(button: HTMLElement, label: string): void {
 }
 
 function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return escapeCodeHTML(value);
 }
 
 function escapeAttr(value: string): string {

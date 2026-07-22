@@ -56,6 +56,52 @@ func TestChatTaskRunnerTracksSessionsIndependently(t *testing.T) {
 	}
 }
 
+func TestProjectSessionIdleCheckDistinguishesDuplicateSessionIDs(t *testing.T) {
+	_, cancelA := context.WithCancel(context.Background())
+	_, cancelB := context.WithCancel(context.Background())
+	t.Cleanup(cancelA)
+	t.Cleanup(cancelB)
+
+	taskA := &chatTask{id: "task-a", projectID: "project-a", sessionID: "new-chat", cancel: cancelA}
+	taskB := &chatTask{id: "task-b", projectID: "project-b", sessionID: "new-chat", cancel: cancelB}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{taskA.id: taskA, taskB.id: taskB}
+	app.chat.bySession = map[string]string{
+		chatSessionKey(taskA.projectID, taskA.sessionID): taskA.id,
+		chatSessionKey(taskB.projectID, taskB.sessionID): taskB.id,
+	}
+
+	if err := app.requireProjectSessionIdleChat("project-a", "new-chat"); err == nil {
+		t.Fatal("running project-a conversation was reported idle")
+	}
+	app.finishChatTask(taskA)
+	if err := app.requireProjectSessionIdleChat("project-a", "new-chat"); err != nil {
+		t.Fatalf("finished project-a conversation remained busy: %v", err)
+	}
+	if err := app.requireProjectSessionIdleChat("project-b", "new-chat"); err == nil {
+		t.Fatal("project-b task was confused with the identically named project-a conversation")
+	}
+}
+
+func TestDeleteProjectSessionOnlyChecksTargetConversation(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	running := &chatTask{id: "task-b", projectID: "project-b", sessionID: "new-chat", cancel: cancel}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{running.id: running}
+	app.chat.bySession = map[string]string{
+		chatSessionKey(running.projectID, running.sessionID): running.id,
+	}
+
+	if err := app.requireProjectSessionIdleChat("project-a", "new-chat"); err != nil {
+		t.Fatalf("another project's task blocked the target conversation: %v", err)
+	}
+	if err := app.requireProjectSessionIdleChat("project-b", "new-chat"); err == nil {
+		t.Fatal("running target conversation was reported idle")
+	}
+}
+
 func TestApprovalServiceRoutesToOwningTask(t *testing.T) {
 	serviceA := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir()})
 	serviceB := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir()})

@@ -3,11 +3,13 @@ import {
   Archive,
   BarChart3,
   Brain,
+  CalendarClock,
   Database,
   Folder,
   GitBranch,
   Globe2,
   Hash,
+  Info,
   Keyboard,
   Monitor,
   Palette,
@@ -65,6 +67,17 @@ export const providerAPITypeOptions = [
   { value: "responses", label: "Responses" },
   { value: "anthropic-messages", label: "Anthropic Messages" },
   { value: "gemini-generate-content", label: "Gemini Generate Content" },
+];
+
+export const providerReasoningProfileOptions = [
+  { value: "auto", label: "自动识别（推荐）", protocols: ["*"] },
+  { value: "none", label: "不发送推理参数", protocols: ["*"] },
+  { value: "openai", label: "OpenAI 官方模型", protocols: ["openai-compatible", "local"] },
+  { value: "openai-effort", label: "通用 reasoning_effort", protocols: ["openai-compatible", "local"] },
+  { value: "xai", label: "xAI Grok", protocols: ["openai-compatible", "local"] },
+  { value: "deepseek", label: "DeepSeek 推理", protocols: ["deepseek-official", "openai-compatible", "local"] },
+  { value: "anthropic", label: "Anthropic Thinking", protocols: ["anthropic", "anthropic-compatible"] },
+  { value: "gemini", label: "Gemini Thinking", protocols: ["gemini"] },
 ];
 
 export const providerPresets: ProviderPreset[] = [
@@ -226,6 +239,13 @@ export const settingsGroups: Array<{
       { id: "usage", label: "使用统计", icon: () => <BarChart3 size={15} /> },
       { id: "git", label: "Git", icon: () => <GitBranch size={15} /> },
       { id: "environment", label: "环境", icon: () => <Folder size={15} /> },
+    ],
+  },
+  {
+    title: "应用",
+    items: [
+      { id: "automation", label: "自动化任务", icon: () => <CalendarClock size={15} /> },
+      { id: "about", label: "关于 MHcode", icon: () => <Info size={15} /> },
     ],
   },
   {

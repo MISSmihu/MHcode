@@ -3,21 +3,26 @@ import { For, Index, Match, Show, Switch, createEffect, createMemo, createSignal
 import type { JSX } from "solid-js";
 import {
   AlertTriangle, Archive, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Bot, Braces,
-  Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Command, Cpu, Database, FileText,
-  Folder, Gauge, GitBranch, Globe2, Hash, HardDrive, Keyboard, KeyRound, LayoutList,
+  Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Command, Cpu, Database, Download, ExternalLink, FileText,
+  Folder, FolderOpen, Gauge, GitBranch, Globe2, Hash, HardDrive, Keyboard, KeyRound, LayoutList,
   ListFilter, LockKeyhole, MessageSquarePlus, Monitor, Moon, Network, Palette, Plug,
-  Plus, RefreshCw, Save, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles,
-  Sun, Terminal, Trash2, User, Wrench, X, Zap,
+  Play, Plus, RefreshCw, Save, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles,
+  Square, Sun, Terminal, Trash2, User, Wrench, X, Zap,
   Users,
 } from "lucide-solid";
 import { ReasoningMenu } from "./components/ReasoningMenu";
 import type {
+  AppInfo,
+  AutomationState,
+  AutomationTask,
   DeepSeekSessionState,
   MCPServerSetting,
   ModelProviderSetting,
+  ProjectNode,
   ReasoningLevel,
   RuntimeSettings,
   TeamRole,
+  UpdateState,
   UsageMetrics,
   WorkbenchState,
 } from "./types";
@@ -26,7 +31,7 @@ import type { UIAppearancePreferences, UIFontPreset, UIFontSmoothing, UIScaleMod
 import { uiFontPresetOptions } from "./ui-appearance";
 import {
   sandboxOptions, filesystemOptions, approvalOptions, toolResultOptions,
-  stablePrefixOptions, providerProtocolOptions, providerAPITypeOptions,
+  stablePrefixOptions, providerProtocolOptions, providerAPITypeOptions, providerReasoningProfileOptions,
   providerPresets, sitePermissionOptions, settingsGroups,
 } from "./constants";
 import {
@@ -39,7 +44,13 @@ import {
   supportsModelFetchForProtocol, parseEnvLines, parseHeaderLines, prefixStatusLabel, thinkingStatusLabel,
 } from "./format";
 import { inferModelContextWindow, contextWindowSourceLabel } from "./model-context";
-import { browserClearData, deleteBrowserCredential, saveBrowserCredential } from "./services/workbench";
+import {
+  browserClearData, checkForUpdates, deleteAutomationTask, deleteBrowserCredential, downloadUpdate, getAppInfo,
+  getAutomationState, getUpdateState, installUpdate, onAutomationState, onUpdateState, openAppRepositoryPage,
+  openUpdateReleasePage, revealAppConfigFile, revealAppExecutable, runAutomationTaskNow, saveAutomationTask,
+  saveBrowserCredential, setAutomationTaskEnabled, stopAutomationTask,
+} from "./services/workbench";
+import type { ConfirmationRequest } from "./components/ConfirmDialog";
 
 export type SettingsCenterProps = {
   activeCategory: SettingsCategory;
@@ -47,6 +58,7 @@ export type SettingsCenterProps = {
   cacheHealth: WorkbenchState["cacheHealth"];
   cacheHitRate: number;
   cacheTarget: number;
+  confirmAction: (request: ConfirmationRequest) => Promise<boolean>;
   configFiles: WorkbenchState["configFiles"];
   sandboxCapabilities: WorkbenchState["sandboxCapabilities"];
   clearingKey: boolean;
@@ -63,6 +75,7 @@ export type SettingsCenterProps = {
   mcpServers: WorkbenchState["mcpServers"];
   models: WorkbenchState["deepSeek"]["models"];
   projectMemory: WorkbenchState["projectMemory"];
+  projectTree: ProjectNode[];
   uiAppearance: UIAppearancePreferences;
   effectiveUIScale: number;
   updateUIAppearance: (patch: Partial<UIAppearancePreferences>) => void;
@@ -190,6 +203,7 @@ export function SettingsCenter(props: SettingsCenterProps) {
           </Match>
           <Match when={props.activeCategory === "mcp"}>
             <McpSettingsPanel
+              confirmAction={props.confirmAction}
               resetRuntimeDraft={props.resetRuntimeDraft}
               runtimeDirty={props.runtimeDirty}
               runtimeDraft={props.runtimeDraft}
@@ -204,6 +218,7 @@ export function SettingsCenter(props: SettingsCenterProps) {
           </Match>
           <Match when={props.activeCategory === "browser"}>
             <BrowserSettingsPanel
+              confirmAction={props.confirmAction}
               resetRuntimeDraft={props.resetRuntimeDraft}
               runtimeDirty={props.runtimeDirty}
               runtimeDraft={props.runtimeDraft}
@@ -311,6 +326,19 @@ export function SettingsCenter(props: SettingsCenterProps) {
           </Match>
           <Match when={props.activeCategory === "archive"}>
             <ArchiveSettingsPanel />
+          </Match>
+          <Match when={props.activeCategory === "about"}>
+            <AboutSettingsPanel
+              resetRuntimeDraft={props.resetRuntimeDraft}
+              runtimeDirty={props.runtimeDirty}
+              runtimeDraft={props.runtimeDraft}
+              saveRuntime={props.saveRuntime}
+              savingRuntime={props.savingRuntime}
+              updateRuntimeDraft={props.updateRuntimeDraft}
+            />
+          </Match>
+          <Match when={props.activeCategory === "automation"}>
+            <AutomationSettingsPanel confirmAction={props.confirmAction} projectTree={props.projectTree} runtimeDraft={props.runtimeDraft} />
           </Match>
         </Switch>
       </section>
@@ -1074,6 +1102,33 @@ export function GitSettingsPanel(props: {
   );
 }
 
+function reasoningProfilesForProtocol(protocol: string) {
+  return providerReasoningProfileOptions
+    .filter((option) => option.protocols.includes("*") || option.protocols.includes(protocol))
+    .map(({ value, label }) => ({ value, label }));
+}
+
+function reasoningProfileDescription(profile: string) {
+  switch (profile) {
+    case "none":
+      return "完全不附加推理字段，适合不支持 reasoning 的兼容服务。";
+    case "openai":
+      return "按 OpenAI 模型族校验能力，并把超高映射到该模型支持的 high、xhigh 或 max。";
+    case "openai-effort":
+      return "不判断模型名称，固定发送 low、medium、high、xhigh；仅在上游明确兼容时使用。";
+    case "xai":
+      return "按 Grok 模型族发送官方 reasoning_effort，自动限制不支持的最高档。";
+    case "deepseek":
+      return "按 DeepSeek 规则映射为 disabled、high 或 max。";
+    case "anthropic":
+      return "按 Claude 型号选择 adaptive thinking 或 token budget。";
+    case "gemini":
+      return "按 Gemini 型号发送 thinkingConfig.thinkingLevel。";
+    default:
+      return "只识别原生协议与已知官方 API 地址；未知自定义地址不会猜测或发送推理字段。";
+  }
+}
+
 export function ModelSettingsPanel(props: {
   clearProviderKey: (providerID: string) => Promise<void> | void;
   clearingProviderID: string;
@@ -1151,11 +1206,15 @@ export function ModelSettingsPanel(props: {
     setEntryMode("custom");
   };
   const changeProviderProtocol = (provider: ModelProviderSetting, protocol: string) => {
+	const reasoningProfile = reasoningProfilesForProtocol(protocol).some((option) => option.value === provider.reasoningProfile)
+	  ? provider.reasoningProfile
+	  : "auto";
     updateProvider(provider.id, {
       protocol,
       apiType: defaultAPITypeForProtocol(protocol),
       baseUrl: provider.baseUrl || providerBaseURLPlaceholder(protocol),
       supportsModelFetch: supportsModelFetchForProtocol(protocol),
+	  reasoningProfile,
     });
   };
   const addProviderModel = (provider: ModelProviderSetting) => {
@@ -1341,6 +1400,17 @@ export function ModelSettingsPanel(props: {
                         value={provider().apiType}
                         options={providerAPITypeOptions}
                         onChange={(value) => updateProvider(provider().id, { apiType: value })}
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title="推理兼容"
+                    description={reasoningProfileDescription(provider().reasoningProfile ?? "auto")}
+                    control={
+                      <SelectControl
+                        value={provider().reasoningProfile ?? "auto"}
+                        options={reasoningProfilesForProtocol(provider().protocol)}
+                        onChange={(value) => updateProvider(provider().id, { reasoningProfile: value })}
                       />
                     }
                   />
@@ -1913,6 +1983,7 @@ function mcpStatusTone(state?: string): "good" | "bad" | "watch" | "neutral" {
 }
 
 export function McpSettingsPanel(props: {
+  confirmAction: (request: ConfirmationRequest) => Promise<boolean>;
   runtimeDraft: RuntimeSettings;
   runtimeDirty: boolean;
   saveRuntime: () => void;
@@ -1965,10 +2036,16 @@ export function McpSettingsPanel(props: {
     updateServers([...props.runtimeDraft.mcp.servers, server]);
     setActiveServerID(server.id);
   };
-  const removeServer = (server: MCPServerSetting) => {
-    if (server.transport === "builtin" || !window.confirm(`删除 MCP 服务器“${server.name || server.id}”？`)) {
-      return;
-    }
+  const removeServer = async (server: MCPServerSetting) => {
+    if (server.transport === "builtin") return;
+    const confirmed = await props.confirmAction({
+      title: "删除 MCP 服务器？",
+      message: `“${server.name || server.id}”将从当前配置中移除。`,
+      detail: "保存设置后，该服务器将不再启动或提供工具。",
+      confirmLabel: "删除",
+      tone: "danger",
+    });
+    if (!confirmed) return;
     updateServers(props.runtimeDraft.mcp.servers.filter((item) => item.id !== server.id));
   };
   const changeTransport = (server: MCPServerSetting, transport: string) => {
@@ -2044,7 +2121,7 @@ export function McpSettingsPanel(props: {
                     <RefreshCw size={14} classList={{ spinning: props.refreshingMCPID === server().id }} />
                   </IconButton>
                   <Show when={server().transport !== "builtin"}>
-                    <IconButton title="删除 MCP 服务器" danger onClick={() => removeServer(server())}>
+                    <IconButton title="删除 MCP 服务器" danger onClick={() => void removeServer(server())}>
                       <Trash2 size={14} />
                     </IconButton>
                   </Show>
@@ -2235,6 +2312,7 @@ export function McpSettingsPanel(props: {
 }
 
 export function BrowserSettingsPanel(props: {
+  confirmAction: (request: ConfirmationRequest) => Promise<boolean>;
   runtimeDraft: RuntimeSettings;
   runtimeDirty: boolean;
   saveRuntime: () => void;
@@ -2283,7 +2361,16 @@ export function BrowserSettingsPanel(props: {
 		}
 	};
 	const clearBrowserData = async () => {
-		if (props.runtimeDraft.browser.clearDataPolicy === "ask" && !window.confirm("清除内置浏览器的 Cookie、缓存和登录状态？")) return;
+		if (props.runtimeDraft.browser.clearDataPolicy === "ask") {
+			const confirmed = await props.confirmAction({
+				title: "清除浏览数据？",
+				message: "内置浏览器的 Cookie、缓存和登录状态将被清除。",
+				detail: "已登录的网站可能需要重新验证身份。",
+				confirmLabel: "清除",
+				tone: "danger",
+			});
+			if (!confirmed) return;
+		}
 		setClearingBrowserData(true);
 		setBrowserDataMessage("");
 		try {
@@ -2808,6 +2895,539 @@ export function ShortcutSettingsPanel() {
       </PanelSection>
     </div>
   );
+}
+
+export function AutomationSettingsPanel(props: {
+  confirmAction: (request: ConfirmationRequest) => Promise<boolean>;
+  projectTree: ProjectNode[];
+  runtimeDraft: RuntimeSettings;
+}) {
+  const [automation, setAutomation] = createSignal<AutomationState>({ tasks: [], running: false });
+  const [draft, setDraft] = createSignal<AutomationTask>(createAutomationDraft(props.projectTree));
+  const [draftDirty, setDraftDirty] = createSignal(false);
+  const [busy, setBusy] = createSignal<"save" | "delete" | "run" | "stop" | "toggle" | "">("");
+  const [error, setError] = createSignal("");
+  let unsubscribeAutomation: () => void = () => undefined;
+
+  const applyState = (state: AutomationState, preferredID = draft().id, replaceDraft = true) => {
+    setAutomation(state);
+    const selected = state.tasks.find((task) => task.id === preferredID);
+    if (selected && replaceDraft) {
+      setDraft(cloneAutomationTask(selected));
+      setDraftDirty(false);
+    }
+  };
+
+  const editDraft = (update: (current: AutomationTask) => AutomationTask) => {
+    setDraft(update);
+    setDraftDirty(true);
+  };
+
+  onMount(() => {
+    unsubscribeAutomation = onAutomationState((state) => applyState(state, draft().id, !draftDirty()));
+    void getAutomationState()
+      .then((state) => applyState(state, state.tasks[0]?.id ?? ""))
+      .catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)));
+  });
+  onCleanup(() => unsubscribeAutomation());
+
+  const selectedProject = createMemo(() => props.projectTree.find((project) => project.id === draft().projectId));
+  const availableSessions = createMemo(() => selectedProject()?.sessions.filter((session) => !session.archived || session.id === draft().sessionId) ?? []);
+  const selectedProvider = createMemo(() => props.runtimeDraft.model.providers.find((provider) => provider.id === draft().providerId));
+  const selectedTaskRunning = createMemo(() => draft().lastRun?.status === "running" || draft().lastRun?.status === "starting");
+
+  createEffect(() => {
+    if (!draft().projectId && props.projectTree.length > 0) {
+      setDraft(createAutomationDraft(props.projectTree));
+      setDraftDirty(false);
+    }
+  });
+
+  const createNew = () => {
+    setError("");
+    setDraft(createAutomationDraft(props.projectTree));
+    setDraftDirty(false);
+  };
+
+  const save = async () => {
+    setBusy("save");
+    setError("");
+    const wasNew = !draft().id;
+    try {
+      const state = await saveAutomationTask(draft());
+      const selectedID = wasNew
+        ? [...state.tasks].sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0]?.id ?? ""
+        : draft().id;
+      applyState(state, selectedID);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const remove = async () => {
+    const task = draft();
+    if (!task.id) return;
+    const confirmed = await props.confirmAction({
+      title: "删除自动化任务",
+      message: `确定删除“${task.name}”吗？`,
+      detail: "运行记录与计划会一起删除，已经写入会话的消息不会被移除。",
+      confirmLabel: "删除任务",
+      tone: "danger",
+    });
+    if (!confirmed) return;
+    setBusy("delete");
+    setError("");
+    try {
+      const state = await deleteAutomationTask(task.id);
+      setAutomation(state);
+      setDraft(state.tasks[0] ? cloneAutomationTask(state.tasks[0]) : createAutomationDraft(props.projectTree));
+      setDraftDirty(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const runNow = async () => {
+    if (!draft().id || draftDirty()) return;
+    setBusy("run");
+    setError("");
+    try {
+      applyState(await runAutomationTaskNow(draft().id), draft().id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const stop = async () => {
+    if (!draft().id || !selectedTaskRunning()) return;
+    setBusy("stop");
+    setError("");
+    try {
+      applyState(await stopAutomationTask(draft().id), draft().id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const toggleTask = async (task: AutomationTask, enabled: boolean) => {
+    setBusy("toggle");
+    setError("");
+    try {
+      applyState(await setAutomationTaskEnabled(task.id, enabled), draft().id || task.id, !draftDirty());
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <div class="settings-page-body automation-settings-page">
+      <section class="automation-task-list-section settings-form-section">
+        <div class="settings-form-title">
+          <h2>任务</h2>
+          <button class="settings-square-button" type="button" title="新建自动化任务" onClick={createNew}><Plus size={15} /></button>
+        </div>
+        <div class="automation-task-list">
+          <For each={automation().tasks} fallback={<p class="settings-empty-box">还没有自动化任务</p>}>
+            {(task) => (
+              <div class="automation-task-option" classList={{ active: draft().id === task.id }}>
+                <button type="button" onClick={() => { setDraft(cloneAutomationTask(task)); setDraftDirty(false); }}>
+                  <span class="automation-task-status" classList={{ running: task.lastRun?.status === "running", failed: task.lastRun?.status === "failed" }} />
+                  <span class="automation-task-copy">
+                    <strong>{task.name}</strong>
+                    <small>{automationScheduleLabel(task)} · {task.nextRunAt ? `下次 ${formatAutomationDate(task.nextRunAt)}` : "已暂停"}</small>
+                  </span>
+                </button>
+                <SwitchControl checked={task.enabled} onChange={(enabled) => void toggleTask(task, enabled)} />
+              </div>
+            )}
+          </For>
+        </div>
+      </section>
+
+      <section class="automation-task-editor-section settings-form-section">
+        <div class="settings-form-title">
+          <h2>{draft().id ? "编辑任务" : "新建任务"}</h2>
+          <Show when={draft().id}>
+            <span class="settings-muted-value">已运行 {draft().runCount} 次 · 失败 {draft().failureCount} 次</span>
+          </Show>
+        </div>
+
+        <SettingsCard>
+          <SettingsRow
+            title="任务名称"
+            description="用于任务列表和运行记录"
+            control={<input class="settings-input row-control" value={draft().name} placeholder="例如：每日检查主分支" onInput={(event) => editDraft((current) => ({ ...current, name: event.currentTarget.value }))} />}
+          />
+          <SettingsRow
+            title="启用计划"
+            description="关闭后仍可手动运行一次"
+            control={<SwitchControl checked={draft().enabled} onChange={(enabled) => editDraft((current) => ({ ...current, enabled }))} />}
+          />
+        </SettingsCard>
+
+        <SettingsSection title="执行计划">
+          <SettingsCard>
+            <SettingsRow
+              title="计划类型"
+              description={draft().schedule.kind === "daily" ? "按本机时区每天执行" : "从保存或上次运行时间开始计算"}
+              control={
+                <div class="settings-mini-segment">
+                  <button type="button" classList={{ active: draft().schedule.kind === "interval" }} onClick={() => editDraft((current) => ({ ...current, schedule: { ...current.schedule, kind: "interval" } }))}>按间隔</button>
+                  <button type="button" classList={{ active: draft().schedule.kind === "daily" }} onClick={() => editDraft((current) => ({ ...current, schedule: { ...current.schedule, kind: "daily" } }))}>每天</button>
+                </div>
+              }
+            />
+            <Show when={draft().schedule.kind === "daily"} fallback={
+              <SettingsRow
+                title="间隔分钟"
+                description="最短 1 分钟，最长 1 年"
+                control={<input class="settings-input numeric" type="number" min="1" max="525600" value={draft().schedule.intervalMinutes} onInput={(event) => editDraft((current) => ({ ...current, schedule: { ...current.schedule, intervalMinutes: Number(event.currentTarget.value) } }))} />}
+              />
+            }>
+              <SettingsRow
+                title="执行时间"
+                description="使用当前操作系统时区"
+                control={<input class="settings-input" type="time" value={draft().schedule.dailyTime} onInput={(event) => editDraft((current) => ({ ...current, schedule: { ...current.schedule, dailyTime: event.currentTarget.value } }))} />}
+              />
+            </Show>
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection title="目标会话">
+          <SettingsCard>
+            <SettingsRow
+              title="项目"
+              description={selectedProject()?.workspaceRoot || "选择 Agent 工作目录"}
+              control={
+                <select class="settings-select" value={draft().projectId} onChange={(event) => {
+                  const project = props.projectTree.find((candidate) => candidate.id === event.currentTarget.value);
+                  const session = project?.sessions.find((candidate) => !candidate.archived) ?? project?.sessions[0];
+                  editDraft((current) => ({ ...current, projectId: project?.id ?? "", sessionId: session?.id ?? "" }));
+                }}>
+                  <For each={props.projectTree}>{(project) => <option value={project.id}>{project.name}</option>}</For>
+                </select>
+              }
+            />
+            <SettingsRow
+              title="会话"
+              description="运行结果会作为一轮新消息写入该会话"
+              control={
+                <select class="settings-select" value={draft().sessionId} onChange={(event) => editDraft((current) => ({ ...current, sessionId: event.currentTarget.value }))}>
+                  <For each={availableSessions()}>{(session) => <option value={session.id}>{session.title}{session.archived ? "（已归档）" : ""}</option>}</For>
+                </select>
+              }
+            />
+            <SettingsRow
+              title="模型路由"
+              description="默认跟随模型设置；也可为此任务固定供应商"
+              control={
+                <select class="settings-select" value={draft().providerId ?? ""} onChange={(event) => {
+                  const providerID = event.currentTarget.value;
+                  const provider = props.runtimeDraft.model.providers.find((candidate) => candidate.id === providerID);
+                  const modelID = provider ? modelOptionsForProvider(provider)[0]?.id ?? provider.defaultModelId : "";
+                  editDraft((current) => ({ ...current, providerId: providerID, modelId: modelID }));
+                }}>
+                  <option value="">跟随当前模型</option>
+                  <For each={props.runtimeDraft.model.providers.filter((provider) => provider.enabled)}>{(provider) => <option value={provider.id}>{provider.name}</option>}</For>
+                </select>
+              }
+            />
+            <Show when={selectedProvider()}>
+              {(provider) => (
+                <SettingsRow
+                  title="固定模型"
+                  description="仅影响该自动化任务"
+                  control={
+                    <select class="settings-select" value={draft().modelId ?? ""} onChange={(event) => editDraft((current) => ({ ...current, modelId: event.currentTarget.value }))}>
+                      <For each={modelOptionsForProvider(provider())}>{(model) => <option value={model.id}>{model.displayName || model.id}</option>}</For>
+                    </select>
+                  }
+                />
+              )}
+            </Show>
+          </SettingsCard>
+        </SettingsSection>
+
+        <SettingsSection title="任务内容">
+          <textarea
+            class="settings-large-textarea automation-prompt"
+            value={draft().prompt}
+            placeholder="写清楚希望 Agent 检查、修改或汇报的内容。它会使用该项目已有的记忆、Skills、MCP 和权限设置。"
+            onInput={(event) => editDraft((current) => ({ ...current, prompt: event.currentTarget.value }))}
+          />
+        </SettingsSection>
+
+        <Show when={draft().lastRun}>
+          {(run) => (
+            <div class="automation-last-run" classList={{ failed: run().status === "failed" || run().status === "cancelled" }}>
+              <Clock3 size={15} />
+              <div>
+                <strong>{automationRunStatusLabel(run().status)}</strong>
+                <span>{run().message || "暂无运行说明"}{run().startedAt ? ` · ${formatAutomationDate(run().startedAt!)}` : ""}</span>
+              </div>
+            </div>
+          )}
+        </Show>
+        <Show when={error()}><p class="about-action-error automation-error"><AlertTriangle size={14} />{error()}</p></Show>
+
+        <div class="settings-actions automation-actions">
+          <Show when={draft().id}>
+            <button class="settings-danger-button" type="button" disabled={busy() !== "" || selectedTaskRunning()} onClick={() => void remove()}><Trash2 size={14} />删除</button>
+            <Show when={selectedTaskRunning()} fallback={
+              <button class="settings-soft-button" type="button" title={draftDirty() ? "请先保存任务更改" : "立即运行一次"} disabled={busy() !== "" || draftDirty()} onClick={() => void runNow()}><Play size={14} />运行一次</button>
+            }>
+              <button class="settings-danger-button" type="button" disabled={busy() !== ""} onClick={() => void stop()}><Square size={13} />{busy() === "stop" ? "停止中" : "停止运行"}</button>
+            </Show>
+          </Show>
+          <button class="settings-soft-button primary" type="button" disabled={busy() !== "" || props.projectTree.length === 0 || Boolean(draft().id && !draftDirty())} onClick={() => void save()}><Save size={14} />{busy() === "save" ? "保存中" : "保存任务"}</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function createAutomationDraft(projectTree: ProjectNode[]): AutomationTask {
+  const project = projectTree.find((candidate) => candidate.isActive) ?? projectTree[0];
+  const session = project?.sessions.find((candidate) => candidate.isActive && !candidate.archived)
+    ?? project?.sessions.find((candidate) => !candidate.archived)
+    ?? project?.sessions[0];
+  return {
+    id: "",
+    name: "",
+    enabled: true,
+    prompt: "",
+    projectId: project?.id ?? "",
+    sessionId: session?.id ?? "",
+    providerId: "",
+    modelId: "",
+    schedule: { kind: "interval", intervalMinutes: 60, dailyTime: "09:00" },
+    createdAt: "",
+    updatedAt: "",
+    runCount: 0,
+    failureCount: 0,
+  };
+}
+
+function cloneAutomationTask(task: AutomationTask): AutomationTask {
+  return JSON.parse(JSON.stringify(task)) as AutomationTask;
+}
+
+function automationScheduleLabel(task: AutomationTask) {
+  if (task.schedule.kind === "daily") return `每天 ${task.schedule.dailyTime}`;
+  if (task.schedule.intervalMinutes % 1440 === 0) return `每 ${task.schedule.intervalMinutes / 1440} 天`;
+  if (task.schedule.intervalMinutes % 60 === 0) return `每 ${task.schedule.intervalMinutes / 60} 小时`;
+  return `每 ${task.schedule.intervalMinutes} 分钟`;
+}
+
+function automationRunStatusLabel(status: string) {
+  switch (status) {
+    case "starting": return "正在启动";
+    case "running": return "正在运行";
+    case "completed": return "运行完成";
+    case "cancelled": return "已取消";
+    case "interrupted": return "上次运行中断";
+    default: return "运行失败";
+  }
+}
+
+function formatAutomationDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+export function AboutSettingsPanel(props: {
+  resetRuntimeDraft: () => void;
+  runtimeDirty: boolean;
+  runtimeDraft: RuntimeSettings;
+  saveRuntime: () => void;
+  savingRuntime: boolean;
+  updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
+}) {
+  const [info, setInfo] = createSignal<AppInfo>();
+  const [update, setUpdate] = createSignal<UpdateState>();
+  const [busyAction, setBusyAction] = createSignal<"check" | "download" | "install" | "">("");
+  const [actionError, setActionError] = createSignal("");
+  let unsubscribeUpdate: () => void = () => undefined;
+
+  onMount(() => {
+    unsubscribeUpdate = onUpdateState((state) => setUpdate(state));
+    void Promise.all([getAppInfo(), getUpdateState()])
+      .then(([appInfo, state]) => {
+        setInfo(appInfo);
+        setUpdate(state);
+      })
+      .catch((error) => setActionError(error instanceof Error ? error.message : String(error)));
+  });
+  onCleanup(() => unsubscribeUpdate());
+
+  const runUpdateAction = async (
+    action: "check" | "download" | "install",
+    operation: () => Promise<UpdateState>,
+  ) => {
+    setBusyAction(action);
+    setActionError("");
+    try {
+      setUpdate(await operation());
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusyAction("");
+    }
+  };
+
+  const updateSettings = (patch: Partial<RuntimeSettings["update"]>) => {
+    props.updateRuntimeDraft({ update: { ...props.runtimeDraft.update, ...patch } });
+  };
+  const stateBusy = createMemo(() => ["checking", "downloading", "installing"].includes(update()?.status ?? ""));
+  const progress = createMemo(() => Math.min(100, Math.max(0, Math.round((update()?.progress ?? 0) * 100))));
+
+  return (
+    <div class="settings-page-body about-settings-page">
+      <section class="about-product" aria-label="MHcode 版本信息">
+        <div class="about-product-mark" aria-hidden="true"><Command size={24} /></div>
+        <div class="about-product-copy">
+          <h2>{info()?.name ?? "MHcode"}</h2>
+          <p>面向真实项目工作的 AI 编码 Agent</p>
+          <span>版本 {info()?.version ?? update()?.currentVersion ?? "读取中"}</span>
+        </div>
+        <button
+          class="settings-soft-button about-check-button"
+          type="button"
+          disabled={stateBusy() || busyAction() !== ""}
+          onClick={() => void runUpdateAction("check", checkForUpdates)}
+        >
+          <RefreshCw size={14} classList={{ spinning: busyAction() === "check" || update()?.status === "checking" }} />
+          {update()?.status === "checking" ? "正在检查" : "检查更新"}
+        </button>
+      </section>
+
+      <SettingsSection title="软件更新">
+        <SettingsCard>
+          <div class="about-update-state" classList={{ error: update()?.status === "error", available: Boolean(update()?.updateAvailable) }}>
+            <div class="about-update-icon" aria-hidden="true">
+              <Show when={update()?.status === "error"} fallback={<CheckCircle2 size={18} />}>
+                <AlertTriangle size={18} />
+              </Show>
+            </div>
+            <div class="about-update-copy">
+              <strong>{update()?.message ?? "正在读取更新状态..."}</strong>
+              <Show when={update()?.latestVersion}>
+                <span>
+                  当前 {update()?.currentVersion} · 最新 {update()?.latestVersion}
+                  <Show when={update()?.publishedAt}> · {formatAboutDate(update()?.publishedAt)}</Show>
+                </span>
+              </Show>
+            </div>
+            <div class="about-update-actions">
+              <Show when={update()?.updateAvailable && update()?.downloadUrl && update()?.status !== "downloaded"}>
+                <button
+                  class="settings-soft-button primary"
+                  type="button"
+                  disabled={stateBusy() || busyAction() !== ""}
+                  onClick={() => void runUpdateAction("download", downloadUpdate)}
+                >
+                  <Download size={14} />
+                  {update()?.status === "downloading" ? "下载中" : "下载更新"}
+                </button>
+              </Show>
+              <Show when={update()?.status === "downloaded"}>
+                <button
+                  class="settings-soft-button primary"
+                  type="button"
+                  disabled={busyAction() !== ""}
+                  onClick={() => void runUpdateAction("install", installUpdate)}
+                >
+                  <RefreshCw size={14} />
+                  重启并安装
+                </button>
+              </Show>
+              <button class="settings-soft-button" type="button" onClick={() => void openUpdateReleasePage()}>
+                <ExternalLink size={14} />
+                发布页
+              </button>
+            </div>
+          </div>
+          <Show when={update()?.status === "downloading" || update()?.status === "downloaded"}>
+            <div class="about-download-progress">
+              <div><span style={{ width: `${progress()}%` }} /></div>
+              <small>{progress()}% · {formatAboutBytes(update()?.downloadedBytes ?? 0)} / {formatAboutBytes(update()?.totalBytes ?? 0)}</small>
+            </div>
+          </Show>
+          <Show when={actionError()}>
+            <p class="about-action-error"><AlertTriangle size={14} />{actionError()}</p>
+          </Show>
+          <Show when={update()?.releaseNotes}>
+            <details class="about-release-notes">
+              <summary>查看版本说明</summary>
+              <p>{update()?.releaseNotes}</p>
+            </details>
+          </Show>
+        </SettingsCard>
+
+        <SettingsCard>
+          <SettingsRow
+            title="启动时自动检查"
+            description="每 6 小时最多检查一次稳定版，不阻塞应用启动"
+            control={<SwitchControl checked={props.runtimeDraft.update.autoCheck} onChange={(checked) => updateSettings({ autoCheck: checked })} />}
+          />
+          <SettingsRow
+            title="自动下载更新"
+            description="发现适用于当前系统的便携版后在后台下载，安装前仍由你确认"
+            control={<SwitchControl checked={props.runtimeDraft.update.autoDownload} onChange={(checked) => updateSettings({ autoDownload: checked })} />}
+          />
+        </SettingsCard>
+        <RuntimeSaveActions dirty={props.runtimeDirty} reset={props.resetRuntimeDraft} save={props.saveRuntime} saving={props.savingRuntime} />
+      </SettingsSection>
+
+      <SettingsSection title="运行信息">
+        <SettingsCard>
+          <SettingsRow title="运行环境" description={`${info()?.operatingSystem ?? "-"} · ${info()?.architecture ?? "-"}`} control={<span class="settings-muted-value">{info()?.goVersion ?? "-"}</span>} />
+          <SettingsRow title="构建版本" description={info()?.buildDate ? formatAboutDate(info()?.buildDate) : "本地开发构建"} control={<code class="settings-path-value">{info()?.commit || "dev"}</code>} />
+          <SettingsRow
+            title="程序位置"
+            description={info()?.executablePath || "桌面运行时可用"}
+            control={<button class="settings-square-button" type="button" title="在文件管理器中显示程序" disabled={!info()?.executablePath} onClick={() => void revealAppExecutable()}><FolderOpen size={15} /></button>}
+          />
+          <SettingsRow
+            title="配置文件"
+            description={info()?.configPath || "桌面运行时可用"}
+            control={<button class="settings-square-button" type="button" title="在文件管理器中显示配置" disabled={!info()?.configPath} onClick={() => void revealAppConfigFile()}><FolderOpen size={15} /></button>}
+          />
+          <SettingsRow
+            title="源代码与问题反馈"
+            description={info()?.repositoryUrl || "https://github.com/MISSmihu/MHcode"}
+            control={<button class="settings-square-button" type="button" title="打开项目主页" onClick={() => void openAppRepositoryPage()}><ExternalLink size={15} /></button>}
+          />
+        </SettingsCard>
+      </SettingsSection>
+    </div>
+  );
+}
+
+function formatAboutBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  const amount = value / 1024 ** index;
+  return `${amount >= 10 || index === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[index]}`;
+}
+
+function formatAboutDate(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
 export function ArchiveSettingsPanel() {

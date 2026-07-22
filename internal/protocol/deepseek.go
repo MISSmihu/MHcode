@@ -27,11 +27,12 @@ const (
 )
 
 type DeepSeekProvider struct {
-	APIKey        string
-	BaseURL       string
-	HTTPClient    *http.Client
-	ExtraHeaders  string
-	ExtraBodyJSON string
+	APIKey           string
+	BaseURL          string
+	HTTPClient       *http.Client
+	ExtraHeaders     string
+	ExtraBodyJSON    string
+	ReasoningProfile string
 }
 
 func NewDeepSeekProvider(apiKey string) DeepSeekProvider {
@@ -89,18 +90,23 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 	if chatRequestHasAttachments(request) {
 		return nil, errors.New("DeepSeek 原生协议暂不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
 	}
+	reasoning := reasoningOptionsForRequest("deepseek-official", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Mode == "enabled" {
+		temperature = 0
+	}
 	body := deepSeekChatRequest{
 		Model:           request.Model,
 		Messages:        request.Messages,
-		Temperature:     request.Temperature,
+		Temperature:     temperature,
 		Stream:          true,
 		StreamOptions:   &deepSeekStreamOptions{IncludeUsage: true},
-		ReasoningEffort: request.ReasoningEffort,
+		ReasoningEffort: reasoning.Effort,
 		Tools:           request.Tools,
 	}
-	if strings.TrimSpace(request.ThinkingMode) != "" {
-		body.Thinking = &deepSeekThinking{Type: request.ThinkingMode}
-		if request.ThinkingMode == "disabled" {
+	if reasoning.Mode != "" {
+		body.Thinking = &deepSeekThinking{Type: reasoning.Mode}
+		if reasoning.Mode == "disabled" {
 			body.ReasoningEffort = ""
 		}
 	}
@@ -108,7 +114,7 @@ func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-ch
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "stream_options", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "temperature", "thinking", "reasoning_effort", "stream", "stream_options", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -143,17 +149,22 @@ func (p DeepSeekProvider) Complete(ctx context.Context, request ChatRequest) (Co
 	if chatRequestHasAttachments(request) {
 		return CompletionResult{}, errors.New("DeepSeek 原生协议暂不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
 	}
+	reasoning := reasoningOptionsForRequest("deepseek-official", p.BaseURL, p.ReasoningProfile, request)
+	temperature := request.Temperature
+	if reasoning.Mode == "enabled" {
+		temperature = 0
+	}
 	body := deepSeekChatRequest{
 		Model:           request.Model,
 		Messages:        request.Messages,
-		Temperature:     request.Temperature,
+		Temperature:     temperature,
 		Stream:          false,
-		ReasoningEffort: request.ReasoningEffort,
+		ReasoningEffort: reasoning.Effort,
 		Tools:           request.Tools,
 	}
-	if strings.TrimSpace(request.ThinkingMode) != "" {
-		body.Thinking = &deepSeekThinking{Type: request.ThinkingMode}
-		if request.ThinkingMode == "disabled" {
+	if reasoning.Mode != "" {
+		body.Thinking = &deepSeekThinking{Type: reasoning.Mode}
+		if reasoning.Mode == "disabled" {
 			body.ReasoningEffort = ""
 		}
 	}
@@ -161,7 +172,7 @@ func (p DeepSeekProvider) Complete(ctx context.Context, request ChatRequest) (Co
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "messages", "temperature", "thinking", "reasoning_effort", "stream", "tools"))
 	if err != nil {
 		return CompletionResult{}, err
 	}

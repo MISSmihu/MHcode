@@ -16,12 +16,13 @@ import (
 const DefaultGeminiBaseURL = "https://generativelanguage.googleapis.com/v1beta"
 
 type GeminiProvider struct {
-	BaseURL       string
-	APIKey        string
-	ProviderID    string
-	HTTPClient    *http.Client
-	ExtraHeaders  string
-	ExtraBodyJSON string
+	BaseURL          string
+	APIKey           string
+	ProviderID       string
+	HTTPClient       *http.Client
+	ExtraHeaders     string
+	ExtraBodyJSON    string
+	ReasoningProfile string
 }
 
 func (p GeminiProvider) Name() string {
@@ -99,10 +100,12 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	if len(contents) == 0 {
 		contents = []geminiContent{{Role: "user", Parts: []geminiPart{{Text: ""}}}}
 	}
+	reasoning := reasoningOptionsForRequest("gemini", p.BaseURL, p.ReasoningProfile, request)
 	body := geminiGenerateContentRequest{
 		Contents: contents,
 		GenerationConfig: geminiGenerationConfig{
-			Temperature: request.Temperature,
+			Temperature:    request.Temperature,
+			ThinkingConfig: geminiThinkingConfigFor(reasoning),
 		},
 		Tools: geminiToolsFromProtocol(request.Tools),
 	}
@@ -115,7 +118,7 @@ func (p GeminiProvider) Stream(ctx context.Context, request ChatRequest) (<-chan
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "generationConfig", "systemInstruction", "tools"))
 	if err != nil {
 		return nil, err
 	}
@@ -160,10 +163,12 @@ func (p GeminiProvider) Complete(ctx context.Context, request ChatRequest) (Comp
 	if len(contents) == 0 {
 		contents = []geminiContent{{Role: "user", Parts: []geminiPart{{Text: ""}}}}
 	}
+	reasoning := reasoningOptionsForRequest("gemini", p.BaseURL, p.ReasoningProfile, request)
 	body := geminiGenerateContentRequest{
 		Contents: contents,
 		GenerationConfig: geminiGenerationConfig{
-			Temperature: request.Temperature,
+			Temperature:    request.Temperature,
+			ThinkingConfig: geminiThinkingConfigFor(reasoning),
 		},
 		Tools: geminiToolsFromProtocol(request.Tools),
 	}
@@ -174,7 +179,7 @@ func (p GeminiProvider) Complete(ctx context.Context, request ChatRequest) (Comp
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "systemInstruction", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("contents", "generationConfig", "systemInstruction", "tools"))
 	if err != nil {
 		return CompletionResult{}, err
 	}
@@ -238,16 +243,19 @@ func geminiContentsFromProtocol(messages []Message) (string, []geminiContent) {
 				systemParts = append(systemParts, content)
 			}
 		case "assistant":
-			parts := make([]geminiPart, 0, len(message.ToolCalls)+1)
-			if content != "" {
-				parts = append(parts, geminiPart{Text: content})
-			}
-			for _, call := range message.ToolCalls {
-				parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{
-					ID:   call.ID,
-					Name: call.Function.Name,
-					Args: rawJSONObjectMap(call.Function.Arguments),
-				}})
+			parts := geminiContinuationParts(message.Continuation)
+			if len(parts) == 0 {
+				parts = make([]geminiPart, 0, len(message.ToolCalls)+1)
+				if content != "" {
+					parts = append(parts, geminiPart{Text: content})
+				}
+				for _, call := range message.ToolCalls {
+					parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{
+						ID:   call.ID,
+						Name: call.Function.Name,
+						Args: rawJSONObjectMap(call.Function.Arguments),
+					}})
+				}
 			}
 			if len(parts) > 0 {
 				contents = append(contents, geminiContent{Role: "model", Parts: parts})
@@ -301,6 +309,13 @@ func geminiToolsFromProtocol(tools []ToolDefinition) []geminiTool {
 	return []geminiTool{{FunctionDeclarations: declarations}}
 }
 
+func geminiThinkingConfigFor(reasoning ReasoningOptions) *geminiThinkingConfig {
+	if strings.TrimSpace(reasoning.ThinkingLevel) == "" {
+		return nil
+	}
+	return &geminiThinkingConfig{ThinkingLevel: reasoning.ThinkingLevel}
+}
+
 func rawJSONObjectMap(raw json.RawMessage) map[string]any {
 	object := map[string]any{}
 	_ = json.Unmarshal(normalizedJSONObject(raw), &object)
@@ -322,6 +337,8 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	toolIndex := 0
+	continuationParts := make([]geminiPart, 0, 8)
+	hasToolCall := false
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -345,10 +362,16 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 		}
 		for _, candidate := range chunk.Candidates {
 			for _, part := range candidate.Content.Parts {
+				continuationParts = append(continuationParts, part)
 				if part.Text != "" {
-					events <- StreamEvent{Type: "delta", Delta: part.Text}
+					if part.Thought {
+						events <- StreamEvent{Type: "reasoning", Delta: part.Text}
+					} else {
+						events <- StreamEvent{Type: "delta", Delta: part.Text}
+					}
 				}
 				if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.Name) != "" {
+					hasToolCall = true
 					id := strings.TrimSpace(part.FunctionCall.ID)
 					if id == "" {
 						id = fmt.Sprintf("gemini-tool-%d", toolIndex)
@@ -373,6 +396,11 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 	if err := scanner.Err(); err != nil {
 		events <- StreamEvent{Type: "error", Error: "读取 Gemini 流式响应失败: " + err.Error()}
 		return
+	}
+	if hasToolCall {
+		if continuation := geminiContinuation(continuationParts); continuation != nil {
+			events <- StreamEvent{Type: "continuation", Continuation: continuation}
+		}
 	}
 	events <- StreamEvent{Type: "done"}
 }
@@ -430,7 +458,12 @@ type geminiGenerateContentRequest struct {
 }
 
 type geminiGenerationConfig struct {
-	Temperature float64 `json:"temperature,omitempty"`
+	Temperature    float64               `json:"temperature,omitempty"`
+	ThinkingConfig *geminiThinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+type geminiThinkingConfig struct {
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 }
 
 type geminiContent struct {
@@ -440,6 +473,8 @@ type geminiContent struct {
 
 type geminiPart struct {
 	Text             string                  `json:"text,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 	FunctionCall     *geminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *geminiFunctionResponse `json:"functionResponse,omitempty"`
 	InlineData       *geminiInlineData       `json:"inlineData,omitempty"`
@@ -493,9 +528,14 @@ func geminiCompletionFromCandidates(candidates []geminiCandidate) CompletionResu
 		return result
 	}
 	var content strings.Builder
+	var reasoning strings.Builder
 	for index, part := range candidates[0].Content.Parts {
 		if part.Text != "" {
-			content.WriteString(part.Text)
+			if part.Thought {
+				reasoning.WriteString(part.Text)
+			} else {
+				content.WriteString(part.Text)
+			}
 		}
 		if part.FunctionCall != nil && strings.TrimSpace(part.FunctionCall.Name) != "" {
 			id := strings.TrimSpace(part.FunctionCall.ID)
@@ -514,7 +554,43 @@ func geminiCompletionFromCandidates(candidates []geminiCandidate) CompletionResu
 		}
 	}
 	result.Content = content.String()
+	result.Reasoning = reasoning.String()
+	if len(result.ToolCalls) > 0 {
+		result.Continuation = geminiContinuation(candidates[0].Content.Parts)
+	}
 	return result
+}
+
+func geminiContinuation(parts []geminiPart) *ProviderContinuation {
+	if len(parts) == 0 {
+		return nil
+	}
+	needed := false
+	for _, part := range parts {
+		if part.Thought || strings.TrimSpace(part.ThoughtSignature) != "" {
+			needed = true
+			break
+		}
+	}
+	if !needed {
+		return nil
+	}
+	encoded, err := json.Marshal(parts)
+	if err != nil {
+		return nil
+	}
+	return &ProviderContinuation{Protocol: "gemini", Data: encoded}
+}
+
+func geminiContinuationParts(continuation *ProviderContinuation) []geminiPart {
+	if continuation == nil || continuation.Protocol != "gemini" || len(continuation.Data) == 0 {
+		return nil
+	}
+	var parts []geminiPart
+	if json.Unmarshal(continuation.Data, &parts) != nil {
+		return nil
+	}
+	return parts
 }
 
 type geminiUsageMetadata struct {

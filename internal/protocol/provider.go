@@ -17,6 +17,7 @@ type ChatRequest struct {
 	Model           string            `json:"model"`
 	Messages        []Message         `json:"messages"`
 	Temperature     float64           `json:"temperature"`
+	ReasoningLevel  string            `json:"-"`
 	ThinkingMode    string            `json:"thinkingMode,omitempty"`
 	ReasoningEffort string            `json:"reasoningEffort,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
@@ -28,9 +29,11 @@ type ChatRequest struct {
 }
 
 type Message struct {
-	Role        string       `json:"role"`
-	Content     string       `json:"content"`
-	Attachments []Attachment `json:"-"`
+	Role             string                `json:"role"`
+	Content          string                `json:"content"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	Attachments      []Attachment          `json:"-"`
+	Continuation     *ProviderContinuation `json:"-"`
 	// 以下字段用于 function-calling 多轮：
 	// assistant 轮携带 ToolCalls；tool 轮携带 ToolCallID + Name + Content(结果)。
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
@@ -80,10 +83,18 @@ type ToolCallFunction struct {
 
 // CompletionResult 是一次非流式补全结果：要么带文本，要么带工具调用。
 type CompletionResult struct {
-	Content   string
-	Reasoning string
-	ToolCalls []ToolCall
-	Usage     *TokenUsage
+	Content      string
+	Reasoning    string
+	ToolCalls    []ToolCall
+	Usage        *TokenUsage
+	Continuation *ProviderContinuation
+}
+
+// ProviderContinuation carries opaque, signed reasoning state between tool
+// sub-turns. Each provider only reads continuations matching its own protocol.
+type ProviderContinuation struct {
+	Protocol string
+	Data     json.RawMessage
 }
 
 type TokenUsage struct {
@@ -95,12 +106,13 @@ type TokenUsage struct {
 }
 
 type StreamEvent struct {
-	Type         string      `json:"type"`
-	Delta        string      `json:"delta,omitempty"`
-	Error        string      `json:"error,omitempty"`
-	Usage        *TokenUsage `json:"usage,omitempty"`
-	ToolCalls    []ToolCall  `json:"toolCalls,omitempty"`
-	FinishReason string      `json:"finishReason,omitempty"`
+	Type         string                `json:"type"`
+	Delta        string                `json:"delta,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	Usage        *TokenUsage           `json:"usage,omitempty"`
+	ToolCalls    []ToolCall            `json:"toolCalls,omitempty"`
+	FinishReason string                `json:"finishReason,omitempty"`
+	Continuation *ProviderContinuation `json:"-"`
 }
 
 type Provider interface {

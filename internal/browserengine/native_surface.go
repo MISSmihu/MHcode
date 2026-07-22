@@ -26,6 +26,25 @@ type nativeBrowserSurface interface {
 	Close()
 }
 
+// embeddedNativeBrowserSurface hosts WebView2 controllers directly inside the
+// MHcode window. The CDP endpoint is private and only used by the agent so the
+// visible page and the page being inspected are always the same target.
+type embeddedNativeBrowserSurface interface {
+	nativeBrowserSurface
+	Start(options embeddedBrowserOptions) (string, error)
+	CreateTab(tabID, markerURL string) error
+	ActivateTab(tabID string) error
+	CloseTab(tabID string)
+}
+
+type embeddedBrowserOptions struct {
+	ProfileDir             string
+	AdditionalBrowserArgs  []string
+	DeveloperToolsEnabled  bool
+	PasswordManagerEnabled bool
+	AutofillContactEnabled bool
+}
+
 func validateNativeSurfaceBounds(bounds NativeSurfaceBounds) error {
 	if bounds.Width < 1 || bounds.Height < 1 {
 		return fmt.Errorf("浏览器显示区域尺寸无效")

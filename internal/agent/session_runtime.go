@@ -16,6 +16,10 @@ import (
 func (s *Service) ActiveSessionIDs() (projectID, sessionID string) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
+	return s.activeSessionIDsLocked()
+}
+
+func (s *Service) activeSessionIDsLocked() (projectID, sessionID string) {
 	if s.projectID != "" && s.sessionID != "" {
 		return s.projectID, s.sessionID
 	}
@@ -33,9 +37,17 @@ func (s *Service) ActiveSessionIDs() (projectID, sessionID string) {
 // The application-level active session is deliberately not changed. This is
 // what allows a user to switch conversations while another task is streaming.
 func (s *Service) NewSessionRuntime(sessionID string) (*Service, error) {
+	return s.NewProjectSessionRuntime("", sessionID)
+}
+
+// NewProjectSessionRuntime creates a runtime for an exact project/session pair.
+// A blank project ID is retained only for legacy callers and must resolve to a
+// globally unambiguous session ID.
+func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Service, error) {
+	projectID = strings.TrimSpace(projectID)
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		_, sessionID = s.ActiveSessionIDs()
+		projectID, sessionID = s.ActiveSessionIDs()
 	}
 
 	s.stateMu.RLock()
@@ -54,6 +66,7 @@ func (s *Service) NewSessionRuntime(sessionID string) (*Service, error) {
 	baseMessages := cloneProtocolMessages(s.sessionMessages)
 	baseSessionState := s.sessionState
 	teamState := cloneTeamState(s.teamState)
+	teamResume := cloneTeamRunCheckpoint(s.teamResume)
 	snapshot := cloneWorkbenchState(s.stateSnapshot)
 	var notify func(ApprovalRequest)
 	if s.approvals != nil {
@@ -79,18 +92,25 @@ func (s *Service) NewSessionRuntime(sessionID string) (*Service, error) {
 			providerFactory: providerFactory,
 			approvals:       newApprovalBroker(),
 			sessionID:       sessionID,
+			projectID:       projectID,
 			sessionMessages: baseMessages,
 			sessionState:    baseSessionState,
 		}
 		runtime.approvals.SetNotify(notify)
 		runtime.teamState = teamState
+		runtime.teamResume = teamResume
 		runtime.stateSnapshot = snapshot
 		return runtime, nil
 	}
 
-	projectID, _, ok := projects.FindSession(sessionID)
-	if !ok {
-		return nil, fmt.Errorf("会话不存在: %s", sessionID)
+	if projectID == "" {
+		var ok bool
+		projectID, _, ok = projects.FindSession(sessionID)
+		if !ok {
+			return nil, fmt.Errorf("会话不存在或 ID 不唯一: %s", sessionID)
+		}
+	} else if _, ok := projects.ProjectSession(projectID, sessionID); !ok {
+		return nil, fmt.Errorf("项目 %s 中不存在会话: %s", projectID, sessionID)
 	}
 	workspace, ok := projects.Project(projectID)
 	if !ok {
@@ -134,6 +154,24 @@ func (s *Service) NewSessionRuntime(sessionID string) (*Service, error) {
 	return runtime, nil
 }
 
+// ReloadProjectSessionIfActive adopts events written by a detached task
+// runtime without changing the user's current project/session selection.
+func (s *Service) ReloadProjectSessionIfActive(projectID, sessionID string) (WorkbenchState, bool, error) {
+	release, err := s.beginActivity("reloading a completed conversation")
+	if err != nil {
+		return s.WorkbenchState(), false, err
+	}
+	defer release()
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	activeProjectID, activeSessionID := s.activeSessionIDsLocked()
+	if projectID != activeProjectID || sessionID != activeSessionID {
+		return s.workbenchStateLocked(), false, nil
+	}
+	s.activateCurrent()
+	return s.workbenchStateLocked(), true, nil
+}
+
 func cloneRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	encoded, err := json.Marshal(settings)
 	if err != nil {
@@ -154,15 +192,28 @@ func cloneDeepSeekState(state DeepSeekState) DeepSeekState {
 // sessionProject is intentionally small and detached; it is useful to callers
 // that need to validate a task target without changing the active session.
 func (s *Service) sessionProject(sessionID string) (projectID string, session project.Session, err error) {
+	return s.projectSession("", sessionID)
+}
+
+func (s *Service) projectSession(projectID, sessionID string) (resolvedProjectID string, session project.Session, err error) {
 	s.stateMu.RLock()
 	projects := s.projects
 	s.stateMu.RUnlock()
 	if projects == nil {
 		return "", project.Session{}, fmt.Errorf("会话运行时不可用")
 	}
-	projectID, session, ok := projects.FindSession(sessionID)
-	if !ok {
-		return "", project.Session{}, fmt.Errorf("会话不存在: %s", sessionID)
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	if projectID != "" {
+		session, ok := projects.ProjectSession(projectID, sessionID)
+		if !ok {
+			return "", project.Session{}, fmt.Errorf("项目 %s 中不存在会话: %s", projectID, sessionID)
+		}
+		return projectID, session, nil
 	}
-	return projectID, session, nil
+	resolvedProjectID, session, ok := projects.FindSession(sessionID)
+	if !ok {
+		return "", project.Session{}, fmt.Errorf("会话不存在或 ID 不唯一: %s", sessionID)
+	}
+	return resolvedProjectID, session, nil
 }

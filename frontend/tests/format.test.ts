@@ -5,17 +5,24 @@ import { errorMessage } from "../src/lib/errors";
 import { reasoningOptions } from "../src/state/reasoning";
 import { inferModelContextWindow } from "../src/model-context";
 import { defaultTeamSettings } from "../src/team-config";
+import { formatElapsedDuration } from "../src/lib/duration";
 
 describe("frontend fallback state", () => {
+  test("formats durable task timings", () => {
+    expect(formatElapsedDuration(12_450)).toBe("12s");
+    expect(formatElapsedDuration(765_000)).toBe("12m 45s");
+    expect(formatElapsedDuration(3_661_000)).toBe("1h 1m 1s");
+  });
   test("keeps reasoning budgets explicit", () => {
-    expect(reasoningOptions.find((item) => item.id === "ultra")?.budget.planner).toBe(true);
+    expect(reasoningOptions.find((item) => item.id === "max")?.budget.planner).toBe(true);
     expect(reasoningOptions.find((item) => item.id === "low")?.budget.maxToolCalls).toBe(3);
   });
 
   test("renders code and escapes raw HTML", () => {
     const html = renderMarkdown("<script>alert(1)</script>\n\n```ts\nconst x = 1;\n```");
     expect(html).not.toContain("<script>alert(1)</script>");
-    expect(html).toContain("code-block");
+    expect(html).toContain('<details class="code-block"');
+    expect(html).not.toContain('<details class="code-block" open');
     expect(html).toContain("hljs-keyword");
   });
 

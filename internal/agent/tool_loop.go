@@ -99,7 +99,7 @@ func (s *Service) runToolLoopTurn(
 				answer := "已生成执行计划，但你选择不执行。\n\n" + plan
 				s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
 				s.sessionState.MessageCount = len(s.sessionMessages)
-				s.recordAssistantAndCheckpoint(answer, route.ModelID, []tools.ResultPart{{Kind: tools.PartText, Text: plan}})
+				s.recordAssistantAndCheckpoint(answer, route.ModelID, []tools.ResultPart{{Kind: tools.PartText, Text: plan}}, chatTurnDurationMs(ctx))
 				s.markChatProviderStatus(route.Provider.ID, "ok", "计划已生成，等待下一步。")
 				return ChatResult{
 					Content: answer,
@@ -161,7 +161,7 @@ func (s *Service) runToolLoopTurn(
 				)
 				s.sessionState.MessageCount = len(s.sessionMessages)
 				s.sessionState.TurnCount++
-				s.recordAssistantAndCheckpoint(partialContent, route.ModelID, partialParts)
+				s.recordAssistantAndCheckpoint(partialContent, route.ModelID, partialParts, chatTurnDurationMs(ctx))
 			}
 		}
 		result := ChatResult{
@@ -195,7 +195,7 @@ func (s *Service) runToolLoopTurn(
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
 	// 文件快照已在每次工具写入后立即记录，这里只提交 assistant + checkpoint。
-	s.recordAssistantAndCheckpoint(answer, route.ModelID, outcome.Parts)
+	s.recordAssistantAndCheckpoint(answer, route.ModelID, outcome.Parts, chatTurnDurationMs(ctx))
 	s.markChatProviderStatus(route.Provider.ID, "ok", fmt.Sprintf("试聊成功，%s / %s 工具会话完成，产出 %d 个片段。", route.Provider.Name, route.ModelID, len(outcome.Parts)))
 
 	return ChatResult{
@@ -940,9 +940,11 @@ func (s *Service) runToolLoopWithCompletion(
 
 		// 记录 assistant 的工具调用轮（回喂需要）。
 		messages = append(messages, protocol.Message{
-			Role:      "assistant",
-			Content:   completion.Content,
-			ToolCalls: completion.ToolCalls,
+			Role:             "assistant",
+			Content:          completion.Content,
+			ReasoningContent: completion.Reasoning,
+			ToolCalls:        completion.ToolCalls,
+			Continuation:     completion.Continuation,
 		})
 		if strings.TrimSpace(completion.Content) != "" {
 			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: completion.Content})
@@ -1171,8 +1173,13 @@ func emitOutcomeProgress(sink ChatEventSink, parts []tools.ResultPart) {
 }
 
 // executeToolCall 执行单个工具调用，返回结构化结果与回喂给模型的 tool 消息。
-func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call protocol.ToolCall) (tools.Result, protocol.Message) {
+func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call protocol.ToolCall) (result tools.Result, message protocol.Message) {
 	name := call.Function.Name
+	normalizedArgs := normalizeToolArgs(call.Function.Arguments)
+	startedAt := time.Now()
+	defer func() {
+		result = ensureToolExecutionMetadata(result, name, normalizedArgs, startedAt, time.Now())
+	}()
 	tool, ok := reg.Get(name)
 	if !ok {
 		summary := fmt.Sprintf("未知工具: %s", name)
@@ -1188,7 +1195,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 			}
 	}
 
-	result, err := s.runToolWithApproval(ctx, tool, name, normalizeToolArgs(call.Function.Arguments))
+	result, err := s.runToolWithApproval(ctx, tool, name, normalizedArgs)
 	if err != nil {
 		summary := fmt.Sprintf("工具 %s 执行出错: %v", name, err)
 		return tools.Result{
@@ -1204,7 +1211,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	}
 	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy)
 
-	result = ensureToolErrorPart(result, name, normalizeToolArgs(call.Function.Arguments))
+	result = ensureToolErrorPart(result, name, normalizedArgs)
 	if !result.IsError {
 		for _, change := range result.Changes {
 			if snapshotErr := s.recordFileSnapshot(change); snapshotErr != nil {
@@ -1216,7 +1223,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 					summary += "；已自动恢复写入前状态"
 				}
 				result = tools.Result{Summary: summary, IsError: true}
-				result = ensureToolErrorPart(result, name, normalizeToolArgs(call.Function.Arguments))
+				result = ensureToolErrorPart(result, name, normalizedArgs)
 				break
 			}
 			s.turnChanges = append(s.turnChanges, change)
@@ -1241,6 +1248,58 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 		Content:     feedback,
 		Attachments: protocolToolAttachments(result.Attachments),
 	}
+}
+
+func ensureToolExecutionMetadata(result tools.Result, name string, rawArgs json.RawMessage, startedAt, completedAt time.Time) tools.Result {
+	status := "ok"
+	if result.IsError {
+		status = "error"
+	}
+	input := toolInputForDisplay(name, rawArgs)
+	durationMs := completedAt.Sub(startedAt).Milliseconds()
+	if durationMs < 1 {
+		durationMs = 1
+	}
+	found := false
+	for index := range result.Parts {
+		part := &result.Parts[index]
+		if part.Kind != tools.PartToolCall {
+			continue
+		}
+		found = true
+		if part.Name == "" {
+			part.Name = name
+		}
+		if part.Status == "" {
+			part.Status = status
+		}
+		if part.Input == "" {
+			part.Input = input
+		}
+		if part.StartedAt == "" {
+			part.StartedAt = startedAt.Format(time.RFC3339Nano)
+		}
+		if part.CompletedAt == "" {
+			part.CompletedAt = completedAt.Format(time.RFC3339Nano)
+		}
+		if part.DurationMs <= 0 {
+			part.DurationMs = durationMs
+		}
+	}
+	if found {
+		return result
+	}
+	result.Parts = append([]tools.ResultPart{{
+		Kind:        tools.PartToolCall,
+		Name:        name,
+		Status:      status,
+		Input:       input,
+		Output:      result.Summary,
+		StartedAt:   startedAt.Format(time.RFC3339Nano),
+		CompletedAt: completedAt.Format(time.RFC3339Nano),
+		DurationMs:  durationMs,
+	}}, result.Parts...)
+	return result
 }
 
 func protocolToolAttachments(attachments []tools.Attachment) []protocol.Attachment {

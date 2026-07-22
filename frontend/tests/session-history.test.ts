@@ -34,10 +34,11 @@ describe("session history reconciliation", () => {
         role: "unexpected-role",
         content: "persisted reply",
         createdAt: "2026-07-19T01:00:01.000Z",
+        durationMs: 12_450,
       },
     ], true)).toMatchObject([
       { id: "event-1", eventId: "event-1", role: "user", content: "persisted turn" },
-      { id: "event-2", eventId: "event-2", role: "assistant", content: "persisted reply" },
+      { id: "event-2", eventId: "event-2", role: "assistant", content: "persisted reply", durationMs: 12_450 },
     ]);
   });
 });

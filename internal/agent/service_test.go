@@ -572,8 +572,8 @@ func TestServiceMapsReasoningToDeepSeekThinking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if medium.State.DeepSeekSession.ThinkingMode != "disabled" || medium.State.DeepSeekSession.ReasoningEffort != "" {
-		t.Fatalf("medium session thinking = %#v, want disabled", medium.State.DeepSeekSession)
+	if medium.State.DeepSeekSession.ThinkingMode != "enabled" || medium.State.DeepSeekSession.ReasoningEffort != "high" {
+		t.Fatalf("medium session thinking = %#v, want enabled/high", medium.State.DeepSeekSession)
 	}
 
 	mu.Lock()
@@ -584,8 +584,8 @@ func TestServiceMapsReasoningToDeepSeekThinking(t *testing.T) {
 	if payloads[0].Model != "deepseek-v4-pro" || payloads[0].Thinking == nil || payloads[0].Thinking.Type != "enabled" || payloads[0].ReasoningEffort != "max" {
 		t.Fatalf("ultra payload = %#v, want v4-pro enabled/max", payloads[0])
 	}
-	if payloads[1].Model != "deepseek-v4-flash" || payloads[1].Thinking == nil || payloads[1].Thinking.Type != "disabled" || payloads[1].ReasoningEffort != "" {
-		t.Fatalf("medium payload = %#v, want v4-flash disabled", payloads[1])
+	if payloads[1].Model != "deepseek-v4-flash" || payloads[1].Thinking == nil || payloads[1].Thinking.Type != "enabled" || payloads[1].ReasoningEffort != "high" {
+		t.Fatalf("medium payload = %#v, want v4-flash enabled/high", payloads[1])
 	}
 }
 
@@ -862,6 +862,75 @@ func TestSendChatMessageWithEventsEmitsDeltas(t *testing.T) {
 	}
 	if strings.Join(deltas, "") != result.Content || len(deltas) != 2 {
 		t.Fatalf("deltas = %#v, result = %q", deltas, result.Content)
+	}
+}
+
+func TestConfiguredRelayCarriesSelectedGPT56ReasoningToResponsesPayload(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %q, want /responses", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, `{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`)
+	}))
+	defer server.Close()
+
+	secrets := vault.NewMemoryVault()
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: t.TempDir() + "/settings.json", Vault: secrets})
+	settings := DefaultRuntimeSettings()
+	settings.Model.SelectedProviderID = "relay"
+	settings.Model.SelectedModelID = "gpt-5.6-sol"
+	settings.Model.Providers = []ModelProviderSetting{{
+		ID:                 "relay",
+		Name:               "Relay",
+		Protocol:           "local",
+		APIType:            "responses",
+		BaseURL:            server.URL,
+		Enabled:            true,
+		ReasoningProfile:   "auto",
+		DefaultModelID:     "gpt-5.6-sol",
+		Models:             []ProviderModel{{ID: "gpt-5.6-sol", DisplayName: "GPT-5.6 Sol", Provider: "relay"}},
+		SupportsModelFetch: true,
+	}}
+	if _, err := service.SaveRuntimeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SaveModelProviderAPIKey("relay", "sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := service.SetReasoningLevel(ReasoningMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.ReasoningOptions) != 6 || state.Reasoning.ID != ReasoningMax {
+		t.Fatalf("dynamic reasoning state = %#v / %#v", state.Reasoning, state.ReasoningOptions)
+	}
+	route, err := service.selectChatRoute()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := service.chatProviderForRoute(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, ok := provider.(protocol.ToolCaller)
+	if !ok {
+		t.Fatal("configured Responses provider does not implement ToolCaller")
+	}
+	_, err = caller.Complete(context.Background(), protocol.ChatRequest{
+		Model:          route.ModelID,
+		ReasoningLevel: string(service.reasoning),
+		Messages:       []protocol.Message{{Role: "user", Content: "ping"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasoning, ok := payload["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "max" {
+		t.Fatalf("reasoning payload = %#v, want effort=max", payload["reasoning"])
 	}
 }
 

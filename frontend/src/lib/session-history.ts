@@ -20,6 +20,7 @@ export function reconcileSessionMessages(
     parts: message.parts,
     attachments: message.attachments,
     createdAt: message.createdAt || new Date(fallbackTimestamp).toISOString(),
+    durationMs: message.durationMs,
   }));
 }
 

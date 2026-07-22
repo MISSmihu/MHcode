@@ -99,3 +99,16 @@ func TestRuntimeSettingsNormalizesTeamRoutesAndRequiredRoles(t *testing.T) {
 		t.Fatal("synthesizer must remain enabled")
 	}
 }
+
+func TestNormalizeModelReasoningProfiles(t *testing.T) {
+	settings := DefaultRuntimeSettings()
+	settings.Model.Providers = []ModelProviderSetting{
+		{ID: "proxy", Protocol: "openai-compatible", ReasoningProfile: "openai-effort"},
+		{ID: "native-anthropic", Protocol: "anthropic-compatible", ReasoningProfile: "anthropic"},
+		{ID: "invalid", Protocol: "gemini", ReasoningProfile: "xai"},
+	}
+	providers := settings.Normalized().Model.Providers
+	if providers[0].ReasoningProfile != "openai-effort" || providers[1].ReasoningProfile != "anthropic" || providers[2].ReasoningProfile != "auto" {
+		t.Fatalf("reasoning profiles = %#v", providers)
+	}
+}

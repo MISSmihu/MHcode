@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, WorkbenchState, WorkspaceFilePreview } from "../types";
+import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -14,6 +14,8 @@ type WailsAppBinding = {
   StartChatMessageWithAttachments?: (prompt: string, attachments: ChatAttachment[]) => Promise<string>;
   StartChatMessageForSession?: (sessionID: string, prompt: string) => Promise<string>;
   StartChatMessageForSessionWithAttachments?: (sessionID: string, prompt: string, attachments: ChatAttachment[]) => Promise<string>;
+  StartChatMessageForProjectSession?: (projectID: string, sessionID: string, prompt: string) => Promise<string>;
+  StartChatMessageForProjectSessionWithAttachments?: (projectID: string, sessionID: string, prompt: string, attachments: ChatAttachment[]) => Promise<string>;
   GuideChatMessage?: (taskID: string, guidanceID: string, prompt: string) => Promise<boolean>;
   GuideChatMessageWithAttachments?: (taskID: string, guidanceID: string, prompt: string, attachments: ChatAttachment[]) => Promise<boolean>;
   StopChatMessage?: (taskID: string) => Promise<boolean>;
@@ -21,6 +23,21 @@ type WailsAppBinding = {
   GetActiveChatTasks?: () => Promise<ChatTaskState[]>;
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
+  GetAppInfo?: () => Promise<AppInfo>;
+  GetUpdateState?: () => Promise<UpdateState>;
+  CheckForUpdates?: () => Promise<UpdateState>;
+  DownloadUpdate?: () => Promise<UpdateState>;
+  InstallUpdate?: () => Promise<UpdateState>;
+  OpenUpdateReleasePage?: () => Promise<void>;
+  OpenAppRepositoryPage?: () => Promise<void>;
+  RevealAppExecutable?: () => Promise<void>;
+  RevealAppConfigFile?: () => Promise<void>;
+  GetAutomationState?: () => Promise<AutomationState>;
+  SaveAutomationTask?: (task: AutomationTask) => Promise<AutomationState>;
+  DeleteAutomationTask?: (taskID: string) => Promise<AutomationState>;
+  SetAutomationTaskEnabled?: (taskID: string, enabled: boolean) => Promise<AutomationState>;
+  RunAutomationTaskNow?: (taskID: string) => Promise<AutomationState>;
+  StopAutomationTask?: (taskID: string) => Promise<AutomationState>;
   SaveModelProviderAPIKey: (providerID: string, apiKey: string) => Promise<WorkbenchState>;
   ClearModelProviderAPIKey: (providerID: string) => Promise<WorkbenchState>;
   DeleteModelProvider?: (providerID: string) => Promise<WorkbenchState>;
@@ -31,6 +48,7 @@ type WailsAppBinding = {
   ListBranches?: () => Promise<BranchInfo[]>;
   SwitchBranch?: (leafID: string) => Promise<WorkbenchState>;
   ForkFromMessage?: (messageEventID: string) => Promise<WorkbenchState>;
+  ForkFromMessageForProjectSession?: (projectID: string, sessionID: string, messageEventID: string) => Promise<WorkbenchState>;
   RespondApproval?: (id: string, tool: string, approved: boolean, scope: string) => Promise<void>;
   SetPlanMode?: (enabled: boolean) => Promise<WorkbenchState>;
   ListProjects?: () => Promise<ProjectInfo[]>;
@@ -38,6 +56,7 @@ type WailsAppBinding = {
   GetProjectTree?: () => Promise<ProjectNode[]>;
   GetSessionMessages?: () => Promise<SessionMessage[]>;
   GetSessionMessagesForSession?: (sessionID: string) => Promise<SessionMessage[]>;
+  GetSessionMessagesForProjectSession?: (projectID: string, sessionID: string) => Promise<SessionMessage[]>;
   CreateProject?: (name: string, workspaceRoot: string) => Promise<WorkbenchState>;
   SwitchProject?: (projectID: string) => Promise<WorkbenchState>;
   SetProjectPinned?: (projectID: string, pinned: boolean) => Promise<WorkbenchState>;
@@ -48,12 +67,18 @@ type WailsAppBinding = {
   CreatePermanentWorktree?: (projectID: string, branchName: string, destination: string) => Promise<WorkbenchState>;
   NewSession?: () => Promise<WorkbenchState>;
   SwitchSession?: (sessionID: string) => Promise<WorkbenchState>;
+  SwitchProjectSession?: (projectID: string, sessionID: string) => Promise<WorkbenchState>;
+  RenameSession?: (sessionID: string, title: string) => Promise<WorkbenchState>;
+  RenameProjectSession?: (projectID: string, sessionID: string, title: string) => Promise<WorkbenchState>;
   ArchiveSession?: (sessionID: string, archived: boolean) => Promise<WorkbenchState>;
+  ArchiveProjectSession?: (projectID: string, sessionID: string, archived: boolean) => Promise<WorkbenchState>;
   DeleteSession?: (sessionID: string) => Promise<WorkbenchState>;
+  DeleteProjectSession?: (projectID: string, sessionID: string) => Promise<WorkbenchState>;
   SelectDirectory?: () => Promise<string>;
   SelectWorktreeParentDirectory?: () => Promise<string>;
   OpenWorkspaceFile?: (path: string) => Promise<void>;
   ReadWorkspaceFile?: (path: string) => Promise<WorkspaceFilePreview>;
+  ListWorkspaceDirectory?: (path: string) => Promise<WorkspaceDirectoryListing>;
   PreviewWorkspaceFile?: (path: string) => Promise<BrowserPreview>;
   RevealWorkspaceFile?: (path: string) => Promise<void>;
   GetBrowserState?: () => Promise<BrowserState>;
@@ -343,11 +368,17 @@ export async function sendDeepSeekMessage(prompt: string): Promise<ChatResult> {
 }
 
 export async function startChatMessage(prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
-	return startChatMessageForSession("", prompt, attachments);
+	return startChatMessageForSession("", "", prompt, attachments);
 }
 
-export async function startChatMessageForSession(sessionID: string, prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
+export async function startChatMessageForSession(projectID: string, sessionID: string, prompt: string, attachments: ChatAttachment[] = []): Promise<string> {
   const binding = wailsBinding();
+  if (binding?.StartChatMessageForProjectSessionWithAttachments) {
+    return binding.StartChatMessageForProjectSessionWithAttachments(projectID, sessionID, prompt, attachments);
+  }
+  if (binding?.StartChatMessageForProjectSession && attachments.length === 0) {
+    return binding.StartChatMessageForProjectSession(projectID, sessionID, prompt);
+  }
   if (binding?.StartChatMessageForSessionWithAttachments) {
     return binding.StartChatMessageForSessionWithAttachments(sessionID, prompt, attachments);
   }
@@ -451,6 +482,138 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
   const runtime = (window as WailsWindow).runtime;
   if (runtime?.EventsOn) {
     return runtime.EventsOn("mcp:state", (data) => handler(data as WorkbenchState));
+  }
+  return () => undefined;
+}
+
+const fallbackAppInfo: AppInfo = {
+  name: "MHcode",
+  version: "0.3.0",
+  goVersion: "浏览器预览",
+  operatingSystem: "web",
+  architecture: "preview",
+  executablePath: "",
+  configPath: "",
+  repositoryUrl: "https://github.com/MISSmihu/MHcode",
+};
+
+const fallbackUpdateState: UpdateState = {
+  currentVersion: fallbackAppInfo.version,
+  updateAvailable: false,
+  status: "idle",
+  message: "请在 MHcode 桌面应用中检查更新。",
+  progress: 0,
+  downloadedBytes: 0,
+  totalBytes: 0,
+  checksumVerified: false,
+};
+
+export async function getAppInfo(): Promise<AppInfo> {
+  const binding = wailsBinding();
+  return binding?.GetAppInfo ? binding.GetAppInfo() : { ...fallbackAppInfo };
+}
+
+export async function getUpdateState(): Promise<UpdateState> {
+  const binding = wailsBinding();
+  return binding?.GetUpdateState ? binding.GetUpdateState() : { ...fallbackUpdateState };
+}
+
+export async function checkForUpdates(): Promise<UpdateState> {
+  const binding = wailsBinding();
+  return binding?.CheckForUpdates ? binding.CheckForUpdates() : { ...fallbackUpdateState };
+}
+
+export async function downloadUpdate(): Promise<UpdateState> {
+  const binding = wailsBinding();
+  if (!binding?.DownloadUpdate) throw new Error("更新下载仅在 MHcode 桌面应用中可用。");
+  return binding.DownloadUpdate();
+}
+
+export async function installUpdate(): Promise<UpdateState> {
+  const binding = wailsBinding();
+  if (!binding?.InstallUpdate) throw new Error("更新安装仅在 MHcode 桌面应用中可用。");
+  return binding.InstallUpdate();
+}
+
+export async function openUpdateReleasePage(): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.OpenUpdateReleasePage) {
+    await binding.OpenUpdateReleasePage();
+    return;
+  }
+  window.open(fallbackAppInfo.repositoryUrl + "/releases", "_blank", "noopener,noreferrer");
+}
+
+export async function openAppRepositoryPage(): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.OpenAppRepositoryPage) {
+    await binding.OpenAppRepositoryPage();
+    return;
+  }
+  window.open(fallbackAppInfo.repositoryUrl, "_blank", "noopener,noreferrer");
+}
+
+export async function revealAppExecutable(): Promise<void> {
+  const binding = wailsBinding();
+  if (!binding?.RevealAppExecutable) throw new Error("程序位置仅在 MHcode 桌面应用中可用。");
+  await binding.RevealAppExecutable();
+}
+
+export async function revealAppConfigFile(): Promise<void> {
+  const binding = wailsBinding();
+  if (!binding?.RevealAppConfigFile) throw new Error("配置位置仅在 MHcode 桌面应用中可用。");
+  await binding.RevealAppConfigFile();
+}
+
+export function onUpdateState(handler: (state: UpdateState) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("update:state", (data) => handler(data as UpdateState));
+  }
+  return () => undefined;
+}
+
+const fallbackAutomationState: AutomationState = { tasks: [], running: false };
+
+export async function getAutomationState(): Promise<AutomationState> {
+  const binding = wailsBinding();
+  return binding?.GetAutomationState ? binding.GetAutomationState() : { ...fallbackAutomationState, tasks: [] };
+}
+
+export async function saveAutomationTask(task: AutomationTask): Promise<AutomationState> {
+  const binding = wailsBinding();
+  if (!binding?.SaveAutomationTask) throw new Error("自动化任务仅在 MHcode 桌面应用中可用。");
+  return binding.SaveAutomationTask(task);
+}
+
+export async function deleteAutomationTask(taskID: string): Promise<AutomationState> {
+  const binding = wailsBinding();
+  if (!binding?.DeleteAutomationTask) throw new Error("自动化任务仅在 MHcode 桌面应用中可用。");
+  return binding.DeleteAutomationTask(taskID);
+}
+
+export async function setAutomationTaskEnabled(taskID: string, enabled: boolean): Promise<AutomationState> {
+  const binding = wailsBinding();
+  if (!binding?.SetAutomationTaskEnabled) throw new Error("自动化任务仅在 MHcode 桌面应用中可用。");
+  return binding.SetAutomationTaskEnabled(taskID, enabled);
+}
+
+export async function runAutomationTaskNow(taskID: string): Promise<AutomationState> {
+  const binding = wailsBinding();
+  if (!binding?.RunAutomationTaskNow) throw new Error("自动化任务仅在 MHcode 桌面应用中可用。");
+  return binding.RunAutomationTaskNow(taskID);
+}
+
+export async function stopAutomationTask(taskID: string): Promise<AutomationState> {
+  const binding = wailsBinding();
+  if (!binding?.StopAutomationTask) throw new Error("自动化任务仅在 MHcode 桌面应用中可用。");
+  return binding.StopAutomationTask(taskID);
+}
+
+export function onAutomationState(handler: (state: AutomationState) => void): () => void {
+  const runtime = (window as WailsWindow).runtime;
+  if (runtime?.EventsOn) {
+    return runtime.EventsOn("automation:state", (data) => handler(data as AutomationState));
   }
   return () => undefined;
 }
@@ -693,8 +856,11 @@ export async function switchBranch(leafID: string): Promise<WorkbenchState> {
 }
 
 // 从历史消息创建新分支，旧分支仍保留在事件树中。
-export async function forkFromMessage(messageEventID: string): Promise<WorkbenchState> {
+export async function forkFromMessage(messageEventID: string, projectID = "", sessionID = ""): Promise<WorkbenchState> {
   const binding = wailsBinding();
+  if (binding?.ForkFromMessageForProjectSession && projectID && sessionID) {
+    return binding.ForkFromMessageForProjectSession(projectID, sessionID, messageEventID);
+  }
   if (binding?.ForkFromMessage) {
     return binding.ForkFromMessage(messageEventID);
   }
@@ -788,8 +954,11 @@ export async function getSessionMessages(): Promise<SessionMessage[]> {
   return [];
 }
 
-export async function getSessionMessagesForSession(sessionID: string): Promise<SessionMessage[]> {
+export async function getSessionMessagesForSession(projectID: string, sessionID: string): Promise<SessionMessage[]> {
   const binding = wailsBinding();
+  if (binding?.GetSessionMessagesForProjectSession) {
+    return binding.GetSessionMessagesForProjectSession(projectID, sessionID);
+  }
   if (binding?.GetSessionMessagesForSession) {
     return binding.GetSessionMessagesForSession(sessionID);
   }
@@ -873,24 +1042,44 @@ export async function newSession(): Promise<WorkbenchState> {
   return resetDeepSeekSession();
 }
 
-export async function switchSession(sessionID: string): Promise<WorkbenchState> {
+export async function switchSession(projectID: string, sessionID: string): Promise<WorkbenchState> {
   const binding = wailsBinding();
+  if (binding?.SwitchProjectSession) {
+    return binding.SwitchProjectSession(projectID, sessionID);
+  }
   if (binding?.SwitchSession) {
     return binding.SwitchSession(sessionID);
   }
   return cloneState(fallbackState);
 }
 
-export async function archiveSession(sessionID: string, archived: boolean): Promise<WorkbenchState> {
+export async function renameSession(projectID: string, sessionID: string, title: string): Promise<WorkbenchState> {
   const binding = wailsBinding();
+  if (binding?.RenameProjectSession) {
+    return binding.RenameProjectSession(projectID, sessionID, title);
+  }
+  if (binding?.RenameSession) {
+    return binding.RenameSession(sessionID, title);
+  }
+  return cloneState(fallbackState);
+}
+
+export async function archiveSession(projectID: string, sessionID: string, archived: boolean): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.ArchiveProjectSession) {
+    return binding.ArchiveProjectSession(projectID, sessionID, archived);
+  }
   if (binding?.ArchiveSession) {
     return binding.ArchiveSession(sessionID, archived);
   }
   return cloneState(fallbackState);
 }
 
-export async function deleteSession(sessionID: string): Promise<WorkbenchState> {
+export async function deleteSession(projectID: string, sessionID: string): Promise<WorkbenchState> {
   const binding = wailsBinding();
+  if (binding?.DeleteProjectSession) {
+    return binding.DeleteProjectSession(projectID, sessionID);
+  }
   if (binding?.DeleteSession) {
     return binding.DeleteSession(sessionID);
   }
@@ -929,6 +1118,14 @@ export async function readWorkspaceFile(path: string): Promise<WorkspaceFilePrev
     return binding.ReadWorkspaceFile(path);
   }
   throw new Error("文件预览仅在 MHcode 桌面应用中可用。");
+}
+
+export async function listWorkspaceDirectory(path = ""): Promise<WorkspaceDirectoryListing> {
+  const binding = wailsBinding();
+  if (binding?.ListWorkspaceDirectory) {
+    return binding.ListWorkspaceDirectory(path);
+  }
+  return { path, entries: [], truncated: false };
 }
 
 export async function previewWorkspaceFile(path: string): Promise<BrowserPreview> {
@@ -1213,6 +1410,8 @@ export async function openURLInSystemBrowser(url: string): Promise<void> {
 function createFallbackState(level: ReasoningLevel): WorkbenchState {
   const reasoning = reasoningOptions.find((option) => option.id === level) ?? reasoningOptions[0];
   return {
+    activeProjectId: "",
+    activeSessionId: "",
     reasoning,
     reasoningOptions,
     cacheTarget: 0.96,
@@ -1525,6 +1724,11 @@ function defaultRuntimeSettings(): RuntimeSettings {
       ],
     },
     team: defaultTeamSettings(),
+    update: {
+      autoCheck: true,
+      autoDownload: false,
+      channel: "stable",
+    },
     workspace: {
       configured: true,
       dependenciesEnabled: true,
@@ -1562,6 +1766,7 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
       ...settings.team,
       roles: Array.isArray(settings.team?.roles) && settings.team.roles.length > 0 ? settings.team.roles : defaults.team.roles,
     },
+    update: { ...defaults.update, ...settings.update },
     model: {
       ...defaults.model,
       ...settings.model,
@@ -1730,15 +1935,9 @@ function supportsProviderModelFetch(protocol: string) {
 }
 
 function thinkingModeForReasoning(level: ReasoningLevel) {
-  return level === "high" || level === "ultra" ? "enabled" : "disabled";
+  return level === "none" ? "disabled" : "enabled";
 }
 
 function reasoningEffortForReasoning(level: ReasoningLevel) {
-  if (level === "ultra") {
-    return "max";
-  }
-  if (level === "high") {
-    return "high";
-  }
-  return "";
+  return level;
 }

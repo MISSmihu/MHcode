@@ -2,7 +2,9 @@ package main
 
 import (
 	"embed"
+	"os"
 
+	"github.com/MISSmihu/MHcode/internal/appupdate"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -15,6 +17,10 @@ var assets embed.FS
 var bundledSkills embed.FS
 
 func main() {
+	if handled, exitCode := appupdate.HandleCommandLine(os.Args[1:]); handled {
+		os.Exit(exitCode)
+	}
+	appupdate.ScheduleCleanup(os.Args[1:])
 	app := NewApp()
 
 	err := wails.Run(&options.App{

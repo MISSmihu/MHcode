@@ -2,6 +2,7 @@ import { For, Match, Switch, Show, createMemo, createSignal } from "solid-js";
 import {
   AlertCircle,
   Check,
+  ChevronDown,
   ChevronRight,
   Circle,
   Eye,
@@ -16,24 +17,35 @@ import {
   Pencil,
   Search,
   TerminalSquare,
+  Undo2,
   Users,
   Wrench,
 } from "lucide-solid";
 import type { MessagePart, WorkspaceFileView } from "../../types";
 import { renderMarkdown, handleCodeCopyClick } from "../../lib/markdown";
 import { parseWorkspaceFileRangeCandidate, parseWorkspacePathCandidate } from "../../lib/workspace-path";
+import { inlineDiffStats } from "../../lib/inline-diff";
 import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench";
+import { formatElapsedDuration } from "../../lib/duration";
+import { InlineCodePreview } from "./InlineCodePreview";
+import { InlineDiffPreview } from "./InlineDiffPreview";
 
 // 操作流渲染：按片段类型分派。工具/diff 卡片默认折叠，用户按需展开（对标 ZCode/Codex）。
 export function MessageContent(props: {
   parts: MessagePart[];
   inferFileArtifacts?: boolean;
+  hideTeamRun?: boolean;
+  hideFileChangesSummary?: boolean;
+  undoingChanges?: boolean;
+  onUndoChanges?: () => void | Promise<void>;
+  onReviewChanges?: () => void | Promise<void>;
   onPreviewFile?: (path: string) => void | Promise<void>;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
 }) {
   const renderedParts = createMemo(() => withInferredFileArtifacts(props.parts, props.inferFileArtifacts !== false));
   const blocks = createMemo(() => groupRenderBlocks(renderedParts()));
+  const fileChanges = createMemo(() => editedFileSummaries(renderedParts()));
   return (
     <div class="op-stream">
       <For each={blocks()}>
@@ -55,11 +67,22 @@ export function MessageContent(props: {
               />
             </Match>
             <Match when={block.kind === "team"}>
-              <TeamRun parts={(block as TeamRenderBlock).parts} />
+              <Show when={!props.hideTeamRun}>
+                <TeamRun parts={(block as TeamRenderBlock).parts} />
+              </Show>
             </Match>
           </Switch>
         )}
       </For>
+      <Show when={!props.hideFileChangesSummary && fileChanges().length > 0}>
+        <FileChangesSummary
+          files={fileChanges()}
+          undoing={props.undoingChanges}
+          onUndo={props.onUndoChanges}
+          onReview={props.onReviewChanges}
+          onOpenFile={props.onOpenWorkspaceFile}
+        />
+      </Show>
     </div>
   );
 }
@@ -70,7 +93,7 @@ type DiffPart = Extract<MessagePart, { kind: "diff" }>;
 type FilePart = Extract<MessagePart, { kind: "file" }>;
 export type TaskProgressPart = Extract<MessagePart, { kind: "task_progress" }>;
 type WebSearchPart = Extract<MessagePart, { kind: "web_search_results" }>;
-type TeamPart = Extract<MessagePart, { kind: "team_role" }>;
+export type TeamPart = Extract<MessagePart, { kind: "team_role" }>;
 type TextRenderBlock = { kind: "text"; part: TextPart };
 type ActivityRenderBlock = { kind: "activity"; parts: MessagePart[] };
 type TeamRenderBlock = { kind: "team"; parts: TeamPart[] };
@@ -122,7 +145,6 @@ function ActivityRow(props: {
     <details
       class="op-activity-item"
       classList={{ [status()]: true }}
-      open={status() === "error" || props.item.category === "edit" ? true : undefined}
     >
       <summary title={activityTitle(props.item)}>
         <span class="op-activity-icon"><ActivityIcon category={props.item.category} /></span>
@@ -136,9 +158,6 @@ function ActivityRow(props: {
         <ChevronRight class="op-activity-chevron" size={14} aria-hidden="true" />
       </summary>
       <div class="op-activity-body">
-        <Show when={props.item.category === "edit"}>
-          <EditedFilesList parts={props.item.parts} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
-        </Show>
         <For each={props.item.parts}>
           {(part) => (
             <Switch>
@@ -149,7 +168,7 @@ function ActivityRow(props: {
                   onOpenWorkspaceFile={props.onOpenWorkspaceFile}
                 />
               </Match>
-              <Match when={part.kind === "diff" && props.item.category !== "edit"}>
+              <Match when={part.kind === "diff"}>
                 <DiffDetail part={part as DiffPart} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
               </Match>
               <Match when={part.kind === "web_search_results"}>
@@ -184,14 +203,18 @@ function ToolDetail(props: {
   hideOutput?: boolean;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 }) {
+  if (props.part.name === "run_command") {
+    return <ShellToolDetail part={props.part} />;
+  }
   const readReference = createMemo(() => props.part.name === "read_file"
     ? parseWorkspaceFileRangeCandidate(props.part.input ?? "")
     : undefined);
+  const hasCodePreview = () => props.part.status !== "error" && Boolean(props.part.output) && !props.hideOutput;
   return (
     <div class="op-activity-detail">
       <div class="op-activity-detail-head">
         <code>{props.part.name}</code>
-        <span>{toolStatusLabel(props.part.status ?? "ok")}</span>
+        <span>{toolStatusLabel(props.part.status ?? "ok")}{props.part.durationMs !== undefined ? ` · ${formatElapsedDuration(props.part.durationMs)}` : ""}</span>
       </div>
       <Show when={readReference()} fallback={
         <>
@@ -199,26 +222,39 @@ function ToolDetail(props: {
           <Show when={props.part.output && !props.hideOutput}><pre>{props.part.output}</pre></Show>
         </>
       }>
-        <button
-          type="button"
-          class="op-read-file"
-          disabled={!props.onOpenWorkspaceFile}
-          title={`在右侧查看 ${readReference()?.path}`}
-          onClick={() => {
-            const reference = readReference();
-            if (reference) void props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine);
-          }}
-        >
-          <FileCode2 size={15} aria-hidden="true" />
-          <span class="op-read-file-main">
-            <strong>{baseName(readReference()?.path ?? "")}</strong>
-            <small>{readReference()?.path}</small>
-          </span>
-          <Show when={readRangeLabel(readReference())}>
-            <span class="op-read-file-range">{readRangeLabel(readReference())}</span>
-          </Show>
-          <ChevronRight size={13} aria-hidden="true" />
-        </button>
+        <Show when={!hasCodePreview()}>
+          <button
+            type="button"
+            class="op-read-file"
+            disabled={!props.onOpenWorkspaceFile}
+            title={`在右侧查看 ${readReference()?.path}`}
+            onClick={() => {
+              const reference = readReference();
+              if (reference) void props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine);
+            }}
+          >
+            <FileCode2 size={15} aria-hidden="true" />
+            <span class="op-read-file-main">
+              <strong>{baseName(readReference()?.path ?? "")}</strong>
+              <small>{readReference()?.path}</small>
+            </span>
+            <Show when={readRangeLabel(readReference())}>
+              <span class="op-read-file-range">{readRangeLabel(readReference())}</span>
+            </Show>
+            <ChevronRight size={13} aria-hidden="true" />
+          </button>
+        </Show>
+        <Show when={hasCodePreview()}>
+          <InlineCodePreview
+            path={readReference()?.path ?? ""}
+            content={props.part.output ?? ""}
+            startLine={readReference()?.startLine}
+            onOpen={props.onOpenWorkspaceFile ? () => {
+              const reference = readReference();
+              if (reference) void props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine);
+            } : undefined}
+          />
+        </Show>
         <Show when={props.part.status === "error" && props.part.output && !props.hideOutput}>
           <pre>{props.part.output}</pre>
         </Show>
@@ -227,32 +263,42 @@ function ToolDetail(props: {
   );
 }
 
+function ShellToolDetail(props: { part: ToolPart }) {
+  const duration = () => props.part.durationMs !== undefined ? formatElapsedDuration(props.part.durationMs) : "";
+  return (
+    <div class="op-activity-detail op-shell-detail">
+      <div class="op-activity-detail-head">
+        <span class="op-shell-title"><TerminalSquare size={13} /><code>Shell</code></span>
+        <span class="op-shell-meta">
+          <Show when={props.part.exitCode !== undefined}>
+            <em classList={{ error: props.part.exitCode !== 0 }}>exit {props.part.exitCode}</em>
+          </Show>
+          <Show when={duration()}><em>{duration()}</em></Show>
+        </span>
+      </div>
+      <div class="op-shell-command"><span aria-hidden="true">$</span><code>{props.part.input || "(empty command)"}</code></div>
+      <Show when={props.part.workingDirectory}>
+        <div class="op-shell-workdir" title={props.part.workingDirectory}>cwd <code>{props.part.workingDirectory}</code></div>
+      </Show>
+      <pre class="op-shell-output">{props.part.output || "(no output)"}</pre>
+    </div>
+  );
+}
+
 function DiffDetail(props: {
   part: DiffPart;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 }) {
-  const lines = () => props.part.patch.split("\n");
   return (
-    <div class="op-activity-diff">
-      <div class="op-activity-detail-head">
-        <button
-          type="button"
-          class="op-diff-file-link"
-          title={`在右侧查看 ${props.part.path}`}
-          onClick={() => void props.onOpenWorkspaceFile?.(props.part.path, "changes")}
-        >
-          <FileCode2 size={13} />
-          <code>{props.part.path}</code>
-        </button>
-        <span class="op-diff-stat">
-          <Show when={props.part.additions}><em class="add">+{props.part.additions}</em></Show>
-          <Show when={props.part.deletions}><em class="del">-{props.part.deletions}</em></Show>
-        </span>
-      </div>
-      <pre class="op-diff-body">
-        <For each={lines()}>{(line) => <DiffLine line={line} />}</For>
-      </pre>
-    </div>
+    <InlineDiffPreview
+      path={props.part.path}
+      patch={props.part.patch}
+      additions={props.part.additions}
+      deletions={props.part.deletions}
+      onOpen={props.onOpenWorkspaceFile
+        ? () => void props.onOpenWorkspaceFile?.(props.part.path, "changes")
+        : undefined}
+    />
   );
 }
 
@@ -262,54 +308,94 @@ type EditedFileSummary = {
   deletions: number;
 };
 
-function EditedFilesList(props: {
-  parts: MessagePart[];
-  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+function FileChangesSummary(props: {
+  files: EditedFileSummary[];
+  undoing?: boolean;
+  onUndo?: () => void | Promise<void>;
+  onReview?: () => void | Promise<void>;
+  onOpenFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 }) {
-  const files = createMemo(() => editedFileSummaries(props.parts));
+  const [expanded, setExpanded] = createSignal(false);
+  const visibleFiles = createMemo(() => expanded() ? props.files : props.files.slice(0, 3));
+  const hiddenCount = createMemo(() => Math.max(0, props.files.length - 3));
+  const additions = createMemo(() => props.files.reduce((total, file) => total + file.additions, 0));
+  const deletions = createMemo(() => props.files.reduce((total, file) => total + file.deletions, 0));
   return (
-    <div class="op-edited-files">
-      <For each={files()}>
-        {(file) => (
-          <button
-            type="button"
-            class="op-edited-file"
-            title={`在右侧查看 ${file.path}`}
-            onClick={() => void props.onOpenWorkspaceFile?.(file.path, "changes")}
-          >
-            <FileCode2 size={14} aria-hidden="true" />
-            <span>{file.path}</span>
-            <span class="op-diff-stat">
-              <Show when={file.additions > 0}><em class="add">+{file.additions}</em></Show>
-              <Show when={file.deletions > 0}><em class="del">-{file.deletions}</em></Show>
-            </span>
-            <ChevronRight size={13} aria-hidden="true" />
-          </button>
-        )}
-      </For>
-    </div>
+    <section class="op-file-changes" aria-label={`已编辑 ${props.files.length} 个文件`}>
+      <header class="op-file-changes-head">
+        <span class="op-file-changes-icon" aria-hidden="true"><FileCode2 size={15} /></span>
+        <span class="op-file-changes-title">
+          <strong>已编辑 {props.files.length} 个文件</strong>
+          <small class="op-diff-stat">
+            <Show when={additions() > 0}><em class="add">+{additions()}</em></Show>
+            <Show when={deletions() > 0}><em class="del">-{deletions()}</em></Show>
+          </small>
+        </span>
+        <span class="op-file-changes-actions">
+          <Show when={props.onUndo}>
+            <button type="button" disabled={props.undoing} title="撤销本轮文件修改" onClick={() => void props.onUndo?.()}>
+              <Undo2 size={13} /><span>{props.undoing ? "撤销中" : "撤销"}</span>
+            </button>
+          </Show>
+          <Show when={props.onReview}>
+            <button type="button" title="在右侧审阅修改" onClick={() => void props.onReview?.()}>
+              <Eye size={13} /><span>审阅</span>
+            </button>
+          </Show>
+        </span>
+      </header>
+      <div class="op-edited-files">
+        <For each={visibleFiles()}>
+          {(file) => (
+            <button
+              type="button"
+              class="op-edited-file"
+              disabled={!props.onOpenFile}
+              title={`在右侧查看 ${file.path}`}
+              onClick={() => void props.onOpenFile?.(file.path, "changes")}
+            >
+              <span>{file.path}</span>
+              <span class="op-diff-stat">
+                <Show when={file.additions > 0}><em class="add">+{file.additions}</em></Show>
+                <Show when={file.deletions > 0}><em class="del">-{file.deletions}</em></Show>
+              </span>
+              <ChevronRight size={13} aria-hidden="true" />
+            </button>
+          )}
+        </For>
+      </div>
+      <Show when={hiddenCount() > 0}>
+        <button
+          class="op-file-changes-more"
+          type="button"
+          aria-expanded={expanded()}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span>{expanded() ? "收起文件" : `再显示 ${hiddenCount()} 个文件`}</span>
+          <ChevronDown size={13} aria-hidden="true" />
+        </button>
+      </Show>
+    </section>
   );
 }
 
 function editedFileSummaries(parts: MessagePart[]): EditedFileSummary[] {
   const files = new Map<string, EditedFileSummary>();
   for (const part of parts) {
-    if (part.kind !== "diff" && part.kind !== "file") continue;
+    if (part.kind !== "diff" && (part.kind !== "file" || !isChangedFilePart(part))) continue;
     const current = files.get(part.path) ?? { path: part.path, additions: 0, deletions: 0 };
     if (part.kind === "diff") {
-      current.additions += part.additions ?? 0;
-      current.deletions += part.deletions ?? 0;
+      const calculated = inlineDiffStats(part.patch);
+      current.additions += part.additions ?? calculated.additions;
+      current.deletions += part.deletions ?? calculated.deletions;
     }
     files.set(part.path, current);
   }
   return [...files.values()];
 }
 
-function DiffLine(props: { line: string }) {
-  const add = () => props.line.startsWith("+") && !props.line.startsWith("+++");
-  const del = () => props.line.startsWith("-") && !props.line.startsWith("---");
-  const meta = () => props.line.startsWith("@@") || props.line.startsWith("diff ") || props.line.startsWith("index ") || props.line.startsWith("--- ") || props.line.startsWith("+++ ");
-  return <span class="op-line" classList={{ add: add(), del: del(), meta: meta() }}>{props.line || " "}</span>;
+function isChangedFilePart(part: FilePart): boolean {
+  return part.created === true || part.fileAction === "created" || part.fileAction === "modified";
 }
 
 function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
@@ -401,48 +487,116 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
   }
 }
 
-function TeamRun(props: { parts: TeamPart[] }) {
+export function TeamRun(props: { parts: TeamPart[]; docked?: boolean }) {
+  const completed = createMemo(() => props.parts.filter((part) => part.status === "completed").length);
+  const current = createMemo(() =>
+    props.parts.find((part) => part.status === "running") ??
+    props.parts.find((part) => part.status === "error") ??
+    props.parts.find((part) => part.status !== "completed") ??
+    props.parts[props.parts.length - 1],
+  );
+  const progress = createMemo(() => {
+    if (props.parts.length === 0) return 0;
+    const runningWeight = props.parts.some((part) => part.status === "running") ? 0.45 : 0;
+    return Math.min(100, Math.round(((completed() + runningWeight) / props.parts.length) * 100));
+  });
+
+  if (props.docked) {
+    return (
+      <details class="op-team-run docked" aria-label="AI 团队执行状态">
+        <summary class="op-team-dock-summary">
+          <span class="op-team-mark"><Users size={15} /></span>
+          <span class="op-team-dock-copy">
+            <strong>AI 团队</strong>
+            <small>{teamCurrentStatus(current(), completed(), props.parts.length)}</small>
+          </span>
+          <span class="op-team-count">{completed()}/{props.parts.length}</span>
+          <ChevronDown class="op-team-disclosure" size={14} />
+          <span class="op-team-progress-track" aria-hidden="true">
+            <span style={{ width: `${progress()}%` }} />
+          </span>
+          <span class="op-team-stage-track" aria-label="团队阶段">
+            <For each={props.parts}>
+              {(part) => (
+                <span
+                  class="op-team-stage"
+                  classList={{ [part.status || "pending"]: true }}
+                  title={`${part.roleLabel || part.role} · ${part.model || "跟随当前模型"}`}
+                >
+                  <TeamRoleStatus status={part.status} />
+                  <span>{part.roleLabel || part.role}</span>
+                </span>
+              )}
+            </For>
+          </span>
+        </summary>
+        <div class="op-team-dock-details">
+          <TeamRoleRows parts={props.parts} />
+        </div>
+      </details>
+    );
+  }
+
   return (
     <section class="op-team-run" aria-label="AI 团队执行记录">
       <div class="op-team-head"><Users size={14} /><strong>AI 团队</strong></div>
-      <div class="op-team-roles">
-        <For each={props.parts}>
-          {(part) => (
-            <div class="op-team-role" classList={{ [part.status || "pending"]: true }}>
-              <span class="op-team-role-status" aria-hidden="true">
-                <Show when={part.status === "completed"} fallback={
-                  <Show when={part.status === "error"} fallback={
-                    <Show when={part.status === "running"} fallback={<Circle size={12} />}>
-                      <span class="op-team-spinner" />
-                    </Show>
-                  }>
-                    <AlertCircle size={13} />
-                  </Show>
-                }>
-                  <Check size={13} />
-                </Show>
-              </span>
-              <span class="op-team-role-main">
-                <strong>{part.roleLabel || part.role}</strong>
-                <small>{part.model || "跟随当前模型"}{(part.attempt ?? 1) > 1 ? ` · 第 ${part.attempt} 轮` : ""}</small>
-              </span>
-              <Show when={part.verdict}>
-                <span class="op-team-verdict" classList={{ approved: part.verdict === "approved", changes: part.verdict === "changes_required" }}>
-                  {part.verdict === "approved" ? "通过" : part.verdict === "changes_required" ? "需修改" : "已检查"}
-                </span>
-              </Show>
-              <Show when={part.summary}>
-                <details class="op-team-summary">
-                  <summary>查看结果 <ChevronRight size={12} /></summary>
-                  <p>{part.summary}</p>
-                </details>
-              </Show>
-            </div>
-          )}
-        </For>
-      </div>
+      <TeamRoleRows parts={props.parts} />
     </section>
   );
+}
+
+function TeamRoleRows(props: { parts: TeamPart[] }) {
+  return (
+    <div class="op-team-roles">
+      <For each={props.parts}>
+        {(part) => (
+          <div class="op-team-role" classList={{ [part.status || "pending"]: true }}>
+            <span class="op-team-role-status" aria-hidden="true"><TeamRoleStatus status={part.status} /></span>
+            <span class="op-team-role-main">
+              <strong>{part.roleLabel || part.role}</strong>
+              <small>{part.model || "跟随当前模型"}{(part.attempt ?? 1) > 1 ? ` · 第 ${part.attempt} 轮` : ""}</small>
+            </span>
+            <Show when={part.verdict}>
+              <span class="op-team-verdict" classList={{ approved: part.verdict === "approved", changes: part.verdict === "changes_required" }}>
+                {part.verdict === "approved" ? "通过" : part.verdict === "changes_required" ? "需修改" : "已检查"}
+              </span>
+            </Show>
+            <Show when={part.summary}>
+              <details class="op-team-summary">
+                <summary>查看结果 <ChevronRight size={12} /></summary>
+                <p>{part.summary}</p>
+              </details>
+            </Show>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function TeamRoleStatus(props: { status?: string }) {
+  return (
+    <Show when={props.status === "completed"} fallback={
+      <Show when={props.status === "error"} fallback={
+        <Show when={props.status === "running"} fallback={<Circle size={11} />}>
+          <span class="op-team-spinner" />
+        </Show>
+      }>
+        <AlertCircle size={12} />
+      </Show>
+    }>
+      <Check size={12} />
+    </Show>
+  );
+}
+
+function teamCurrentStatus(part: TeamPart | undefined, completed: number, total: number) {
+  if (total > 0 && completed === total) return "全部阶段已完成";
+  if (!part) return "正在准备任务";
+  const label = part.roleLabel || part.role || "团队角色";
+  if (part.status === "error") return `${label}需要处理`;
+  if (part.status === "running") return `${label}正在工作`;
+  return `等待${label}`;
 }
 
 function aggregateActivity(category: ActivityCategory): boolean {

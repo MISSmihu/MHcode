@@ -33,11 +33,12 @@ type RuntimeSettings struct {
 	MCP                  MCPSettings             `json:"mcp"`
 	Model                ModelSettings           `json:"model"`
 	Team                 TeamSettings            `json:"team"`
+	Update               UpdateSettings          `json:"update"`
 	Workspace            WorkspaceSettings       `json:"workspace"`
 	Memory               MemorySettings          `json:"memory"`
 }
 
-const runtimeSettingsSchemaVersion = 6
+const runtimeSettingsSchemaVersion = 7
 
 type GitSettings struct {
 	BranchPrefix            string `json:"branchPrefix"`
@@ -141,6 +142,12 @@ type TeamSettings struct {
 	Roles           []TeamRoleSetting `json:"roles"`
 }
 
+type UpdateSettings struct {
+	AutoCheck    bool   `json:"autoCheck"`
+	AutoDownload bool   `json:"autoDownload"`
+	Channel      string `json:"channel"`
+}
+
 type TeamRoleSetting struct {
 	Role       string `json:"role"`
 	Enabled    bool   `json:"enabled"`
@@ -157,6 +164,7 @@ type ModelProviderSetting struct {
 	BalanceURL               string          `json:"balanceUrl"`
 	ExtraHeaders             string          `json:"extraHeaders"`
 	ExtraBodyJSON            string          `json:"extraBodyJson"`
+	ReasoningProfile         string          `json:"reasoningProfile"`
 	Enabled                  bool            `json:"enabled"`
 	APIKeyConfigured         bool            `json:"apiKeyConfigured"`
 	DefaultModelID           string          `json:"defaultModelId"`
@@ -261,6 +269,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 					Protocol:           "deepseek-official",
 					APIType:            "chat-completions",
 					BaseURL:            "https://api.deepseek.com",
+					ReasoningProfile:   "auto",
 					Enabled:            true,
 					LastSyncStatus:     "idle",
 					LastSyncMessage:    "等待保存 API Key 后刷新模型。",
@@ -272,6 +281,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 					Protocol:           "openai-compatible",
 					APIType:            "chat-completions",
 					BaseURL:            "https://api.openai.com/v1",
+					ReasoningProfile:   "auto",
 					Enabled:            false,
 					LastSyncStatus:     "idle",
 					LastSyncMessage:    "填写 Base URL 与 API Key 后可自动获取模型。",
@@ -283,6 +293,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 					Protocol:           "openai-compatible",
 					APIType:            "chat-completions",
 					BaseURL:            "http://127.0.0.1:11434/v1",
+					ReasoningProfile:   "none",
 					Enabled:            false,
 					LastSyncStatus:     "idle",
 					LastSyncMessage:    "适用于 Ollama、LM Studio 等本地兼容服务。",
@@ -300,6 +311,11 @@ func DefaultRuntimeSettings() RuntimeSettings {
 				{Role: TeamRoleReviewer, Enabled: true},
 				{Role: TeamRoleSynthesizer, Enabled: true},
 			},
+		},
+		Update: UpdateSettings{
+			AutoCheck:    true,
+			AutoDownload: false,
+			Channel:      "stable",
 		},
 		Workspace: WorkspaceSettings{
 			Configured:          true,
@@ -441,7 +457,13 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	settings.MCP = normalizeMCPSettings(settings.MCP, defaults.MCP)
 	settings.Model = normalizeModelSettings(settings.Model, defaults.Model)
 	settings.Team = normalizeTeamSettings(settings.Team, defaults.Team, settings.Model)
+	settings.Update = normalizeUpdateSettings(settings.Update, defaults.Update)
 	settings.Workspace = normalizeWorkspaceSettings(settings.Workspace, defaults.Workspace)
+	return settings
+}
+
+func normalizeUpdateSettings(settings, defaults UpdateSettings) UpdateSettings {
+	settings.Channel = normalizeChoice(settings.Channel, defaults.Channel, map[string]bool{"stable": true})
 	return settings
 }
 
@@ -477,6 +499,9 @@ func loadRuntimeSettings(path string) (RuntimeSettings, bool) {
 }
 
 func migrateRuntimeSettings(stored RuntimeSettings) RuntimeSettings {
+	if stored.SchemaVersion < 7 {
+		stored.Update = DefaultRuntimeSettings().Update
+	}
 	if stored.SchemaVersion >= 6 {
 		return stored
 	}
@@ -752,6 +777,7 @@ func normalizeModelSettings(settings ModelSettings, _ ModelSettings) ModelSettin
 		provider.BalanceURL = strings.TrimSpace(provider.BalanceURL)
 		provider.ExtraHeaders = strings.TrimSpace(provider.ExtraHeaders)
 		provider.ExtraBodyJSON = strings.TrimSpace(provider.ExtraBodyJSON)
+		provider.ReasoningProfile = normalizeReasoningProfile(provider.ReasoningProfile, provider.Protocol)
 		provider.DefaultModelID = strings.TrimSpace(provider.DefaultModelID)
 		if provider.ContextWindowTokens < 0 {
 			provider.ContextWindowTokens = 0
@@ -795,6 +821,31 @@ func normalizeModelSettings(settings ModelSettings, _ ModelSettings) ModelSettin
 		break
 	}
 	return settings
+}
+
+func normalizeReasoningProfile(profile, providerProtocol string) string {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if profile == "" {
+		profile = "auto"
+	}
+	allowed := map[string]bool{"auto": true, "none": true}
+	switch providerProtocol {
+	case "deepseek-official":
+		allowed["deepseek"] = true
+	case "anthropic", "anthropic-compatible":
+		allowed["anthropic"] = true
+	case "gemini":
+		allowed["gemini"] = true
+	case "openai-compatible", "local":
+		allowed["openai"] = true
+		allowed["openai-effort"] = true
+		allowed["xai"] = true
+		allowed["deepseek"] = true
+	}
+	if allowed[profile] {
+		return profile
+	}
+	return "auto"
 }
 
 func normalizeTokenPrice(value float64) float64 {

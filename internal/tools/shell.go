@@ -84,11 +84,13 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 	stderr.limit = maxCommandOutputBytes / 2
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	startedAt := time.Now()
 	process, startErr := sandboxexec.Start(cmd, t.Policy.ProcessLimits())
 	runErr := startErr
 	if startErr == nil {
 		runErr = process.Wait()
 	}
+	completedAt := time.Now()
 	output := DecodeCommandOutput(stdout.Bytes())
 	stderrOutput := DecodeCommandOutput(stderr.Bytes())
 	if strings.TrimSpace(stderrOutput) != "" {
@@ -124,9 +126,32 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 		Summary: summary,
 		IsError: status == "error",
 		Parts: []ResultPart{
-			{Kind: PartToolCall, Name: t.Name(), Status: status, Input: args.Command, Output: truncateForDisplay(output)},
+			{
+				Kind:             PartToolCall,
+				Name:             t.Name(),
+				Status:           status,
+				Input:            args.Command,
+				Output:           output,
+				WorkingDirectory: workDir,
+				ExitCode:         intPointer(exitCode),
+				StartedAt:        startedAt.Format(time.RFC3339Nano),
+				CompletedAt:      completedAt.Format(time.RFC3339Nano),
+				DurationMs:       elapsedMilliseconds(startedAt, completedAt),
+			},
 		},
 	}, nil
+}
+
+func intPointer(value int) *int {
+	return &value
+}
+
+func elapsedMilliseconds(startedAt, completedAt time.Time) int64 {
+	duration := completedAt.Sub(startedAt).Milliseconds()
+	if duration < 1 {
+		return 1
+	}
+	return duration
 }
 
 type cappedCommandOutput struct {

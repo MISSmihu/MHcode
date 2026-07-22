@@ -7,6 +7,7 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: string;
+  durationMs?: number;
   model?: string;
   reasoning?: string;
   usage?: UsageMetrics;
@@ -43,6 +44,8 @@ export type SettingsCategory =
   | "usage"
   | "environment"
   | "git"
+  | "automation"
+  | "about"
   | "archive";
 
 export type ProviderPreset = {

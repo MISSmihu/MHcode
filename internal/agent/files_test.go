@@ -116,3 +116,39 @@ func TestReadWorkspaceFileReportsBinaryAndTruncatesLongText(t *testing.T) {
 		t.Fatalf("long preview was not truncated at %d lines: %+v", maxWorkspacePreviewLines, long)
 	}
 }
+
+func TestListWorkspaceDirectoryIsBoundedToWorkspaceAndSorted(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "z.txt"), []byte("z"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	svc.runtimeSettings.WorkspaceRoot = root
+	listing, err := svc.ListWorkspaceDirectory("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Entries) != 2 || !listing.Entries[0].IsDirectory || listing.Entries[0].Path != "src" || listing.Entries[1].Path != "z.txt" {
+		t.Fatalf("root listing = %#v", listing)
+	}
+	nested, err := svc.ListWorkspaceDirectory("src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nested.Entries) != 2 || !nested.Entries[0].IsDirectory || nested.Entries[1].Path != "src/main.go" {
+		t.Fatalf("nested listing = %#v", nested)
+	}
+	if _, err := svc.ListWorkspaceDirectory("../"); err == nil {
+		t.Fatal("expected parent traversal to be rejected")
+	}
+	if _, err := svc.ListWorkspaceDirectory("z.txt"); err == nil {
+		t.Fatal("expected file path to be rejected as a directory")
+	}
+}

@@ -13,6 +13,7 @@ import {
   ChevronDown,
   ChevronRight,
   ClipboardList,
+  Clock3,
   Command,
   Copy,
   Cpu,
@@ -70,10 +71,12 @@ import { Portal } from "solid-js/web";
 import { ReasoningMenu } from "./components/ReasoningMenu";
 import { SidePanelHost } from "./components/SidePanelHost";
 import type { SidePanelView } from "./components/SidePanelHost";
-import { MessageContent, TaskProgress, textToParts } from "./components/chat/MessageContent";
-import type { TaskProgressPart } from "./components/chat/MessageContent";
+import { MessageContent, TaskProgress, TeamRun, textToParts } from "./components/chat/MessageContent";
+import type { TaskProgressPart, TeamPart } from "./components/chat/MessageContent";
 import { TimelinePanel } from "./components/TimelinePanel";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import type { ConfirmationRequest, ConfirmationResult } from "./components/ConfirmDialog";
 import { ImagePreviewModal } from "./components/ImagePreviewModal";
 import { WorkspaceToolsPanel } from "./components/WorkspaceToolsPanel";
 import {
@@ -116,6 +119,7 @@ import {
   createPermanentWorktree,
   newSession,
   switchSession,
+  renameSession,
   archiveSession,
   deleteSession,
   selectDirectory,
@@ -169,6 +173,7 @@ import {
   readStoredThemeMode, persistThemeMode, applyThemeMode,
   applySidebarWidth, clamp, messageTitle, formatClock,
 } from "./format";
+import { formatElapsedDuration } from "./lib/duration";
 import { errorMessage } from "./lib/errors";
 import { reconcileSessionMessages } from "./lib/session-history";
 import { clearGuidanceMessages, dequeueMessage, enqueueMessage, prioritizeMessage, removeMessage, takeMessageForEditing } from "./lib/message-queue";
@@ -207,16 +212,54 @@ type ProjectDialogState = {
   destinationName: string;
 };
 
+type SessionMenuState = {
+  project: ProjectNode;
+  session: SessionInfo;
+  left: number;
+  top: number;
+};
+
+type SessionRenameDialogState = {
+  project: ProjectNode;
+  session: SessionInfo;
+  title: string;
+};
+
+type ConfirmationState = ConfirmationRequest & {
+  resolve: (result: ConfirmationResult) => void;
+};
+
 type SessionTaskRuntime = {
   taskID: string;
+  projectID: string;
   sessionID: string;
+  userMessageID: string;
   messageID: string;
   prompt: string;
   tail: string;
   attachments: ChatAttachment[];
   links: ComposerLink[];
   startedAt: string;
+  assistantMessage: ChatMessage;
+  progress?: TaskProgressPart;
 };
+
+type SessionViewState = {
+  messages: ChatMessage[];
+  composerDraft?: string;
+  composerTail?: string;
+  composerAttachments?: ChatAttachment[];
+  composerLinks?: ComposerLink[];
+  activeTaskProgress?: TaskProgressPart;
+  browserPreview?: BrowserPreview;
+  reviewOpen: boolean;
+  sidePanelView: SidePanelView;
+  workspaceFileRequest?: WorkspaceFileRequest;
+};
+
+function sessionIdentityKey(projectID: string, sessionID: string): string {
+  return `${projectID.trim()}\u0000${sessionID.trim()}`;
+}
 
 function parentDirectory(path: string): string {
   const clean = path.trim().replace(/[\\/]+$/, "");
@@ -285,6 +328,7 @@ function App() {
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [activeSettingsCategory, setActiveSettingsCategory] = createSignal<SettingsCategory>("general");
   const [error, setError] = createSignal("");
+  const [confirmation, setConfirmation] = createSignal<ConfirmationState>();
   const [sidebarWidth, setSidebarWidth] = createSignal(readStoredSidebarWidth());
   const [resizingSidebar, setResizingSidebar] = createSignal(false);
   const [browserPanelWidth, setBrowserPanelWidth] = createSignal(storedBrowserPanelWidth ?? defaultBrowserPanelWidth);
@@ -300,11 +344,15 @@ function App() {
   const [sessions, setSessions] = createSignal<SessionInfo[]>([]);
   const [projectTree, setProjectTree] = createSignal<ProjectNode[]>([]);
   const [sessionTaskRuntimes, setSessionTaskRuntimes] = createSignal<Record<string, SessionTaskRuntime>>({});
+  const [sessionViewStates, setSessionViewStates] = createSignal<Record<string, SessionViewState>>({});
   const [selectedSessionID, setSelectedSessionID] = createSignal("");
   const [sessionSort, setSessionSort] = createSignal<"recent" | "name">("recent");
   const [showArchived, setShowArchived] = createSignal(false);
   const [switchingSession, setSwitchingSession] = createSignal(false);
   const [deletingSessionID, setDeletingSessionID] = createSignal("");
+  const [sessionActionBusyID, setSessionActionBusyID] = createSignal("");
+  const [sessionMenu, setSessionMenu] = createSignal<SessionMenuState>();
+  const [sessionRenameDialog, setSessionRenameDialog] = createSignal<SessionRenameDialogState>();
   const [projectMenu, setProjectMenu] = createSignal<ProjectMenuState>();
   const [projectDialog, setProjectDialog] = createSignal<ProjectDialogState>();
   const [projectActionBusy, setProjectActionBusy] = createSignal(false);
@@ -337,6 +385,7 @@ function App() {
   let composerImageInputRef: HTMLInputElement | undefined;
   let workspaceFileRequestID = 0;
   let projectActionMenuRef: HTMLDivElement | undefined;
+  let sessionActionMenuRef: HTMLDivElement | undefined;
   let pointerSidebarResizeActive = false;
   let mouseSidebarResizeActive = false;
   let pointerBrowserResizeActive = false;
@@ -392,39 +441,125 @@ function App() {
     const root = runtimeSettings().workspaceRoot?.trim();
     return root ? baseNameFromPath(root) : "未选择项目";
   });
+  const activeProjectID = createMemo(() => state()?.activeProjectId?.trim() || projectTree().find((project) => project.isActive)?.id || "");
   const activeSessionID = createMemo(() => {
-    if (selectedSessionID()) return selectedSessionID();
-    const activeProject = projectTree().find((project) => project.isActive);
+    if (state()?.activeSessionId?.trim()) return state()!.activeSessionId.trim();
+    const activeProject = projectTree().find((project) => project.id === activeProjectID())
+      ?? projectTree().find((project) => project.isActive);
     return activeProject?.sessions.find((session) => session.isActive)?.id
+      ?? selectedSessionID()
       ?? sessions().find((session) => session.isActive)?.id
       ?? "";
   });
-  const activeSessionTask = createMemo(() => sessionTaskRuntimes()[activeSessionID()]);
-  const isSessionBusy = (sessionID: string) => Boolean(sessionID && sessionTaskRuntimes()[sessionID]);
-  const currentSessionBusy = createMemo(() => isSessionBusy(activeSessionID()));
+  const activeSessionKey = createMemo(() => sessionIdentityKey(activeProjectID(), activeSessionID()));
+  const activeSessionTask = createMemo(() => sessionTaskRuntimes()[activeSessionKey()]);
+  const isSessionBusy = (projectID: string, sessionID: string) => Boolean(sessionID && sessionTaskRuntimes()[sessionIdentityKey(projectID, sessionID)]);
+  const currentSessionBusy = createMemo(() => isSessionBusy(activeProjectID(), activeSessionID()));
   const anySessionBusy = createMemo(() => Object.keys(sessionTaskRuntimes()).length > 0);
   const backgroundTaskCount = createMemo(
-    () => Object.keys(sessionTaskRuntimes()).filter((sessionID) => sessionID !== activeSessionID()).length,
+    () => Object.keys(sessionTaskRuntimes()).filter((key) => key !== activeSessionKey()).length,
   );
   const activeSessionTitle = createMemo(() => {
     const sessionID = activeSessionID();
-    for (const project of projectTree()) {
-      const session = project.sessions.find((candidate) => candidate.id === sessionID);
-      if (session) return session.title || "新对话";
-    }
+    const project = projectTree().find((candidate) => candidate.id === activeProjectID());
+    const session = project?.sessions.find((candidate) => candidate.id === sessionID);
+    if (session) return session.title || "新对话";
     return sessions().find((session) => session.id === sessionID)?.title || "新对话";
   });
 
-  const rememberCurrentSessionQueue = (sessionID = activeSessionID()) => {
-    if (!sessionID) return;
-    setQueuedMessagesBySession((current) => ({ ...current, [sessionID]: [...queuedMessages()] }));
+  const rememberCurrentSessionQueue = (projectID = activeProjectID(), sessionID = activeSessionID()) => {
+    if (!projectID || !sessionID) return;
+    setQueuedMessagesBySession((current) => ({ ...current, [sessionIdentityKey(projectID, sessionID)]: [...queuedMessages()] }));
   };
 
-  const restoreSessionQueue = (sessionID: string) => {
-    setQueuedMessages(queuedMessagesBySession()[sessionID] ?? []);
+  const restoreSessionQueue = (projectID: string, sessionID: string) => {
+    setQueuedMessages(queuedMessagesBySession()[sessionIdentityKey(projectID, sessionID)] ?? []);
+  };
+
+  const rememberCurrentSessionView = (projectID = activeProjectID(), sessionID = activeSessionID()) => {
+    if (!projectID || !sessionID) return;
+    const key = sessionIdentityKey(projectID, sessionID);
+    setSessionViewStates((current) => ({
+      ...current,
+      [key]: {
+        messages: [...messages()],
+        composerDraft: promptDraft(),
+        composerTail: composerTailDraft(),
+        composerAttachments: composerAttachments().map((attachment) => ({ ...attachment })),
+        composerLinks: composerLinks().map((link) => ({ ...link })),
+        activeTaskProgress: activeTaskProgress() ? cloneTaskProgress(activeTaskProgress()!) : undefined,
+        browserPreview: browserPreview(),
+        reviewOpen: reviewOpen(),
+        sidePanelView: sidePanelView(),
+        workspaceFileRequest: workspaceFileRequest(),
+      },
+    }));
+  };
+
+  const restoreSessionView = (projectID: string, sessionID: string): boolean => {
+    const view = sessionViewStates()[sessionIdentityKey(projectID, sessionID)];
+    if (!view) {
+      setMessages([]);
+      setComposerDraft("");
+      setComposerTail("");
+      setComposerAttachments([]);
+      setComposerLinks([]);
+      setActiveTaskProgress(undefined);
+      setBrowserPreview(undefined);
+      setReviewOpen(false);
+      setSidePanelView("browser");
+      setWorkspaceFileRequest(undefined);
+      return false;
+    }
+    setMessages([...view.messages]);
+    setComposerDraft(view.composerDraft ?? "");
+    setComposerTail(view.composerTail ?? "");
+    setComposerAttachments(view.composerAttachments?.map((attachment) => ({ ...attachment })) ?? []);
+    setComposerLinks(view.composerLinks?.map((link) => ({ ...link })) ?? []);
+    setActiveTaskProgress(view.activeTaskProgress ? cloneTaskProgress(view.activeTaskProgress) : undefined);
+    setBrowserPreview(view.browserPreview);
+    setReviewOpen(view.reviewOpen);
+    setSidePanelView(view.sidePanelView);
+    setWorkspaceFileRequest(view.workspaceFileRequest);
+    return true;
   };
   const planMode = createMemo(() => state()?.planMode ?? false);
   const teamMode = createMemo(() => runtimeSettings().team.enabled);
+  const activeTeamParts = createMemo<TeamPart[]>(() => {
+    const task = activeSessionTask();
+    if (!task) return [];
+
+    const latestByRole = new Map<string, TeamPart>();
+    for (const part of task.assistantMessage.parts ?? []) {
+      if (part.kind !== "team_role") continue;
+      const current = latestByRole.get(part.role);
+      if (!current || (part.attempt ?? 1) >= (current.attempt ?? 1)) latestByRole.set(part.role, part);
+    }
+
+    const configuredRoles = teamMode() ? runtimeSettings().team.roles.filter((role) => role.enabled) : [];
+    for (const role of configuredRoles) {
+      if (latestByRole.has(role.role)) continue;
+      const provider = runtimeSettings().model.providers.find((candidate) => candidate.id === role.providerId);
+      latestByRole.set(role.role, {
+        kind: "team_role",
+        role: role.role,
+        roleLabel: teamRoleLabel(role.role),
+        providerId: role.providerId,
+        model: role.modelId || provider?.defaultModelId,
+        status: "pending",
+        attempt: 1,
+      });
+    }
+
+    const roleOrder = new Map(configuredRoles.map((role, index) => [role.role, index]));
+    return [...latestByRole.values()].sort((left, right) =>
+      (roleOrder.get(left.role) ?? 99) - (roleOrder.get(right.role) ?? 99),
+    );
+  });
+  const undoableFileChangeMessageID = createMemo(() => {
+    const latestAssistant = [...messages()].reverse().find((message) => message.role === "assistant" && !message.streaming);
+    return latestAssistant && messageHasTrackedFileChanges(latestAssistant) ? latestAssistant.id : "";
+  });
   // 完全访问 = 审批策略为 never（命令/文件修改不再逐次弹框确认）。
   const fullAccess = createMemo(() => runtimeSettings().approvalPolicy === "never");
   const modelName = createMemo(() => {
@@ -436,6 +571,26 @@ function App() {
     return model ? `${provider.name} · ${model}` : provider.name;
   });
   const canSend = createMemo(() => (promptDraft().trim().length > 0 || composerTailDraft().trim().length > 0 || composerLinks().length > 0 || composerAttachments().length > 0) && activeProviderReady() && Boolean(activeChatModel()));
+
+  const requestConfirmationDecision = (request: ConfirmationRequest): Promise<ConfirmationResult> =>
+    new Promise((resolve) => {
+      confirmation()?.resolve("dismiss");
+      setConfirmation({ ...request, resolve });
+    });
+
+  const confirmAction = async (request: ConfirmationRequest): Promise<boolean> =>
+    (await requestConfirmationDecision(request)) === "confirm";
+
+  const resolveConfirmation = (result: ConfirmationResult) => {
+    const current = confirmation();
+    if (!current) return;
+    setConfirmation(undefined);
+    current.resolve(result);
+  };
+
+  onCleanup(() => {
+    confirmation()?.resolve("dismiss");
+  });
 
   createEffect(() => {
     const value = promptDraft();
@@ -454,8 +609,15 @@ function App() {
   const handleBrowserPreviewRequest = async (preview: BrowserPreview) => {
     try {
       if (preview.ask) {
-        const useEmbeddedBrowser = window.confirm(`在 MHcode 内置浏览器中打开 ${preview.name}？\n\n选择“取消”将使用系统浏览器。`);
-        if (!useEmbeddedBrowser) {
+        const decision = await requestConfirmationDecision({
+          title: "选择打开方式",
+          message: `打开“${preview.name}”`,
+          detail: "可在 MHcode 内查看，也可交给系统默认应用。",
+          confirmLabel: "内置打开",
+          cancelLabel: "系统打开",
+        });
+        if (decision === "dismiss") return;
+        if (decision === "cancel") {
           await openWorkspaceFile(preview.path);
           return;
         }
@@ -535,15 +697,19 @@ function App() {
     if (browserPreview()) setSidePanelView("browser");
   };
 
+  const openReviewPanel = () => {
+    setReviewOpen(true);
+    setSidePanelView("files");
+    setWorkspaceToolsOpen(false);
+    queueMicrotask(constrainBrowserPanelWidth);
+  };
+
   const toggleReviewPanel = () => {
     if (reviewOpen() && sidePanelView() === "files") {
       closeReviewPanel();
       return;
     }
-    setReviewOpen(true);
-    setSidePanelView("files");
-    setWorkspaceToolsOpen(false);
-    queueMicrotask(constrainBrowserPanelWidth);
+    openReviewPanel();
   };
 
   const requestOpenURL = (url: string) => {
@@ -630,33 +796,279 @@ function App() {
   );
   const hasMoreSessions = createMemo(() => sidebarSessions().length > 4);
 
-  const updateStreamingMessage = (update: (message: ChatMessage) => ChatMessage) => {
-    const messageID = streamingMessageID();
-    if (!messageID) {
-      return;
-    }
+  const updateSessionStreamingMessage = (
+    projectID: string,
+    sessionID: string,
+    update: (message: ChatMessage) => ChatMessage,
+  ) => {
+    const key = sessionIdentityKey(projectID, sessionID);
+    let messageID = "";
+    setSessionTaskRuntimes((current) => {
+      const task = current[key];
+      if (!task) return current;
+      messageID = task.messageID;
+      return {
+        ...current,
+        [key]: { ...task, assistantMessage: update(task.assistantMessage) },
+      };
+    });
+    if (!messageID || projectID !== activeProjectID() || sessionID !== activeSessionID()) return;
     setMessages((current) => current.map((message) => (message.id === messageID ? update(message) : message)));
+  };
+
+  const updateStreamingMessage = (update: (message: ChatMessage) => ChatMessage) => {
+    updateSessionStreamingMessage(activeProjectID(), activeSessionID(), update);
+  };
+
+  const updateSessionTaskProgress = (projectID: string, sessionID: string, progress?: TaskProgressPart) => {
+    const key = sessionIdentityKey(projectID, sessionID);
+    setSessionTaskRuntimes((current) => {
+      const task = current[key];
+      if (!task) return current;
+      return { ...current, [key]: { ...task, progress: progress ? cloneTaskProgress(progress) : undefined } };
+    });
+    if (projectID === activeProjectID() && sessionID === activeSessionID()) {
+      setActiveTaskProgress(progress ? cloneTaskProgress(progress) : undefined);
+    }
+  };
+
+  const cacheSessionTaskView = (projectID: string, sessionID: string) => {
+    const key = sessionIdentityKey(projectID, sessionID);
+    const task = sessionTaskRuntimes()[key];
+    if (!task) return;
+    setSessionViewStates((current) => {
+      const existing = current[key] ?? {
+        messages: [],
+        reviewOpen: false,
+        sidePanelView: "browser" as SidePanelView,
+      };
+      const composed = composeComposerPrompt(task.prompt, task.links, task.tail);
+      let nextMessages = [...existing.messages];
+      if ((composed || task.attachments.length > 0) && !nextMessages.some((message) => message.id === task.userMessageID)) {
+        nextMessages.push({
+          ...createChatMessage("user", composed),
+          id: task.userMessageID || `user-task-${task.taskID || Date.now()}`,
+          attachments: task.attachments,
+        });
+      }
+      const assistantIndex = nextMessages.findIndex((message) => message.id === task.messageID);
+      if (assistantIndex >= 0) nextMessages[assistantIndex] = task.assistantMessage;
+      else nextMessages.push(task.assistantMessage);
+      return {
+        ...current,
+        [key]: {
+          ...existing,
+          messages: nextMessages,
+          activeTaskProgress: task.progress ? cloneTaskProgress(task.progress) : existing.activeTaskProgress,
+        },
+      };
+    });
+  };
+
+  const rollbackOptimisticTurn = (projectID: string, sessionID: string) => {
+    const key = sessionIdentityKey(projectID, sessionID);
+    const task = sessionTaskRuntimes()[key];
+    if (!task) return;
+    const optimisticIDs = new Set([task.userMessageID, task.messageID].filter(Boolean));
+    setSessionViewStates((current) => {
+      const existing = current[key];
+      if (!existing) return current;
+      return {
+        ...current,
+        [key]: {
+          ...existing,
+          messages: existing.messages.filter((message) => !optimisticIDs.has(message.id)),
+          activeTaskProgress: undefined,
+          composerDraft: task.prompt,
+          composerTail: task.tail,
+          composerAttachments: task.attachments.map((attachment) => ({ ...attachment })),
+          composerLinks: task.links.map((link) => ({ ...link })),
+        },
+      };
+    });
+    if (projectID === activeProjectID() && sessionID === activeSessionID()) {
+      setMessages((current) => current.filter((message) => !optimisticIDs.has(message.id)));
+      setActiveTaskProgress(undefined);
+      setComposerDraft(task.prompt);
+      setComposerTail(task.tail);
+      setComposerAttachments(task.attachments.map((attachment) => ({ ...attachment })));
+      setComposerLinks(task.links.map((link) => ({ ...link })));
+      resetComposerHistory();
+    }
+  };
+
+  const beginGuidedTaskMessage = (projectID: string, sessionID: string, event: ChatTaskEvent): { userMessage: ChatMessage; assistantMessage: ChatMessage } | undefined => {
+    const key = sessionIdentityKey(projectID, sessionID);
+    const guidance = event.guidance?.trim() ?? "";
+    const attachments = event.attachments?.map((attachment) => ({ ...attachment })) ?? [];
+    const startedAt = new Date().toISOString();
+    const userMessage: ChatMessage = {
+      ...createChatMessage("user", guidance),
+      id: `user-guidance-${event.guidanceId || Date.now()}`,
+      attachments,
+    };
+    const message: ChatMessage = {
+      id: `assistant-guidance-${event.guidanceId || Date.now()}`,
+      role: "assistant",
+      content: "",
+      createdAt: startedAt,
+      model: event.model || activeChatModel(),
+      streaming: true,
+      status: event.message || "正在应用引导",
+    };
+    let updated = false;
+    setSessionTaskRuntimes((current) => {
+      const task = current[key];
+      if (!task) return current;
+      updated = true;
+      return {
+        ...current,
+        [key]: {
+          ...task,
+          userMessageID: userMessage.id,
+          messageID: message.id,
+          prompt: guidance,
+          tail: "",
+          attachments,
+          links: [],
+          startedAt,
+          assistantMessage: message,
+        },
+      };
+    });
+    return updated ? { userMessage, assistantMessage: message } : undefined;
+  };
+
+  const reduceBackgroundTaskEvent = (projectID: string, sessionID: string, event: ChatTaskEvent) => {
+    switch (event.type) {
+      case "started":
+      case "status":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, status: event.message || "正在思考", statusKind: undefined, compressionStatus: undefined }));
+        break;
+      case "context_compression":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
+          statusKind: "compression",
+          compressionStatus: event.compression?.status === "completed" ? "completed" : event.compression?.status === "error" ? "error" : "running",
+        }));
+        break;
+      case "delta":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, content: message.content + (event.delta ?? ""), model: event.model || message.model, status: "正在生成" }));
+        break;
+      case "reasoning":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, reasoning: (message.reasoning ?? "") + (event.delta ?? ""), status: "正在推理" }));
+        break;
+      case "tool":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          parts: mergeLiveToolResultParts(updateLiveToolParts(message.parts, event), event.parts),
+          status: event.status === "running" ? `正在运行 ${event.toolName || "工具"}` : event.status === "error" ? `${event.toolName || "工具"} 执行失败` : `${event.toolName || "工具"} 已完成`,
+        }));
+        break;
+      case "progress":
+        if (event.progress) updateSessionTaskProgress(projectID, sessionID, event.progress);
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, parts: updateLiveProgressPart(message.parts, event.progress), status: "正在执行任务" }));
+        break;
+      case "team":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, parts: updateLiveTeamPart(message.parts, event), model: event.model || message.model, status: event.message || `${event.team?.label || "团队角色"}正在工作` }));
+        break;
+      case "guidance": {
+        const previousResult = event.result;
+        if (previousResult) {
+          updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+            ...message,
+            content: previousResult.content || message.content || previousResult.reasoning || "本轮没有返回可展示内容。",
+            reasoning: previousResult.reasoning,
+            model: previousResult.model,
+            usage: previousResult.usage,
+            parts: previousResult.parts,
+            durationMs: previousResult.durationMs,
+            streaming: false,
+            status: undefined,
+          }));
+          cacheSessionTaskView(projectID, sessionID);
+        }
+        beginGuidedTaskMessage(projectID, sessionID, event);
+        break;
+      }
+      case "completed": {
+        const result = event.result;
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          content: result?.content || message.content || result?.reasoning || "本轮没有返回可展示内容。",
+          reasoning: result?.reasoning || message.reasoning,
+          model: result?.model || message.model,
+          usage: result?.usage || message.usage,
+          parts: result?.parts || message.parts,
+          durationMs: result?.durationMs ?? message.durationMs,
+          streaming: false,
+          status: undefined,
+        }));
+        break;
+      }
+      case "cancelled": {
+        const result = event.result;
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          content: result?.content || message.content,
+          reasoning: result?.reasoning || message.reasoning,
+          model: result?.model || message.model,
+          usage: result?.usage || message.usage,
+          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, "cancelled"),
+          durationMs: result?.durationMs ?? message.durationMs,
+          streaming: false,
+          cancelled: true,
+          status: undefined,
+        }));
+        break;
+      }
+      case "failed": {
+        const result = event.result;
+        const partialToolCompleted = hasUsablePartialResult(result?.parts);
+        if (!partialToolCompleted) {
+          rollbackOptimisticTurn(projectID, sessionID);
+          return;
+        }
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          content: result?.content || message.content || chatFailureMessage(event.message || "模型请求失败。"),
+          reasoning: result?.reasoning || message.reasoning,
+          model: result?.model || message.model,
+          usage: result?.usage || message.usage,
+          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, partialToolCompleted ? "completed" : "failed"),
+          durationMs: result?.durationMs ?? message.durationMs,
+          failed: !partialToolCompleted,
+          streaming: false,
+          status: undefined,
+        }));
+        break;
+      }
+    }
+    cacheSessionTaskView(projectID, sessionID);
   };
 
   const settleActiveTaskProgress = (taskStatus: "completed" | "failed" | "cancelled") => {
     setActiveTaskProgress((current) => current ? { ...current, taskStatus } : current);
   };
 
-  const finishChatTask = (finishedSessionID = activeSessionID(), finishedTaskID = "") => {
+  const finishChatTask = (finishedProjectID = activeProjectID(), finishedSessionID = activeSessionID(), finishedTaskID = "") => {
+    const finishedKey = sessionIdentityKey(finishedProjectID, finishedSessionID);
+    const visibleProjectID = activeProjectID();
     const visibleSessionID = activeSessionID();
     const visibleTaskID = activeChatTaskID();
     const pendingReasoning = pendingReasoningLevel();
     if (!finishedSessionID) return undefined;
     let removed = false;
     setSessionTaskRuntimes((current) => {
-      const task = current[finishedSessionID];
+      const task = current[finishedKey];
       if (!task || (finishedTaskID && task.taskID && task.taskID !== finishedTaskID)) return current;
       const next = { ...current };
-      delete next[finishedSessionID];
+      delete next[finishedKey];
       removed = true;
       return next;
     });
-    const belongsToVisibleTask = visibleSessionID === finishedSessionID
+    const belongsToVisibleTask = visibleProjectID === finishedProjectID && visibleSessionID === finishedSessionID
       && (!finishedTaskID || !visibleTaskID || visibleTaskID === finishedTaskID);
     if (removed && belongsToVisibleTask) {
       setSendingMessage(false);
@@ -697,15 +1109,22 @@ function App() {
   };
 
   const handleChatTaskEvent = (event: ChatTaskEvent) => {
+    const eventProjectID = event.projectId?.trim() || activeProjectID();
     const eventSessionID = event.sessionId?.trim() || activeSessionID();
+    const eventSessionKey = sessionIdentityKey(eventProjectID, eventSessionID);
     const currentTaskID = activeChatTaskID();
+    const currentProjectID = activeProjectID();
     const currentSessionID = activeSessionID();
-    const eventTask = eventSessionID ? sessionTaskRuntimes()[eventSessionID] : undefined;
-    const isCurrentSession = !eventSessionID || !currentSessionID || eventSessionID === currentSessionID;
+    const eventTask = eventSessionID ? sessionTaskRuntimes()[eventSessionKey] : undefined;
+    const isCurrentSession = (!eventSessionID || !currentSessionID || eventSessionID === currentSessionID)
+      && (!eventProjectID || !currentProjectID || eventProjectID === currentProjectID);
     const matchesSessionTask = !eventTask || !eventTask.taskID || eventTask.taskID === event.taskId;
     if (!isCurrentSession || !matchesSessionTask || (currentTaskID && event.taskId !== currentTaskID)) {
+      if (!isCurrentSession && eventTask && matchesSessionTask) {
+        reduceBackgroundTaskEvent(eventProjectID, eventSessionID, event);
+      }
       if (event.type === "completed" || event.type === "failed" || event.type === "cancelled") {
-        if (eventSessionID && matchesSessionTask) finishChatTask(eventSessionID, event.taskId);
+        if (eventSessionID && matchesSessionTask) finishChatTask(eventProjectID, eventSessionID, event.taskId);
         void refreshProjectsAndSessions();
       }
       return;
@@ -771,7 +1190,7 @@ function App() {
         break;
       case "progress":
         if (event.progress) {
-          setActiveTaskProgress(cloneTaskProgress(event.progress));
+          updateSessionTaskProgress(eventProjectID, eventSessionID, event.progress);
         }
         updateStreamingMessage((message) => ({
           ...message,
@@ -795,7 +1214,7 @@ function App() {
         const previousResult = event.result;
         const previousProgress = findTaskProgress(previousResult?.parts);
         if (previousProgress) {
-          setActiveTaskProgress(cloneTaskProgress(previousProgress));
+          updateSessionTaskProgress(eventProjectID, eventSessionID, previousProgress);
         }
         if (previousResult) {
           setState(previousResult.state);
@@ -806,6 +1225,7 @@ function App() {
             model: previousResult.model,
             usage: previousResult.usage,
             parts: previousResult.parts,
+            durationMs: previousResult.durationMs,
             streaming: false,
             status: undefined,
           }));
@@ -815,21 +1235,15 @@ function App() {
         }
         const guidance = event.guidance?.trim() ?? "";
         const guidanceAttachments = event.attachments?.map((attachment) => ({ ...attachment })) ?? [];
-        const assistantMessageID = `assistant-guidance-${Date.now()}`;
+        cacheSessionTaskView(eventProjectID, eventSessionID);
+        const guidedTask = beginGuidedTaskMessage(eventProjectID, eventSessionID, event);
+        if (!guidedTask) break;
         setMessages((current) => [
           ...current,
-          { ...createChatMessage("user", guidance), attachments: guidanceAttachments },
-          {
-            id: assistantMessageID,
-            role: "assistant",
-            content: "",
-            createdAt: new Date().toISOString(),
-            model: activeChatModel(),
-            streaming: true,
-            status: event.message || "正在应用引导",
-          },
+          guidedTask.userMessage,
+          guidedTask.assistantMessage,
         ]);
-        setStreamingMessageID(assistantMessageID);
+        setStreamingMessageID(guidedTask.assistantMessage.id);
         setSubmittedPrompt(guidance);
         setSubmittedTail("");
         setSubmittedAttachments(guidanceAttachments);
@@ -840,7 +1254,7 @@ function App() {
         const result = event.result;
         const resultProgress = findTaskProgress(result?.parts);
         if (resultProgress) {
-          setActiveTaskProgress({ ...cloneTaskProgress(resultProgress), taskStatus: "completed" });
+          updateSessionTaskProgress(eventProjectID, eventSessionID, { ...cloneTaskProgress(resultProgress), taskStatus: "completed" });
         } else {
           settleActiveTaskProgress("completed");
         }
@@ -853,41 +1267,53 @@ function App() {
             model: result.model,
             usage: result.usage,
             parts: result.parts,
+            durationMs: result.durationMs,
             streaming: false,
             status: undefined,
           }));
         } else {
           updateStreamingMessage((message) => ({ ...message, streaming: false, status: undefined }));
         }
-        const pendingReasoning = finishChatTask(eventSessionID, event.taskId);
+        const pendingReasoning = finishChatTask(eventProjectID, eventSessionID, event.taskId);
         void (async () => {
-          if (eventSessionID === activeSessionID()) {
-            await restoreSessionMessages(true, eventSessionID);
+          if (eventProjectID === activeProjectID() && eventSessionID === activeSessionID()) {
+            await restoreSessionMessages(true, eventProjectID, eventSessionID);
             await applyPendingReasoning(pendingReasoning);
             await startNextQueuedMessage();
           }
           void refreshProjectsAndSessions();
-          if (eventSessionID === activeSessionID()) void refreshCheckpoints();
+          if (eventProjectID === activeProjectID() && eventSessionID === activeSessionID()) void refreshCheckpoints();
         })();
         break;
       }
-      case "cancelled":
+      case "cancelled": {
         setQueuedMessages(clearGuidanceMessages);
         setComposerDraft(submittedPrompt());
         setComposerTail(submittedTail());
         setComposerAttachments(submittedAttachments());
         setComposerLinks(submittedLinks());
         resetComposerHistory();
+        const result = event.result;
+        if (result) {
+          setState(result.state);
+        }
         updateStreamingMessage((message) => ({
           ...message,
-          parts: settleLiveProgress(message.parts, "cancelled"),
+          content: result?.content || message.content,
+          reasoning: result?.reasoning || message.reasoning,
+          model: result?.model || message.model,
+          usage: result?.usage || message.usage,
+          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, "cancelled"),
+          durationMs: result?.durationMs ?? message.durationMs,
           streaming: false,
           cancelled: true,
           status: undefined,
         }));
         settleActiveTaskProgress("cancelled");
-        void applyPendingReasoning(finishChatTask(eventSessionID, event.taskId));
+        if (activeTaskProgress()) updateSessionTaskProgress(eventProjectID, eventSessionID, { ...cloneTaskProgress(activeTaskProgress()!), taskStatus: "cancelled" });
+        void applyPendingReasoning(finishChatTask(eventProjectID, eventSessionID, event.taskId));
         break;
+      }
       case "failed": {
         setQueuedMessages(clearGuidanceMessages);
         const message = chatFailureMessage(event.message || "模型请求失败。");
@@ -898,38 +1324,32 @@ function App() {
         }
         setError(partialToolCompleted ? "" : message);
         if (!partialToolCompleted) {
-          setComposerDraft(submittedPrompt());
-          setComposerTail(submittedTail());
-          setComposerAttachments(submittedAttachments());
-          setComposerLinks(submittedLinks());
-          resetComposerHistory();
+          rollbackOptimisticTurn(eventProjectID, eventSessionID);
         }
-        updateStreamingMessage((current) => ({
-          ...current,
-          content: partialToolCompleted
-            ? result?.content || current.content || message
-            : current.content || result?.content || message,
-          reasoning: result?.reasoning || current.reasoning,
-          model: result?.model || current.model,
-          usage: result?.usage || current.usage,
-          parts: settleLiveProgress(
-            result?.parts?.length ? result.parts : current.parts,
-            partialToolCompleted ? "completed" : "failed",
-          ),
-          failed: !partialToolCompleted,
-          streaming: false,
-          status: undefined,
-        }));
+        if (partialToolCompleted) {
+          updateStreamingMessage((current) => ({
+            ...current,
+            content: result?.content || current.content || message,
+            reasoning: result?.reasoning || current.reasoning,
+            model: result?.model || current.model,
+            usage: result?.usage || current.usage,
+            parts: settleLiveProgress(result?.parts?.length ? result.parts : current.parts, "completed"),
+            durationMs: result?.durationMs ?? current.durationMs,
+            failed: false,
+            streaming: false,
+            status: undefined,
+          }));
+        }
         const resultProgress = findTaskProgress(result?.parts);
         if (resultProgress) {
-          setActiveTaskProgress({
+          updateSessionTaskProgress(eventProjectID, eventSessionID, {
             ...cloneTaskProgress(resultProgress),
             taskStatus: partialToolCompleted ? "completed" : "failed",
           });
         } else {
           settleActiveTaskProgress(partialToolCompleted ? "completed" : "failed");
         }
-        void applyPendingReasoning(finishChatTask(eventSessionID, event.taskId));
+        void applyPendingReasoning(finishChatTask(eventProjectID, eventSessionID, event.taskId));
         break;
       }
     }
@@ -944,7 +1364,7 @@ function App() {
       await refreshState();
       await refreshProjectsAndSessions();
       await restoreSessionMessages();
-      activateSessionTask(activeSessionID());
+      activateSessionTask(activeProjectID(), activeSessionID());
     })();
     // 订阅后端审批请求，入队等待用户处理。
     const unsubscribe = onApprovalRequest((req) => {
@@ -956,29 +1376,42 @@ function App() {
     const unsubscribeBrowserClose = onBrowserPreviewClose(closeBrowserPanel);
     const unsubscribeChatTask = onChatTaskEvent(handleChatTaskEvent);
     const unsubscribeMCPState = onMCPState(setState);
-    const closeProjectMenuOnOutsidePress = (event: PointerEvent) => {
-      if (!projectMenu()) return;
+    const closeActionMenusOnOutsidePress = (event: PointerEvent) => {
       const target = event.target;
-      if (target instanceof Node && projectActionMenuRef?.contains(target)) return;
-      if (target instanceof Element && target.closest("[data-project-menu-trigger]")) return;
-      setProjectMenu(undefined);
+      if (projectMenu()) {
+        if (!(target instanceof Node && projectActionMenuRef?.contains(target))
+          && !(target instanceof Element && target.closest("[data-project-menu-trigger]"))) {
+          setProjectMenu(undefined);
+        }
+      }
+      if (sessionMenu()) {
+        if (!(target instanceof Node && sessionActionMenuRef?.contains(target))
+          && !(target instanceof Element && target.closest("[data-session-menu-target]"))) {
+          setSessionMenu(undefined);
+        }
+      }
     };
     const closeProjectUIOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (sessionRenameDialog() && !sessionActionBusyID()) {
+        setSessionRenameDialog(undefined);
+        return;
+      }
       if (projectDialog() && !projectActionBusy()) {
         setProjectDialog(undefined);
         return;
       }
+      setSessionMenu(undefined);
       setProjectMenu(undefined);
     };
-    window.addEventListener("pointerdown", closeProjectMenuOnOutsidePress);
+    window.addEventListener("pointerdown", closeActionMenusOnOutsidePress);
     window.addEventListener("keydown", closeProjectUIOnEscape);
     onCleanup(unsubscribe);
     onCleanup(unsubscribeBrowserOpen);
     onCleanup(unsubscribeBrowserClose);
     onCleanup(unsubscribeChatTask);
     onCleanup(unsubscribeMCPState);
-    onCleanup(() => window.removeEventListener("pointerdown", closeProjectMenuOnOutsidePress));
+    onCleanup(() => window.removeEventListener("pointerdown", closeActionMenusOnOutsidePress));
     onCleanup(() => window.removeEventListener("keydown", closeProjectUIOnEscape));
   });
 
@@ -988,6 +1421,9 @@ function App() {
 		drawerOpen()
 		|| timelineOpen()
 		|| activeApproval()
+		|| confirmation()
+		|| projectDialog()
+		|| sessionRenameDialog()
 		|| pendingLinkURL()
 		|| previewAttachment()
 	));
@@ -1151,9 +1587,15 @@ function App() {
 
   const removeModelProvider = async (providerID: string) => {
     const provider = activeRuntimeDraft().model.providers.find((item) => item.id === providerID);
-    if (!provider || !window.confirm(`删除模型供应商“${provider.name}”？\n\n对应的本地 API Key 也会被清除。`)) {
-      return;
-    }
+    if (!provider) return;
+    const confirmed = await confirmAction({
+      title: "删除模型供应商？",
+      message: `“${provider.name}”将从模型配置中移除。`,
+      detail: "对应的本地 API Key 也会被清除，此操作无法撤销。",
+      confirmLabel: "删除",
+      tone: "danger",
+    });
+    if (!confirmed) return;
     setDeletingProviderID(providerID);
     setError("");
     try {
@@ -1405,6 +1847,14 @@ function App() {
     if (editor) placeCaretAtEnd(editor);
   };
 
+  const primeWelcomePrompt = (prompt: string) => {
+    setComposerDraft(prompt);
+    setComposerTail("");
+    setComposerLinks([]);
+    resetComposerHistory();
+    queueMicrotask(focusComposerEnd);
+  };
+
   const addComposerLinks = (links: ComposerLink[]) => {
     if (links.length === 0) return;
     const current = currentComposerSnapshot();
@@ -1501,15 +1951,16 @@ function App() {
     const attachments = (attachmentOverride ?? composerAttachments()).map((attachment) => ({ ...attachment }));
     const links = (linkOverride ?? composerLinks()).map((link) => ({ ...link }));
     const prompt = composeComposerPrompt(draft, links, tail);
+    const projectID = activeProjectID();
     const sessionID = activeSessionID();
     if (!prompt && attachments.length === 0) {
       return;
     }
-    if (!sessionID) {
+    if (!projectID || !sessionID) {
       setError("当前没有可用会话，请先新建或选择一个会话");
       return;
     }
-    if (isSessionBusy(sessionID)) {
+    if (isSessionBusy(projectID, sessionID)) {
       return;
     }
     if (!activeProviderReady() || !activeChatModel()) {
@@ -1519,20 +1970,23 @@ function App() {
     }
 
     const assistantMessageID = `assistant-stream-${Date.now()}`;
+    const optimisticUserMessageID = `user-optimistic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const taskStartedAt = new Date().toISOString();
+    const assistantMessage: ChatMessage = {
+      id: assistantMessageID,
+      role: "assistant",
+      content: "",
+      createdAt: taskStartedAt,
+      model: activeChatModel(),
+      streaming: true,
+      status: "正在准备上下文",
+    };
     setActiveTaskProgress(undefined);
     setChatNearBottom(true);
     setMessages((current) => [
       ...current,
-      { ...createChatMessage("user", prompt), attachments },
-      {
-        id: assistantMessageID,
-        role: "assistant",
-        content: "",
-        createdAt: new Date().toISOString(),
-        model: activeChatModel(),
-        streaming: true,
-        status: "正在准备上下文",
-      },
+      { ...createChatMessage("user", prompt), id: optimisticUserMessageID, attachments },
+      assistantMessage,
     ]);
     setComposerDraft("");
     setComposerTail("");
@@ -1545,43 +1999,42 @@ function App() {
     setSubmittedLinks(links);
     setStreamingMessageID(assistantMessageID);
     setSendingMessage(true);
+    const sessionKey = sessionIdentityKey(projectID, sessionID);
     setSessionTaskRuntimes((current) => ({
       ...current,
-      [sessionID]: {
+      [sessionKey]: {
         taskID: "",
+        projectID,
         sessionID,
+        userMessageID: optimisticUserMessageID,
         messageID: assistantMessageID,
         prompt: draft,
         tail,
         attachments,
         links,
-        startedAt: new Date().toISOString(),
+        startedAt: taskStartedAt,
+        assistantMessage,
       },
     }));
     setError("");
     let taskID = "";
     try {
-      taskID = await startChatMessageForSession(sessionID, prompt, attachments);
+      taskID = await startChatMessageForSession(projectID, sessionID, prompt, attachments);
       setSessionTaskRuntimes((current) => {
-        const task = current[sessionID];
+        const task = current[sessionKey];
         if (!task) return current;
-        return { ...current, [sessionID]: { ...task, taskID } };
+        return { ...current, [sessionKey]: { ...task, taskID } };
       });
-      if (sessionID === activeSessionID()) {
+      if (projectID === activeProjectID() && sessionID === activeSessionID()) {
         setActiveChatTaskID(taskID);
       }
     } catch (err) {
       const message = errorMessage(err);
-      if (sessionID === activeSessionID()) {
+      if (projectID === activeProjectID() && sessionID === activeSessionID()) {
         setError(message);
-        setComposerDraft(draft);
-        setComposerTail(tail);
-        setComposerAttachments(attachments);
-        setComposerLinks(links);
-        resetComposerHistory();
-        updateStreamingMessage((current) => ({ ...current, content: message, failed: true, streaming: false, status: undefined }));
       }
-      void applyPendingReasoning(finishChatTask(sessionID, taskID));
+      rollbackOptimisticTurn(projectID, sessionID);
+      void applyPendingReasoning(finishChatTask(projectID, sessionID, taskID));
     }
   };
 
@@ -1670,6 +2123,7 @@ function App() {
   };
 
   const stopMessage = async () => {
+    const projectID = activeProjectID();
     const sessionID = activeSessionID();
     const taskID = activeChatTaskID();
     if (!sessionID || !taskID) {
@@ -1681,7 +2135,7 @@ function App() {
       if (accepted) return;
 
       const activeTasks = await getActiveChatTasks();
-      const stillRunning = activeTasks.some((task) => task.taskId === taskID || task.sessionId === sessionID);
+      const stillRunning = activeTasks.some((task) => task.taskId === taskID || (task.projectId === projectID && task.sessionId === sessionID));
       if (stillRunning) {
         setError("停止请求未被当前任务接受，请重试。");
         return;
@@ -1694,8 +2148,8 @@ function App() {
         status: undefined,
       }));
       settleActiveTaskProgress("cancelled");
-      const pendingReasoning = finishChatTask(sessionID, taskID);
-      await restoreSessionMessages(true, sessionID);
+      const pendingReasoning = finishChatTask(projectID, sessionID, taskID);
+      await restoreSessionMessages(true, projectID, sessionID);
       await applyPendingReasoning(pendingReasoning);
     } catch (err) {
       setError(errorMessage(err));
@@ -1735,18 +2189,28 @@ function App() {
   };
 
   // 从后端事件日志恢复当前会话的历史消息到前端（修复关闭打开对话消失）。
-  const restoreSessionMessages = async (preserveCurrentOnEmpty = false, sessionID = activeSessionID()) => {
+  let sessionRestoreGeneration = 0;
+  const restoreSessionMessages = async (
+    preserveCurrentOnEmpty = false,
+    projectID = activeProjectID(),
+    sessionID = activeSessionID(),
+  ) => {
+    if (!projectID || !sessionID) return;
+    const generation = ++sessionRestoreGeneration;
     try {
-      const history = await getSessionMessagesForSession(sessionID);
+      const history = await getSessionMessagesForSession(projectID, sessionID);
+      if (generation !== sessionRestoreGeneration || projectID !== activeProjectID() || sessionID !== activeSessionID()) return;
       setMessages((current) => reconcileSessionMessages(current, history, preserveCurrentOnEmpty));
-    } catch {
-      // 恢复失败不阻断使用。
+    } catch (err) {
+      // Lookup failures preserve the current UI. They must never masquerade as
+      // a valid empty conversation and erase visible history.
+      if (generation === sessionRestoreGeneration) setError(errorMessage(err));
     }
   };
 
   // 当前活动会话内容需在切换后重载：从后端事件日志恢复消息。
-  const activateSessionTask = (sessionID: string) => {
-    const task = sessionTaskRuntimes()[sessionID];
+  const activateSessionTask = (projectID: string, sessionID: string) => {
+    const task = sessionTaskRuntimes()[sessionIdentityKey(projectID, sessionID)];
     if (!task) {
       setSendingMessage(false);
       setActiveChatTaskID("");
@@ -1760,23 +2224,17 @@ function App() {
     setSubmittedTail(task.tail);
     setSubmittedAttachments(task.attachments);
     setSubmittedLinks(task.links);
+    setActiveTaskProgress(task.progress ? cloneTaskProgress(task.progress) : undefined);
     setMessages((current) => {
-      if (current.some((message) => message.id === task.messageID)) return current;
       const composed = composeComposerPrompt(task.prompt, task.links, task.tail);
       const hasUser = current.some((message) => message.role === "user" && message.content === composed);
-      return [
+      const withUser = [
         ...current,
         ...(!composed || hasUser ? [] : [{ ...createChatMessage("user", composed), attachments: task.attachments }]),
-        {
-          id: task.messageID,
-          role: "assistant" as const,
-          content: "",
-          createdAt: task.startedAt,
-          model: activeChatModel(),
-          streaming: true,
-          status: "后台任务正在运行",
-        },
       ];
+      const existingIndex = withUser.findIndex((message) => message.id === task.messageID);
+      if (existingIndex < 0) return [...withUser, task.assistantMessage];
+      return withUser.map((message, index) => index === existingIndex ? task.assistantMessage : message);
     });
   };
 
@@ -1786,17 +2244,30 @@ function App() {
       if (activeTasks.length === 0) return;
       const recovered: Record<string, SessionTaskRuntime> = {};
       for (const task of activeTasks) {
+        const projectID = task.projectId?.trim();
         const sessionID = task.sessionId?.trim();
-        if (!sessionID) continue;
-        recovered[sessionID] = {
+        if (!projectID || !sessionID) continue;
+        const startedAt = task.startedAt || new Date().toISOString();
+        const messageID = "assistant-recovered-" + task.taskId;
+        recovered[sessionIdentityKey(projectID, sessionID)] = {
           taskID: task.taskId,
+          projectID,
           sessionID,
-          messageID: "assistant-recovered-" + task.taskId,
+          userMessageID: "",
+          messageID,
           prompt: "",
           tail: "",
           attachments: [],
           links: [],
-          startedAt: task.startedAt || new Date().toISOString(),
+          startedAt,
+          assistantMessage: {
+            id: messageID,
+            role: "assistant",
+            content: "",
+            createdAt: startedAt,
+            streaming: true,
+            status: "后台任务正在运行",
+          },
         };
       }
       setSessionTaskRuntimes((current) => ({ ...recovered, ...current }));
@@ -1805,10 +2276,13 @@ function App() {
     }
   };
 
-  const reloadAfterSessionChange = (nextState: WorkbenchState, rememberQueue = true) => {
-    if (rememberQueue) rememberCurrentSessionQueue();
+  const reloadAfterSessionChange = (nextState: WorkbenchState, rememberQueue = true): boolean => {
+    if (rememberQueue) {
+      rememberCurrentSessionQueue();
+      rememberCurrentSessionView();
+    }
     setState(nextState);
-    setActiveTaskProgress(undefined);
+    setSelectedSessionID(nextState.activeSessionId || "");
     setQueuedMessages([]);
     setComposerDraft("");
     setComposerTail("");
@@ -1816,9 +2290,18 @@ function App() {
     setComposerLinks([]);
     resetComposerHistory();
     setChatNearBottom(true);
-    if (rememberQueue) void restoreSessionMessages();
+    const restored = restoreSessionView(nextState.activeProjectId, nextState.activeSessionId);
+    restoreSessionQueue(nextState.activeProjectId, nextState.activeSessionId);
+    activateSessionTask(nextState.activeProjectId, nextState.activeSessionId);
+    if (rememberQueue) {
+      void (async () => {
+        await restoreSessionMessages(restored || isSessionBusy(nextState.activeProjectId, nextState.activeSessionId), nextState.activeProjectId, nextState.activeSessionId);
+        activateSessionTask(nextState.activeProjectId, nextState.activeSessionId);
+      })();
+    }
     void refreshProjectsAndSessions();
     void refreshCheckpoints();
+    return restored;
   };
 
   const handleNewSession = async () => {
@@ -1829,16 +2312,16 @@ function App() {
     }
   };
 
-  const handleSwitchSession = async (sessionID: string) => {
+  const handleSwitchSession = async (projectID: string, sessionID: string) => {
     setSwitchingSession(true);
     try {
-      rememberCurrentSessionQueue(activeSessionID());
-      const nextState = await switchSession(sessionID);
+      rememberCurrentSessionQueue();
+      rememberCurrentSessionView();
+      const nextState = await switchSession(projectID, sessionID);
       setSelectedSessionID(sessionID);
-      reloadAfterSessionChange(nextState, false);
-      await restoreSessionMessages(false, sessionID);
-      restoreSessionQueue(sessionID);
-      activateSessionTask(sessionID);
+      const restored = reloadAfterSessionChange(nextState, false);
+      await restoreSessionMessages(restored || isSessionBusy(projectID, sessionID), projectID, sessionID);
+      activateSessionTask(projectID, sessionID);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -1884,10 +2367,38 @@ function App() {
     return { parent, name: `${sourceName}-worktree` };
   };
 
+  const openSessionMenu = (event: MouseEvent, project: ProjectNode, session: SessionInfo) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget instanceof HTMLElement
+      ? event.currentTarget.getBoundingClientRect()
+      : undefined;
+    const width = 224;
+    const height = 252;
+    const margin = 8;
+    const anchorX = event.clientX || rect?.right || margin;
+    const anchorY = event.clientY || rect?.bottom || margin;
+    const left = Math.min(Math.max(margin, anchorX), Math.max(margin, window.innerWidth - width - margin));
+    const top = Math.min(Math.max(margin, anchorY), Math.max(margin, window.innerHeight - height - margin));
+    setProjectMenu(undefined);
+    setSessionMenu({ project, session, left: Math.round(left), top: Math.round(top) });
+  };
+
+  const openSessionRenameDialog = (menu: SessionMenuState) => {
+    setSessionMenu(undefined);
+    setError("");
+    setSessionRenameDialog({
+      project: menu.project,
+      session: menu.session,
+      title: menu.session.title || "新对话",
+    });
+  };
+
   const openProjectMenu = (event: MouseEvent, project: ProjectNode) => {
     event.preventDefault();
     event.stopPropagation();
     if (projectActionBusy()) return;
+    setSessionMenu(undefined);
     if (projectMenu()?.project.id === project.id) {
       setProjectMenu(undefined);
       return;
@@ -2021,29 +2532,118 @@ function App() {
     }
   };
 
-  const handleArchiveSession = async (sessionID: string, archived: boolean) => {
+  const submitSessionRename = async () => {
+    const dialog = sessionRenameDialog();
+    if (!dialog) return;
+    const title = dialog.title.trim();
+    if (!title) {
+      setError("会话名称不能为空。");
+      return;
+    }
+    const sessionKey = sessionIdentityKey(dialog.project.id, dialog.session.id);
+    if (sessionActionBusyID() || isSessionBusy(dialog.project.id, dialog.session.id)) return;
+    setSessionActionBusyID(sessionKey);
+    setError("");
     try {
-      setState(await archiveSession(sessionID, archived));
+      setState(await renameSession(dialog.project.id, dialog.session.id, title));
+      setSessionRenameDialog(undefined);
       await refreshProjectsAndSessions();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSessionActionBusyID("");
+    }
+  };
+
+  const handleOpenSessionProjectDirectory = async (projectID: string) => {
+    setSessionMenu(undefined);
+    setError("");
+    try {
+      await openProjectInFileManager(projectID);
     } catch (err) {
       setError(errorMessage(err));
     }
   };
 
-  const handleDeleteSession = async (session: SessionInfo) => {
-    if (isSessionBusy(session.id) || deletingSessionID()) {
-      return;
-    }
-    const title = session.title || "新对话";
-    if (!window.confirm(`永久删除对话“${title}”？\n\n对话记录与事件快照会一并删除，此操作无法撤销。`)) {
-      return;
-    }
-    setDeletingSessionID(session.id);
+  const handleCopySessionValue = async (value: string) => {
+    setSessionMenu(undefined);
     setError("");
     try {
-      const nextState = await deleteSession(session.id);
-      if (session.isActive) {
-        reloadAfterSessionChange(nextState);
+      await writeClipboardText(value);
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  const handleArchiveSession = async (projectID: string, sessionID: string, archived: boolean) => {
+    const sessionKey = sessionIdentityKey(projectID, sessionID);
+    if (sessionActionBusyID() || isSessionBusy(projectID, sessionID)) return;
+    setSessionMenu(undefined);
+    setSessionActionBusyID(sessionKey);
+    setError("");
+    try {
+      setState(await archiveSession(projectID, sessionID, archived));
+      await refreshProjectsAndSessions();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSessionActionBusyID("");
+    }
+  };
+
+  const handleDeleteSession = async (projectID: string, session: SessionInfo) => {
+    const sessionKey = sessionIdentityKey(projectID, session.id);
+    if (isSessionBusy(projectID, session.id) || deletingSessionID() || sessionActionBusyID()) {
+      return;
+    }
+    setSessionMenu(undefined);
+    const title = session.title || "新对话";
+    const confirmed = await confirmAction({
+      title: "删除对话？",
+      message: `“${title}”将从当前项目中永久删除。`,
+      detail: "对话记录与事件快照会一并删除，此操作无法撤销。",
+      confirmLabel: "删除",
+      tone: "danger",
+    });
+    if (!confirmed) return;
+    const currentProjectID = activeProjectID();
+    const currentSessionID = activeSessionID();
+    const deletingActiveSession = projectID === currentProjectID && session.id === currentSessionID;
+    setDeletingSessionID(sessionKey);
+    setError("");
+    try {
+      const nextState = await deleteSession(projectID, session.id);
+      setQueuedMessagesBySession((current) => {
+        if (!(sessionKey in current)) return current;
+        const next = { ...current };
+        delete next[sessionKey];
+        return next;
+      });
+      setSessionViewStates((current) => {
+        if (!(sessionKey in current)) return current;
+        const next = { ...current };
+        delete next[sessionKey];
+        return next;
+      });
+      setSessionTaskRuntimes((current) => {
+        if (!(sessionKey in current)) return current;
+        const next = { ...current };
+        delete next[sessionKey];
+        return next;
+      });
+
+      const activeIdentityChanged = deletingActiveSession
+        || nextState.activeProjectId !== currentProjectID
+        || nextState.activeSessionId !== currentSessionID;
+      if (activeIdentityChanged) {
+        const restored = reloadAfterSessionChange(nextState, false);
+        await restoreSessionMessages(
+          restored || isSessionBusy(nextState.activeProjectId, nextState.activeSessionId),
+          nextState.activeProjectId,
+          nextState.activeSessionId,
+        );
+        activateSessionTask(nextState.activeProjectId, nextState.activeSessionId);
+        await refreshProjectsAndSessions();
       } else {
         setState(nextState);
         await refreshProjectsAndSessions();
@@ -2095,7 +2695,7 @@ function App() {
     setEditingMessageBusy(true);
     setError("");
     try {
-      setState(await forkFromMessage(message.eventId));
+      setState(await forkFromMessage(message.eventId, activeProjectID(), activeSessionID()));
       await restoreSessionMessages();
       await refreshCheckpoints();
       await refreshProjectsAndSessions();
@@ -2119,7 +2719,7 @@ function App() {
     setForkingMessageID(message.id);
     setError("");
     try {
-      setState(await forkFromMessage(message.eventId));
+      setState(await forkFromMessage(message.eventId, activeProjectID(), activeSessionID()));
       await restoreSessionMessages();
       await refreshCheckpoints();
       await refreshProjectsAndSessions();
@@ -2137,6 +2737,39 @@ function App() {
       setError(errorMessage(err));
     } finally {
       setForkingMessageID("");
+    }
+  };
+
+  const handleUndoMessageChanges = async (message: ChatMessage) => {
+    if (message.id !== undoableFileChangeMessageID() || currentSessionBusy() || rewinding()) return;
+    const messageIndex = messages().findIndex((candidate) => candidate.id === message.id);
+    const sourceMessage = messages()
+      .slice(0, messageIndex)
+      .reverse()
+      .find((candidate) => candidate.role === "user" && candidate.eventId);
+    if (!sourceMessage?.eventId) {
+      setError("找不到本轮修改之前的会话检查点。");
+      return;
+    }
+
+    setRewinding(true);
+    setError("");
+    try {
+      setState(await forkFromMessage(sourceMessage.eventId, activeProjectID(), activeSessionID()));
+      await restoreSessionMessages();
+      await refreshCheckpoints();
+      await refreshProjectsAndSessions();
+      const restored = splitComposerPrompt(sourceMessage.content);
+      setComposerDraft(restored.text);
+      setComposerTail(restored.tail);
+      setComposerLinks(restored.links);
+      setComposerAttachments(sourceMessage.attachments ?? []);
+      resetComposerHistory();
+      queueMicrotask(focusComposerEnd);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setRewinding(false);
     }
   };
 
@@ -2656,17 +3289,24 @@ function App() {
                   </div>
                   <For each={project.sessions.filter((s) => showArchived() || !s.archived)}>
                     {(session) => (
-                      <div class="sess-row-wrap" classList={{ archived: session.archived }}>
+                      <div
+                        class="sess-row-wrap"
+                        classList={{ archived: session.archived }}
+                        data-session-menu-target
+                        onContextMenu={(event) => openSessionMenu(event, project, session)}
+                      >
                         <button
                           class="sess-row"
                           classList={{ active: session.isActive }}
                           type="button"
-                          disabled={switchingSession() || deletingSessionID() === session.id}
-                          onClick={() => void handleSwitchSession(session.id)}
+                          disabled={switchingSession()
+                            || deletingSessionID() === sessionIdentityKey(project.id, session.id)
+                            || sessionActionBusyID() === sessionIdentityKey(project.id, session.id)}
+                          onClick={() => void handleSwitchSession(project.id, session.id)}
                           title={session.title}
                         >
                           <span class="sess-title">{session.title || "新对话"}</span>
-                          <Show when={sessionTaskRuntimes()[session.id]}>
+                          <Show when={sessionTaskRuntimes()[sessionIdentityKey(project.id, session.id)]}>
                             <span class="sess-running-dot" title="后台生成中" aria-label="后台生成中" />
                           </Show>
                           <span class="sess-time">{relativeTime(session.updatedAt)}</span>
@@ -2677,8 +3317,8 @@ function App() {
                             type="button"
                             title={session.archived ? "取消归档" : "归档"}
                             aria-label={session.archived ? "取消归档" : "归档"}
-                            disabled={isSessionBusy(session.id) || Boolean(deletingSessionID())}
-                            onClick={() => void handleArchiveSession(session.id, !session.archived)}
+                            disabled={isSessionBusy(project.id, session.id) || Boolean(deletingSessionID()) || Boolean(sessionActionBusyID())}
+                            onClick={() => void handleArchiveSession(project.id, session.id, !session.archived)}
                           >
                             <Archive size={12} />
                           </button>
@@ -2687,8 +3327,8 @@ function App() {
                             type="button"
                             title="永久删除对话"
                             aria-label="永久删除对话"
-                            disabled={isSessionBusy(session.id) || Boolean(deletingSessionID())}
-                            onClick={() => void handleDeleteSession(session)}
+                            disabled={isSessionBusy(project.id, session.id) || Boolean(deletingSessionID()) || Boolean(sessionActionBusyID())}
+                            onClick={() => void handleDeleteSession(project.id, session)}
                           >
                             <Trash2 size={12} />
                           </button>
@@ -2701,6 +3341,114 @@ function App() {
             </For>
           </Show>
         </div>
+
+        <Show when={sessionMenu()}>
+          {(menu) => (
+            <Portal>
+              <div
+                ref={sessionActionMenuRef}
+                class="project-action-menu session-action-menu"
+                role="menu"
+                aria-label={`${menu().session.title || "新对话"} 会话操作`}
+                style={{ left: `${menu().left}px`, top: `${menu().top}px` }}
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={Boolean(sessionActionBusyID()) || isSessionBusy(menu().project.id, menu().session.id)}
+                  onClick={() => openSessionRenameDialog(menu())}
+                >
+                  <Pencil size={15} />
+                  <span>重命名</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={Boolean(sessionActionBusyID()) || Boolean(deletingSessionID()) || isSessionBusy(menu().project.id, menu().session.id)}
+                  onClick={() => void handleArchiveSession(menu().project.id, menu().session.id, !menu().session.archived)}
+                >
+                  <Archive size={15} />
+                  <span>{menu().session.archived ? "取消归档" : "归档"}</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => void handleOpenSessionProjectDirectory(menu().project.id)}>
+                  <FolderOpen size={15} />
+                  <span>打开项目目录</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => void handleCopySessionValue(menu().project.workspaceRoot)}>
+                  <Copy size={15} />
+                  <span>复制工作目录</span>
+                </button>
+                <button type="button" role="menuitem" onClick={() => void handleCopySessionValue(menu().session.id)}>
+                  <Braces size={15} />
+                  <span>复制会话 ID</span>
+                </button>
+                <button
+                  class="danger"
+                  type="button"
+                  role="menuitem"
+                  disabled={Boolean(sessionActionBusyID()) || Boolean(deletingSessionID()) || isSessionBusy(menu().project.id, menu().session.id)}
+                  onClick={() => void handleDeleteSession(menu().project.id, menu().session)}
+                >
+                  <Trash2 size={15} />
+                  <span>永久删除</span>
+                </button>
+              </div>
+            </Portal>
+          )}
+        </Show>
+
+        <Show when={sessionRenameDialog()}>
+          {(dialog) => {
+            const busy = () => sessionActionBusyID() === sessionIdentityKey(dialog().project.id, dialog().session.id);
+            return (
+              <Portal>
+                <div
+                  class="project-action-overlay"
+                  role="presentation"
+                  onPointerDown={(event) => {
+                    if (event.currentTarget === event.target && !busy()) setSessionRenameDialog(undefined);
+                  }}
+                >
+                  <form
+                    class="project-action-dialog session-rename-dialog"
+                    aria-label="重命名会话"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void submitSessionRename();
+                    }}
+                  >
+                    <header>
+                      <div class="project-action-title-icon"><Pencil size={17} /></div>
+                      <div>
+                        <strong>重命名会话</strong>
+                        <span>{dialog().project.name}</span>
+                      </div>
+                      <button type="button" title="关闭" aria-label="关闭" disabled={busy()} onClick={() => setSessionRenameDialog(undefined)}><X size={15} /></button>
+                    </header>
+                    <div class="project-action-body">
+                      <label class="project-action-field">
+                        <span>会话名称</span>
+                        <input
+                          value={dialog().title}
+                          maxlength={200}
+                          autofocus
+                          disabled={busy()}
+                          onFocus={(event) => event.currentTarget.select()}
+                          onInput={(event) => setSessionRenameDialog((current) => current ? { ...current, title: event.currentTarget.value } : current)}
+                        />
+                      </label>
+                      <p class="project-action-note">只修改当前项目中的这条会话。</p>
+                    </div>
+                    <footer>
+                      <button class="secondary" type="button" disabled={busy()} onClick={() => setSessionRenameDialog(undefined)}>取消</button>
+                      <button type="submit" disabled={busy() || !dialog().title.trim()}>{busy() ? "保存中…" : "保存"}</button>
+                    </footer>
+                  </form>
+                </div>
+              </Portal>
+            );
+          }}
+        </Show>
 
         <Show when={projectMenu()}>
           {(menu) => (
@@ -2930,9 +3678,9 @@ function App() {
       <div
         class="workbench-main"
         classList={{
-          "side-panel-open": Boolean(browserPreview()) || reviewOpen(),
-          "browser-open": sidePanelView() === "browser" && Boolean(browserPreview()),
-          "review-open": sidePanelView() === "files" && reviewOpen(),
+          "side-panel-open": !drawerOpen() && (Boolean(browserPreview()) || reviewOpen()),
+          "browser-open": !drawerOpen() && sidePanelView() === "browser" && Boolean(browserPreview()),
+          "review-open": !drawerOpen() && sidePanelView() === "files" && reviewOpen(),
           "resizing-browser": resizingBrowserPanel(),
         }}
         ref={workbenchRef}
@@ -3019,12 +3767,36 @@ function App() {
             each={messages()}
             fallback={
               <div class="welcome-state">
-                <h1>开始新任务</h1>
-                <Show when={!deepSeek().configured}>
-                  <button type="button" onClick={() => openDrawer("settings")}>
-                    连接 DeepSeek
+                <div class="welcome-brand">
+                  <span class="welcome-mark"><Command size={16} /></span>
+                  <span>MHcode</span>
+                </div>
+                <div class="welcome-heading">
+                  <span>当前工作区</span>
+                  <h1>{runtimeSettings().workspaceRoot?.trim() ? workspaceName() : "今天处理什么？"}</h1>
+                  <Show when={runtimeSettings().workspaceRoot?.trim()}>
+                    {(root) => <p class="welcome-path" title={root()}><FolderOpen size={14} /><span>{root()}</span></p>}
+                  </Show>
+                </div>
+                <Show when={!runtimeSettings().workspaceRoot?.trim()}>
+                  <button class="welcome-add-project" type="button" onClick={() => void handleAddProject()}>
+                    <FolderOpen size={15} />添加项目
                   </button>
                 </Show>
+                <div class="welcome-prompt-grid" aria-label="常用任务">
+                  <button class="welcome-prompt" type="button" onClick={() => primeWelcomePrompt("梳理当前项目的结构、关键模块和运行方式")}>
+                    <Search size={16} /><span>梳理当前项目</span><ArrowRight size={14} />
+                  </button>
+                  <button class="welcome-prompt" type="button" onClick={() => primeWelcomePrompt("检查当前工作区未提交的修改并指出风险")}>
+                    <GitBranch size={16} /><span>检查当前修改</span><ArrowRight size={14} />
+                  </button>
+                  <button class="welcome-prompt" type="button" onClick={() => primeWelcomePrompt("定位当前项目的问题并给出修复方案")}>
+                    <Wrench size={16} /><span>定位并修复问题</span><ArrowRight size={14} />
+                  </button>
+                  <button class="welcome-prompt" type="button" onClick={() => primeWelcomePrompt("为接下来的开发任务制定一份可执行计划")}>
+                    <ClipboardList size={16} /><span>制定实现计划</span><ArrowRight size={14} />
+                  </button>
+                </div>
               </div>
             }
           >
@@ -3035,6 +3807,13 @@ function App() {
                   <article class="op-msg assistant" classList={{ system: message.role === "system", failed: message.failed }}>
                     <MessageContent
                       parts={message.parts && message.parts.length > 0 ? message.parts : textToParts(message.content)}
+                      hideTeamRun={message.streaming && activeSessionTask()?.messageID === message.id}
+                      hideFileChangesSummary={message.streaming}
+                      undoingChanges={rewinding()}
+                      onUndoChanges={message.id === undoableFileChangeMessageID() && message.eventId
+                        ? () => handleUndoMessageChanges(message)
+                        : undefined}
+                      onReviewChanges={openReviewPanel}
                       onPreviewFile={handlePreviewFile}
                       onOpenWorkspaceFile={handleOpenWorkspaceFile}
                       onOpenURL={requestOpenURL}
@@ -3052,6 +3831,12 @@ function App() {
                           </Show>
                         </Show>
                         <span>{message.status || (message.cancelled ? "已停止" : "正在生成")}</span>
+                      </div>
+                    </Show>
+                    <Show when={!message.streaming && message.durationMs !== undefined && (message.content || message.parts?.length)}>
+                      <div class="op-message-runtime" title="本轮从提交到完成的总耗时">
+                        <Clock3 size={12} aria-hidden="true" />
+                        <span>已处理 {formatElapsedDuration(message.durationMs)}</span>
                       </div>
                     </Show>
                     <Show when={message.role === "assistant" && !message.streaming && (message.content || message.parts?.length)}>
@@ -3230,12 +4015,20 @@ function App() {
           </Show>
         </div>
 
-        <Show when={activeTaskProgress()}>
-          {(progress) => (
-            <section class="task-progress-dock" aria-label="当前任务进度" aria-live="polite">
-              <TaskProgress part={progress()} />
-            </section>
-          )}
+        <Show when={Boolean(activeTaskProgress()) || activeTeamParts().length > 0}>
+          <section
+            class="execution-status-dock"
+            classList={{ combined: Boolean(activeTaskProgress()) && activeTeamParts().length > 0 }}
+            aria-label="当前执行状态"
+            aria-live="polite"
+          >
+            <Show when={activeTaskProgress()}>
+              {(progress) => <TaskProgress part={progress()} />}
+            </Show>
+            <Show when={activeTeamParts().length > 0}>
+              <TeamRun parts={activeTeamParts()} docked />
+            </Show>
+          </section>
         </Show>
 
         <section class="composer-dock">
@@ -3502,7 +4295,7 @@ function App() {
         />
       </section>
 
-      <Show when={Boolean(browserPreview()) || reviewOpen()}>
+      <Show when={!drawerOpen() && (Boolean(browserPreview()) || reviewOpen())}>
         <>
           <div
             class="browser-panel-resizer"
@@ -3597,6 +4390,7 @@ function App() {
               turnCount: 0,
               summary: "Project: MHcode",
             }}
+            projectTree={projectTree()}
             uiAppearance={uiAppearance()}
             effectiveUIScale={effectiveUIScale()}
             updateUIAppearance={updateUIAppearance}
@@ -3648,6 +4442,7 @@ function App() {
             resetSidebarWidth={resetSidebarWidth}
             usage={usage()}
             usageLedger={state()?.usageLedger}
+            confirmAction={confirmAction}
           />
         </aside>
       </Show>
@@ -3666,6 +4461,8 @@ function App() {
       <Show when={activeApproval()}>
         {(req) => <ApprovalModal request={req()} busy={approvalBusy()} onDecide={decideApproval} />}
       </Show>
+
+      <ConfirmDialog request={confirmation()} onResolve={resolveConfirmation} />
 
       <Show when={pendingLinkURL()}>
         <div class="link-open-overlay" role="presentation" onPointerDown={(event) => {
@@ -3937,6 +4734,23 @@ function updateLiveTeamPart(parts: MessagePart[] | undefined, event: ChatTaskEve
   return next;
 }
 
+function teamRoleLabel(role: TeamPart["role"]): string {
+  switch (role) {
+    case "planner": return "规划";
+    case "implementer": return "实现";
+    case "tester": return "测试";
+    case "reviewer": return "审阅";
+    case "synthesizer": return "汇总";
+  }
+}
+
+function messageHasTrackedFileChanges(message: ChatMessage): boolean {
+  return Boolean(message.parts?.some((part) =>
+    part.kind === "diff"
+    || (part.kind === "file" && (part.created === true || part.fileAction === "created" || part.fileAction === "modified")),
+  ));
+}
+
 function mergeLiveToolResultParts(
   current: MessagePart[],
   resultParts: MessagePart[] | undefined,
@@ -3946,7 +4760,24 @@ function mergeLiveToolResultParts(
   }
   const next = [...current];
   for (const part of resultParts) {
-    if (part.kind === "tool_call" || part.kind === "task_progress") {
+    if (part.kind === "tool_call") {
+      let index = -1;
+      for (let candidate = next.length - 1; candidate >= 0; candidate--) {
+        const currentPart = next[candidate];
+        if (currentPart.kind !== "tool_call" || currentPart.name !== part.name) continue;
+        if (part.input && currentPart.input && part.input !== currentPart.input) continue;
+        index = candidate;
+        break;
+      }
+      if (index >= 0) {
+        const currentPart = next[index] as Extract<MessagePart, { kind: "tool_call" }>;
+        next[index] = { ...currentPart, ...part, toolCallId: currentPart.toolCallId };
+      } else {
+        next.push(part);
+      }
+      continue;
+    }
+    if (part.kind === "task_progress") {
       continue;
     }
     if (part.kind === "web_search_results") {

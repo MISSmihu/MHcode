@@ -102,12 +102,16 @@ func TestAnthropicStreamingToolLoopExecutesAndReturnsToolResult(t *testing.T) {
 			if !strings.Contains(string(body), `"tools"`) {
 				t.Errorf("first Anthropic request does not declare tools: %s", body)
 			}
-			_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_read\",\"name\":\"read_file\",\"input\":{\"path\":\"fixture.txt\"}}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed\"}}\n\n"))
 			_, _ = w.Write([]byte("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_read\",\"name\":\"read_file\",\"input\":{\"path\":\"fixture.txt\"}}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"))
 			_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
 		case 2:
 			payload := string(body)
-			for _, expected := range []string{`"type":"tool_result"`, `"tool_use_id":"toolu_read"`, "hello from fixture"} {
+			for _, expected := range []string{`"type":"thinking"`, `"thinking":"plan"`, `"signature":"signed"`, `"type":"tool_result"`, `"tool_use_id":"toolu_read"`, "hello from fixture"} {
 				if !strings.Contains(payload, expected) {
 					t.Errorf("second Anthropic request missing %q: %s", expected, payload)
 				}
@@ -149,10 +153,10 @@ func TestGeminiStreamingToolLoopExecutesAndReturnsFunctionResponse(t *testing.T)
 			if !strings.Contains(string(body), `"functionDeclarations"`) {
 				t.Errorf("first Gemini request does not declare tools: %s", body)
 			}
-			_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":\"gemini-read\",\"name\":\"read_file\",\"args\":{\"path\":\"fixture.txt\"}}}]}}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"plan\",\"thought\":true,\"thoughtSignature\":\"thought-signed\"},{\"functionCall\":{\"id\":\"gemini-read\",\"name\":\"read_file\",\"args\":{\"path\":\"fixture.txt\"}},\"thoughtSignature\":\"tool-signed\"}]}}]}\n\n"))
 		case 2:
 			payload := string(body)
-			for _, expected := range []string{`"functionResponse"`, `"id":"gemini-read"`, "hello from fixture"} {
+			for _, expected := range []string{`"thoughtSignature":"thought-signed"`, `"thoughtSignature":"tool-signed"`, `"functionResponse"`, `"id":"gemini-read"`, "hello from fixture"} {
 				if !strings.Contains(payload, expected) {
 					t.Errorf("second Gemini request missing %q: %s", expected, payload)
 				}
@@ -173,6 +177,53 @@ func TestGeminiStreamingToolLoopExecutesAndReturnsFunctionResponse(t *testing.T)
 		t.Fatal(err)
 	}
 	if outcome.Content != "gemini done" || requestCount.Load() != 2 {
+		t.Fatalf("outcome = %#v, requests = %d", outcome, requestCount.Load())
+	}
+}
+
+func TestDeepSeekThinkingToolLoopReturnsReasoningContent(t *testing.T) {
+	svc, _ := newNativeToolLoopService(t)
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch requestCount.Add(1) {
+		case 1:
+			for _, expected := range []string{`"thinking":{"type":"enabled"}`, `"reasoning_effort":"high"`, `"tools"`} {
+				if !strings.Contains(string(body), expected) {
+					t.Errorf("first DeepSeek request missing %q: %s", expected, body)
+				}
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"checking","reasoning_content":"signed plan","tool_calls":[{"id":"deepseek-read","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"fixture.txt\"}"}}]}}]}`))
+		case 2:
+			payload := string(body)
+			for _, expected := range []string{`"reasoning_content":"signed plan"`, `"tool_call_id":"deepseek-read"`, "hello from fixture"} {
+				if !strings.Contains(payload, expected) {
+					t.Errorf("second DeepSeek request missing %q: %s", expected, payload)
+				}
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"deepseek done"}}]}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	provider := protocol.DeepSeekProvider{BaseURL: server.URL, APIKey: "test-key"}
+	outcome, err := svc.runToolLoop(context.Background(), provider, svc.buildToolRegistry(), protocol.ChatRequest{
+		Model:          "deepseek-v4-pro",
+		ReasoningLevel: "high",
+		Messages:       []protocol.Message{{Role: "user", Content: "read fixture.txt"}},
+	}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Content != "deepseek done" || requestCount.Load() != 2 {
 		t.Fatalf("outcome = %#v, requests = %d", outcome, requestCount.Load())
 	}
 }

@@ -2,12 +2,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/MISSmihu/MHcode/internal/cache"
+	"github.com/MISSmihu/MHcode/internal/eventlog"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
@@ -72,12 +74,43 @@ type TeamRoleEvent struct {
 
 type teamArtifact struct {
 	role    string
+	attempt int
 	content string
 	verdict string
 	route   chatRoute
 	parts   []tools.ResultPart
 	usage   cache.UsageMetrics
 }
+
+const teamRunCheckpointVersion = 1
+
+type teamRunCheckpoint struct {
+	Version      int                      `json:"version"`
+	Status       string                   `json:"status"`
+	NextRole     string                   `json:"nextRole"`
+	NextAttempt  int                      `json:"nextAttempt"`
+	ReviewRound  int                      `json:"reviewRound"`
+	PlanStarted  bool                     `json:"planStarted"`
+	PlanApproved bool                     `json:"planApproved"`
+	Team         TeamState                `json:"team"`
+	Artifacts    []teamCheckpointArtifact `json:"artifacts"`
+	Parts        []tools.ResultPart       `json:"parts"`
+	Usage        cache.UsageMetrics       `json:"usage"`
+	UpdatedAt    string                   `json:"updatedAt"`
+}
+
+type teamCheckpointArtifact struct {
+	Role       string             `json:"role"`
+	Attempt    int                `json:"attempt"`
+	Content    string             `json:"content"`
+	Verdict    string             `json:"verdict,omitempty"`
+	ProviderID string             `json:"providerId,omitempty"`
+	Model      string             `json:"model,omitempty"`
+	Parts      []tools.ResultPart `json:"parts,omitempty"`
+	Usage      cache.UsageMetrics `json:"usage"`
+}
+
+var errTeamRunPaused = errors.New("AI team run paused")
 
 func isTeamRole(role string) bool {
 	for _, candidate := range teamRoleOrder {
@@ -110,11 +143,164 @@ func cloneTeamState(state TeamState) TeamState {
 	return state
 }
 
+func cloneTeamRunCheckpoint(checkpoint *teamRunCheckpoint) *teamRunCheckpoint {
+	if checkpoint == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		clone := *checkpoint
+		clone.Team = cloneTeamState(checkpoint.Team)
+		clone.Artifacts = append([]teamCheckpointArtifact(nil), checkpoint.Artifacts...)
+		clone.Parts = append([]tools.ResultPart(nil), checkpoint.Parts...)
+		return &clone
+	}
+	var clone teamRunCheckpoint
+	if err := json.Unmarshal(encoded, &clone); err != nil {
+		return nil
+	}
+	return &clone
+}
+
+func newTeamRunCheckpoint(settings TeamSettings) *teamRunCheckpoint {
+	nextRole := TeamRoleImplementer
+	if roleEnabled(settings, TeamRolePlanner) {
+		nextRole = TeamRolePlanner
+	}
+	return &teamRunCheckpoint{
+		Version:     teamRunCheckpointVersion,
+		Status:      "running",
+		NextRole:    nextRole,
+		NextAttempt: 1,
+		Artifacts:   []teamCheckpointArtifact{},
+		Parts:       []tools.ResultPart{},
+	}
+}
+
+func (s *Service) persistTeamRunCheckpoint(checkpoint *teamRunCheckpoint) error {
+	if checkpoint == nil {
+		s.teamResume = nil
+		return nil
+	}
+	checkpoint.Version = teamRunCheckpointVersion
+	checkpoint.Team = cloneTeamState(s.teamState)
+	checkpoint.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	if checkpoint.Status == "running" || checkpoint.Status == "paused" {
+		s.teamResume = cloneTeamRunCheckpoint(checkpoint)
+	} else {
+		s.teamResume = nil
+	}
+	if s.eventStore == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return fmt.Errorf("encode AI team checkpoint: %w", err)
+	}
+	hash, err := s.eventStore.WriteSnapshot(string(encoded))
+	if err != nil {
+		return fmt.Errorf("store AI team checkpoint: %w", err)
+	}
+	if _, err := s.eventStore.Append(eventlog.EventPayload{TeamCheckpointHash: hash}, eventlog.EventTeamCheckpoint); err != nil {
+		return fmt.Errorf("append AI team checkpoint: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) restoreTeamRunCheckpoint(hash string) *teamRunCheckpoint {
+	if s.eventStore == nil || strings.TrimSpace(hash) == "" {
+		return nil
+	}
+	encoded, err := s.eventStore.ReadSnapshot(hash)
+	if err != nil {
+		return nil
+	}
+	var checkpoint teamRunCheckpoint
+	if err := json.Unmarshal([]byte(encoded), &checkpoint); err != nil || checkpoint.Version != teamRunCheckpointVersion {
+		return nil
+	}
+	if checkpoint.NextAttempt < 1 {
+		checkpoint.NextAttempt = 1
+	}
+	return &checkpoint
+}
+
+func teamArtifactsFromCheckpoint(checkpoint *teamRunCheckpoint) []teamArtifact {
+	if checkpoint == nil {
+		return nil
+	}
+	artifacts := make([]teamArtifact, 0, len(checkpoint.Artifacts))
+	for _, item := range checkpoint.Artifacts {
+		artifacts = append(artifacts, teamArtifact{
+			role: item.Role, attempt: item.Attempt, content: item.Content, verdict: item.Verdict,
+			route: chatRoute{Provider: ModelProviderSetting{ID: item.ProviderID}, ModelID: item.Model},
+			parts: append([]tools.ResultPart(nil), item.Parts...), usage: item.Usage,
+		})
+	}
+	return artifacts
+}
+
+func checkpointTeamArtifacts(artifacts []teamArtifact) []teamCheckpointArtifact {
+	checkpoint := make([]teamCheckpointArtifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		checkpoint = append(checkpoint, teamCheckpointArtifact{
+			Role: artifact.role, Attempt: artifact.attempt, Content: artifact.content, Verdict: artifact.verdict,
+			ProviderID: artifact.route.Provider.ID, Model: artifact.route.ModelID,
+			Parts: append([]tools.ResultPart(nil), artifact.parts...), Usage: artifact.usage,
+		})
+	}
+	return checkpoint
+}
+
+func teamArtifactAt(artifacts []teamArtifact, role string, attempt int) (teamArtifact, bool) {
+	for index := len(artifacts) - 1; index >= 0; index-- {
+		if artifacts[index].role == role && artifacts[index].attempt == attempt {
+			return artifacts[index], true
+		}
+	}
+	return teamArtifact{}, false
+}
+
+func isTeamResumePrompt(prompt string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(prompt))
+	normalized = strings.Trim(normalized, "。！!？?，,.;； ")
+	switch normalized {
+	case "继续", "继续吧", "继续执行", "继续开发", "接着", "接着做", "接着开发", "resume", "continue", "go on":
+		return true
+	default:
+		return false
+	}
+}
+
+type teamResumeTurnKey struct{}
+
+func withTeamResumeTurn(ctx context.Context) context.Context {
+	return context.WithValue(ctx, teamResumeTurnKey{}, true)
+}
+
+func isTeamResumeTurn(ctx context.Context) bool {
+	resume, _ := ctx.Value(teamResumeTurnKey{}).(bool)
+	return resume
+}
+
+func (s *Service) recordTeamPauseMessage(content, model string, parts []tools.ResultPart, durations ...int64) {
+	if s.eventStore == nil {
+		return
+	}
+	durationMs := int64(0)
+	if len(durations) > 0 && durations[0] > 0 {
+		durationMs = durations[0]
+	}
+	_, _ = s.eventStore.Append(eventlog.EventPayload{
+		Role: "assistant", Content: content, Model: model, DurationMs: durationMs, Parts: toEventParts(parts),
+	}, eventlog.EventAssistantMessage)
+}
+
 func (s *Service) teamModeEnabled() bool {
 	return s.runtimeSettings.Team.Enabled
 }
 
-func (s *Service) runTeamTurn(
+func (s *Service) runTeamTurnLegacy(
 	ctx context.Context,
 	baseRequest protocol.ChatRequest,
 	maxToolCalls int,
@@ -201,7 +387,7 @@ func (s *Service) runTeamTurn(
 			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 			s.sessionState.MessageCount = len(s.sessionMessages)
 			s.sessionState.TurnCount++
-			s.recordAssistantAndCheckpoint(answer, plan.route.ModelID, parts)
+			s.recordAssistantAndCheckpoint(answer, plan.route.ModelID, parts, chatTurnDurationMs(ctx))
 			return ChatResult{Content: answer, Model: plan.route.ModelID, Usage: aggregate, State: s.workbenchStateLocked(), Parts: parts}, nil
 		}
 		if len(steps) > 0 {
@@ -300,7 +486,7 @@ func (s *Service) runTeamTurn(
 			return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, err
 		}
 	}
-	s.recordAssistantAndCheckpoint(answer, model, parts)
+	s.recordAssistantAndCheckpoint(answer, model, parts, chatTurnDurationMs(ctx))
 	s.markChatProviderStatus(primary.Provider.ID, "ok", fmt.Sprintf("AI 团队任务完成，共执行 %d 个角色回合。", len(artifacts)))
 	s.finishTeamRun("completed", answer, sink)
 	return ChatResult{Content: answer, Model: model, Usage: aggregate, State: s.workbenchStateLocked(), Parts: parts}, nil
@@ -348,7 +534,7 @@ func (s *Service) runTeamRole(
 		outcome, err = s.runStreamingToolLoop(ctx, provider, registry, request, budget, roleSink)
 	}
 
-	artifact := teamArtifact{role: role, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts}
+	artifact := teamArtifact{role: role, attempt: attempt, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts}
 	if outcome.Usage != nil {
 		artifact.usage = usageMetricsFor(route.Provider, outcome.Usage)
 		s.recordUsageMetrics(artifact.usage, route)

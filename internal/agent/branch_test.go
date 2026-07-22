@@ -141,3 +141,51 @@ func TestForkFromAssistantKeepsReplyCheckpoint(t *testing.T) {
 		t.Fatalf("分叉后轮数 = %d, want 1", svc.sessionState.TurnCount)
 	}
 }
+
+func TestForkFromUserMessageRestoresFilesAndClearsPausedTeamCheckpoint(t *testing.T) {
+	workspace := t.TempDir()
+	target := filepath.Join(workspace, "team-edit.txt")
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	svc.runtimeSettings.WorkspaceRoot = workspace
+	// This test targets event-branch semantics, not path canonicalization.
+	svc.runtimeSettings.FilesystemAccess = "unrestricted"
+	if err := tools.WriteFileTextAtomic(target, "before\n", tools.FileText{LineEnding: tools.LineEndingLF}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.recordUserEvent("original team request")
+	if err := svc.recordFileSnapshot(tools.FileChange{Path: "team-edit.txt", Before: "before\n", After: "after\n", Existed: true, LineEnding: "lf"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tools.WriteFileTextAtomic(target, "after\n", tools.FileText{LineEnding: tools.LineEndingLF}); err != nil {
+		t.Fatal(err)
+	}
+	svc.teamState = TeamState{
+		Enabled: true, Status: "paused", CurrentRole: TeamRoleReviewer,
+		Roles: []TeamRoleState{{Role: TeamRoleReviewer, Label: "审阅", Enabled: true, Status: "paused", Attempt: 1}},
+	}
+	checkpoint := newTeamRunCheckpoint(TeamSettings{})
+	checkpoint.Status = "paused"
+	checkpoint.NextRole = TeamRoleReviewer
+	if err := svc.persistTeamRunCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	svc.recordTeamPauseMessage("AI 团队已暂停，发送“继续”恢复。", "model-reviewer", nil)
+
+	history := svc.GetSessionMessages()
+	if len(history) != 2 || history[0].Role != "user" {
+		t.Fatalf("paused history = %#v", history)
+	}
+	if _, err := svc.ForkFromMessage(history[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := tools.ReadFileText(target); got.Content != "before\n" {
+		t.Fatalf("edited resend did not restore files: %q", got.Content)
+	}
+	if svc.teamResume != nil || svc.teamState.Status != "idle" {
+		t.Fatalf("paused team state survived rewind: checkpoint=%#v state=%#v", svc.teamResume, svc.teamState)
+	}
+	if forked := svc.GetSessionMessages(); len(forked) != 0 {
+		t.Fatalf("edited resend kept superseded messages: %#v", forked)
+	}
+}

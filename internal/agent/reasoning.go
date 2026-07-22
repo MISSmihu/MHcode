@@ -5,13 +5,19 @@ import "fmt"
 type ReasoningLevel string
 
 const (
+	ReasoningNone   ReasoningLevel = "none"
 	ReasoningLow    ReasoningLevel = "low"
 	ReasoningMedium ReasoningLevel = "medium"
 	ReasoningHigh   ReasoningLevel = "high"
-	ReasoningUltra  ReasoningLevel = "ultra"
+	ReasoningXHigh  ReasoningLevel = "xhigh"
+	ReasoningMax    ReasoningLevel = "max"
+
+	// ReasoningUltra remains as a source-compatible alias for older callers.
+	// The old product label was never a valid upstream wire value.
+	ReasoningUltra = ReasoningMax
 )
 
-const DefaultReasoningLevel = ReasoningUltra
+const DefaultReasoningLevel = ReasoningMax
 
 type ReasoningBudget struct {
 	MaxToolCalls  int    `json:"maxToolCalls"`
@@ -29,8 +35,19 @@ type ReasoningProfile struct {
 
 var reasoningProfiles = []ReasoningProfile{
 	{
+		ID:          ReasoningNone,
+		Label:       "关闭",
+		Description: "不请求模型进行额外推理",
+		Budget: ReasoningBudget{
+			MaxToolCalls:  3,
+			ContextPolicy: "minimal",
+			CachePolicy:   "reuse-prefix",
+			Planner:       false,
+		},
+	},
+	{
 		ID:          ReasoningLow,
-		Label:       "低",
+		Label:       "轻度",
 		Description: "简单问答、轻量编辑、低成本优先",
 		Budget: ReasoningBudget{
 			MaxToolCalls:  3,
@@ -62,8 +79,19 @@ var reasoningProfiles = []ReasoningProfile{
 		},
 	},
 	{
-		ID:          ReasoningUltra,
-		Label:       "超高",
+		ID:          ReasoningXHigh,
+		Label:       "很高",
+		Description: "大型实现、深入排查、多阶段验证",
+		Budget: ReasoningBudget{
+			MaxToolCalls:  24,
+			ContextPolicy: "full-relevant",
+			CachePolicy:   "strict-stable-prefix",
+			Planner:       true,
+		},
+	},
+	{
+		ID:          ReasoningMax,
+		Label:       "极高",
 		Description: "协议设计、Agent 架构、发布级检查",
 		Budget: ReasoningBudget{
 			MaxToolCalls:  32,
@@ -81,14 +109,21 @@ func ReasoningProfiles() []ReasoningProfile {
 }
 
 func ParseReasoningLevel(value string) (ReasoningLevel, error) {
+	if value == "ultra" {
+		value = string(ReasoningMax)
+	}
 	level := ReasoningLevel(value)
-	if _, ok := ReasoningProfileFor(level); !ok {
+	profile, ok := ReasoningProfileFor(level)
+	if !ok {
 		return "", fmt.Errorf("unknown reasoning level %q", value)
 	}
-	return level, nil
+	return profile.ID, nil
 }
 
 func ReasoningProfileFor(level ReasoningLevel) (ReasoningProfile, bool) {
+	if level == "ultra" {
+		level = ReasoningMax
+	}
 	for _, profile := range reasoningProfiles {
 		if profile.ID == level {
 			return profile, true

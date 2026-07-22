@@ -1,4 +1,4 @@
-export type ReasoningLevel = "low" | "medium" | "high" | "ultra";
+export type ReasoningLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ReasoningBudget = {
   maxToolCalls: number;
@@ -159,8 +159,87 @@ export type RuntimeSettings = {
   mcp: MCPSettings;
   model: ModelSettings;
   team: TeamSettings;
+  update: UpdateSettings;
   workspace: WorkspaceSettings;
   memory: MemorySettings;
+};
+
+export type UpdateSettings = {
+  autoCheck: boolean;
+  autoDownload: boolean;
+  channel: "stable" | string;
+};
+
+export type AppInfo = {
+  name: string;
+  version: string;
+  commit?: string;
+  buildDate?: string;
+  goVersion: string;
+  operatingSystem: string;
+  architecture: string;
+  executablePath: string;
+  configPath: string;
+  repositoryUrl: string;
+};
+
+export type UpdateState = {
+  currentVersion: string;
+  latestVersion?: string;
+  updateAvailable: boolean;
+  status: "idle" | "checking" | "current" | "available" | "downloading" | "downloaded" | "installing" | "error" | string;
+  message: string;
+  progress: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  releaseName?: string;
+  releaseNotes?: string;
+  releaseUrl?: string;
+  publishedAt?: string;
+  assetName?: string;
+  downloadUrl?: string;
+  checksumUrl?: string;
+  checksumVerified: boolean;
+  downloadPath?: string;
+  checkedAt?: string;
+};
+
+export type AutomationSchedule = {
+  kind: "interval" | "daily" | string;
+  intervalMinutes: number;
+  dailyTime: string;
+};
+
+export type AutomationRun = {
+  status: "starting" | "running" | "completed" | "failed" | "cancelled" | "interrupted" | string;
+  startedAt?: string;
+  finishedAt?: string;
+  message?: string;
+  chatTaskId?: string;
+};
+
+export type AutomationTask = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  prompt: string;
+  projectId: string;
+  sessionId: string;
+  providerId?: string;
+  modelId?: string;
+  schedule: AutomationSchedule;
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt?: string;
+  lastRun?: AutomationRun;
+  runCount: number;
+  failureCount: number;
+};
+
+export type AutomationState = {
+  tasks: AutomationTask[];
+  running: boolean;
+  updatedAt?: string;
 };
 
 export type SandboxCapabilities = {
@@ -255,6 +334,20 @@ export type WorkspaceFilePreview = {
   truncated: boolean;
   binary: boolean;
   tooLarge: boolean;
+};
+
+export type WorkspaceDirectoryEntry = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  isSymlink: boolean;
+  size: number;
+};
+
+export type WorkspaceDirectoryListing = {
+  path: string;
+  entries: WorkspaceDirectoryEntry[];
+  truncated: boolean;
 };
 
 export type TerminalSessionState = {
@@ -384,6 +477,7 @@ export type ModelProviderSetting = {
   balanceUrl: string;
   extraHeaders: string;
   extraBodyJson: string;
+  reasoningProfile?: string;
   enabled: boolean;
   apiKeyConfigured: boolean;
   defaultModelId: string;
@@ -407,6 +501,8 @@ export type WorkspaceSettings = {
 };
 
 export type WorkbenchState = {
+  activeProjectId: string;
+  activeSessionId: string;
   reasoning: ReasoningOption;
   reasoningOptions: ReasoningOption[];
   cacheTarget: number;
@@ -486,6 +582,7 @@ export type ChatResult = {
   content: string;
   reasoning?: string;
   model: string;
+  durationMs?: number;
   usage: UsageMetrics;
   state: WorkbenchState;
   parts?: MessagePart[];
@@ -664,7 +761,19 @@ export type MessagePart =
   | { kind: "text"; text: string }
   | { kind: "diff"; path: string; patch: string; additions?: number; deletions?: number }
   | { kind: "file"; path: string; lineCount?: number; created?: boolean; fileAction?: "created" | "modified" | "available" | string }
-  | { kind: "tool_call"; name: string; status?: "running" | "ok" | "error"; input?: string; output?: string; toolCallId?: string }
+  | {
+      kind: "tool_call";
+      name: string;
+      status?: "running" | "ok" | "error";
+      input?: string;
+      output?: string;
+      toolCallId?: string;
+      workingDirectory?: string;
+      exitCode?: number;
+      startedAt?: string;
+      completedAt?: string;
+      durationMs?: number;
+    }
   | {
       kind: "task_progress";
       steps: Array<{ title: string; status: "pending" | "in_progress" | "completed" | string }>;
@@ -732,6 +841,7 @@ export type ProjectInfo = {
 
 // 会话摘要（对应后端 agent.SessionInfo）。
 export type SessionInfo = {
+  projectId: string;
   id: string;
   title: string;
   createdAt: string;
@@ -747,6 +857,7 @@ export type SessionMessage = {
   content: string;
   model?: string;
   createdAt: string;
+  durationMs?: number;
   parts?: MessagePart[];
   attachments?: ChatAttachment[];
 };

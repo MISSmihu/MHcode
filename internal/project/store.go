@@ -195,14 +195,37 @@ func (s *Store) Project(projectID string) (Project, bool) {
 func (s *Store) FindSession(sessionID string) (projectID string, session Session, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var foundProjectID string
+	var foundSession Session
+	found := false
 	for _, project := range s.manifest.Projects {
 		for _, candidate := range project.Sessions {
 			if candidate.ID == strings.TrimSpace(sessionID) {
-				return project.ID, candidate, true
+				if found {
+					// A bare session ID is ambiguous. Callers that know the project
+					// must use ProjectSession instead of silently selecting one.
+					return "", Session{}, false
+				}
+				foundProjectID, foundSession, found = project.ID, candidate, true
 			}
 		}
 	}
-	return "", Session{}, false
+	return foundProjectID, foundSession, found
+}
+
+// ProjectSession resolves a session only inside its owning project.
+func (s *Store) ProjectSession(projectID, sessionID string) (Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := s.findProject(strings.TrimSpace(projectID))
+	if project == nil {
+		return Session{}, false
+	}
+	session := project.findSession(strings.TrimSpace(sessionID))
+	if session == nil {
+		return Session{}, false
+	}
+	return *session, true
 }
 
 // ActiveIDs 返回当前活动的项目 ID 与会话 ID。
@@ -432,14 +455,32 @@ func (s *Store) NewSession(title string) (Session, error) {
 
 // SwitchSession 切换活动会话（须属于活动项目）。
 func (s *Store) SwitchSession(sessionID string) error {
+	projectID, _ := s.ActiveIDs()
+	return s.SwitchProjectSession(projectID, sessionID)
+}
+
+// SwitchProjectSession atomically switches both active pointers after
+// validating the exact project/session pair.
+func (s *Store) SwitchProjectSession(projectID, sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := s.findProject(s.manifest.ActiveProjectID)
-	if p == nil || p.findSession(sessionID) == nil {
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	p := s.findProject(projectID)
+	if p == nil {
+		return fmt.Errorf("项目不存在: %s", projectID)
+	}
+	if p.findSession(sessionID) == nil {
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
+	originalProjectID, originalSessionID := s.manifest.ActiveProjectID, s.manifest.ActiveSessionID
+	s.manifest.ActiveProjectID = projectID
 	s.manifest.ActiveSessionID = sessionID
-	return s.save()
+	if err := s.save(); err != nil {
+		s.manifest.ActiveProjectID, s.manifest.ActiveSessionID = originalProjectID, originalSessionID
+		return err
+	}
+	return nil
 }
 
 // SetSessionTitle 更新会话标题（并刷新 UpdatedAt）。
@@ -527,52 +568,85 @@ func (s *Store) SetArchived(sessionID string, archived bool) error {
 	return fmt.Errorf("会话不存在: %s", sessionID)
 }
 
+// SetArchivedForProject updates an exact project/session pair.
+func (s *Store) SetArchivedForProject(projectID, sessionID string, archived bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project := s.findProject(strings.TrimSpace(projectID))
+	if project == nil {
+		return fmt.Errorf("项目不存在: %s", projectID)
+	}
+	session := project.findSession(strings.TrimSpace(sessionID))
+	if session == nil {
+		return fmt.Errorf("会话不存在: %s", sessionID)
+	}
+	original := *session
+	session.Archived = archived
+	session.UpdatedAt = nowRFC3339()
+	if err := s.save(); err != nil {
+		*session = original
+		return err
+	}
+	return nil
+}
+
 // DeleteSession 从清单中永久移除会话元数据。
 // 删除活动会话时自动切换到最近的未归档会话；没有可用会话则创建一个空会话。
 func (s *Store) DeleteSession(sessionID string) (projectID string, activeChanged bool, err error) {
+	projectID, _, ok := s.FindSession(sessionID)
+	if !ok {
+		return "", false, fmt.Errorf("会话不存在或 ID 不唯一: %s", sessionID)
+	}
+	activeChanged, err = s.DeleteProjectSession(projectID, sessionID)
+	return projectID, activeChanged, err
+}
+
+// DeleteProjectSession deletes only the exact project/session pair.
+func (s *Store) DeleteProjectSession(projectID, sessionID string) (activeChanged bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	original := cloneManifest(s.manifest)
-
-	for projectIndex := range s.manifest.Projects {
-		project := &s.manifest.Projects[projectIndex]
-		for sessionIndex := range project.Sessions {
-			if project.Sessions[sessionIndex].ID != sessionID {
-				continue
-			}
-
-			projectID = project.ID
-			activeChanged = project.ID == s.manifest.ActiveProjectID && sessionID == s.manifest.ActiveSessionID
-			project.Sessions = append(project.Sessions[:sessionIndex], project.Sessions[sessionIndex+1:]...)
-
-			if activeChanged {
-				pick := -1
-				for index := range project.Sessions {
-					candidate := project.Sessions[index]
-					if candidate.Archived {
-						continue
-					}
-					if pick == -1 || candidate.UpdatedAt > project.Sessions[pick].UpdatedAt {
-						pick = index
-					}
-				}
-				if pick == -1 {
-					replacement := newSession("新对话")
-					project.Sessions = append(project.Sessions, replacement)
-					s.manifest.ActiveSessionID = replacement.ID
-				} else {
-					s.manifest.ActiveSessionID = project.Sessions[pick].ID
-				}
-			}
-
-			if saveErr := s.save(); saveErr != nil {
-				s.manifest = original
-				return "", false, saveErr
-			}
-			return projectID, activeChanged, nil
-		}
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	project := s.findProject(projectID)
+	if project == nil {
+		return false, fmt.Errorf("项目不存在: %s", projectID)
 	}
-	return "", false, fmt.Errorf("会话不存在: %s", sessionID)
+	for sessionIndex := range project.Sessions {
+		if project.Sessions[sessionIndex].ID != sessionID {
+			continue
+		}
+
+		activeChanged = project.ID == s.manifest.ActiveProjectID && sessionID == s.manifest.ActiveSessionID
+		project.Sessions = append(project.Sessions[:sessionIndex], project.Sessions[sessionIndex+1:]...)
+
+		if activeChanged {
+			pick := -1
+			for index := range project.Sessions {
+				candidate := project.Sessions[index]
+				if candidate.Archived {
+					continue
+				}
+				if pick == -1 || candidate.UpdatedAt > project.Sessions[pick].UpdatedAt {
+					pick = index
+				}
+			}
+			if pick == -1 {
+				replacement := newSession("新对话")
+				project.Sessions = append(project.Sessions, replacement)
+				s.manifest.ActiveSessionID = replacement.ID
+			} else {
+				s.manifest.ActiveSessionID = project.Sessions[pick].ID
+			}
+		}
+
+		if saveErr := s.save(); saveErr != nil {
+			s.manifest = original
+			return false, saveErr
+		}
+		return activeChanged, nil
+	}
+	return false, fmt.Errorf("会话不存在: %s", sessionID)
 }
 
 // PruneGeneratedBootstrapProjects removes inactive empty projects that were

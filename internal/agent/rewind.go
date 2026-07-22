@@ -156,15 +156,20 @@ func (s *Service) recordFileSnapshot(change tools.FileChange) error {
 }
 
 // recordAssistantAndCheckpoint 记录 assistant 消息与本轮 checkpoint。
-func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []tools.ResultPart) {
+func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []tools.ResultPart, durations ...int64) {
 	if s.eventStore == nil {
 		return
 	}
+	durationMs := int64(0)
+	if len(durations) > 0 && durations[0] > 0 {
+		durationMs = durations[0]
+	}
 	_, _ = s.eventStore.Append(eventlog.EventPayload{
-		Role:    "assistant",
-		Content: content,
-		Model:   model,
-		Parts:   toEventParts(parts),
+		Role:       "assistant",
+		Content:    content,
+		Model:      model,
+		DurationMs: durationMs,
+		Parts:      toEventParts(parts),
 	}, eventlog.EventAssistantMessage)
 	_, _ = s.eventStore.Append(eventlog.EventPayload{
 		Label:     truncateLabel(content),
@@ -374,6 +379,29 @@ func (s *Service) ForkFromMessage(messageEventID string) (WorkbenchState, error)
 		return s.WorkbenchState(), err
 	}
 	defer release()
+	return s.forkFromMessageLocked(messageEventID)
+}
+
+// ForkFromMessageForProjectSession refreshes the target log and forks it while
+// holding one activity lock, so a detached chat runtime cannot leave a stale
+// event head behind.
+func (s *Service) ForkFromMessageForProjectSession(projectID, sessionID, messageEventID string) (WorkbenchState, error) {
+	release, err := s.beginActivity("forking the conversation")
+	if err != nil {
+		return s.WorkbenchState(), err
+	}
+	defer release()
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	activeProjectID, activeSessionID := s.activeSessionIDsLocked()
+	if projectID != activeProjectID || sessionID != activeSessionID {
+		return s.workbenchStateLocked(), fmt.Errorf("活动会话已切换，请在目标对话中重试")
+	}
+	s.activateCurrent()
+	return s.forkFromMessageLocked(messageEventID)
+}
+
+func (s *Service) forkFromMessageLocked(messageEventID string) (WorkbenchState, error) {
 	if s.eventStore == nil {
 		return s.workbenchStateLocked(), fmt.Errorf("未启用会话持久化，无法分叉")
 	}
@@ -442,6 +470,8 @@ func (s *Service) rebuildSessionFromEvents() {
 	}
 	turns := 0
 	s.planState = PlanState{}
+	s.teamResume = nil
+	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
 	for _, ev := range s.eventStore.Events() {
 		switch ev.Type {
 		case eventlog.EventUserMessage:
@@ -463,6 +493,27 @@ func (s *Service) rebuildSessionFromEvents() {
 				Status:    ev.Payload.PlanStatus,
 				Steps:     steps,
 				UpdatedAt: ev.TS.Format(time.RFC3339),
+			}
+		case eventlog.EventTeamCheckpoint:
+			checkpoint := s.restoreTeamRunCheckpoint(ev.Payload.TeamCheckpointHash)
+			if checkpoint == nil {
+				continue
+			}
+			if checkpoint.Status == "running" {
+				checkpoint.Status = "paused"
+				checkpoint.Team.Active = false
+				checkpoint.Team.Status = "paused"
+				for index := range checkpoint.Team.Roles {
+					if checkpoint.Team.Roles[index].Status == "running" {
+						checkpoint.Team.Roles[index].Status = "paused"
+					}
+				}
+			}
+			s.teamState = cloneTeamState(checkpoint.Team)
+			if checkpoint.Status == "paused" {
+				s.teamResume = checkpoint
+			} else {
+				s.teamResume = nil
 			}
 		}
 	}
@@ -487,6 +538,7 @@ type SessionMessage struct {
 	Content     string             `json:"content"`
 	Model       string             `json:"model,omitempty"`
 	CreatedAt   string             `json:"createdAt"`
+	DurationMs  int64              `json:"durationMs,omitempty"`
 	Parts       []tools.ResultPart `json:"parts,omitempty"`
 	Attachments []ChatAttachment   `json:"attachments,omitempty"`
 }
@@ -506,26 +558,43 @@ func (s *Service) GetSessionMessages() []SessionMessage {
 // The active Service may have opened its event log before a background task
 // appended new events, so this method intentionally does not reuse eventStore.
 func (s *Service) GetSessionMessagesForSession(sessionID string) []SessionMessage {
+	messages, err := s.GetSessionMessagesForProjectSession("", sessionID)
+	if err != nil {
+		return []SessionMessage{}
+	}
+	return messages
+}
+
+// GetSessionMessagesForProjectSession distinguishes a valid empty conversation
+// from a missing/corrupt session so callers never erase visible history on a
+// lookup failure.
+func (s *Service) GetSessionMessagesForProjectSession(projectID, sessionID string) ([]SessionMessage, error) {
+	projectID = strings.TrimSpace(projectID)
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return s.GetSessionMessages()
+		return nil, fmt.Errorf("会话 ID 不能为空")
 	}
 	s.stateMu.RLock()
 	projects := s.projects
 	sessionsDir := s.config.SessionsDir
 	s.stateMu.RUnlock()
 	if projects == nil || strings.TrimSpace(sessionsDir) == "" {
-		return []SessionMessage{}
+		return nil, fmt.Errorf("会话历史存储不可用")
 	}
-	projectID, _, ok := projects.FindSession(sessionID)
-	if !ok {
-		return []SessionMessage{}
+	if projectID == "" {
+		var ok bool
+		projectID, _, ok = projects.FindSession(sessionID)
+		if !ok {
+			return nil, fmt.Errorf("会话不存在或 ID 不唯一: %s", sessionID)
+		}
+	} else if _, ok := projects.ProjectSession(projectID, sessionID); !ok {
+		return nil, fmt.Errorf("项目 %s 中不存在会话: %s", projectID, sessionID)
 	}
 	store, err := eventlog.Open(filepath.Join(sessionsDir, projectID, sessionID))
 	if err != nil {
-		return []SessionMessage{}
+		return nil, fmt.Errorf("读取会话历史失败: %w", err)
 	}
-	return sessionMessagesFromEventStore(store)
+	return sessionMessagesFromEventStore(store), nil
 }
 
 func sessionMessagesFromEventStore(store *eventlog.Store) []SessionMessage {
@@ -547,12 +616,13 @@ func sessionMessagesFromEventStore(store *eventlog.Store) []SessionMessage {
 			parts := fromEventParts(ev.Payload.Parts)
 			content, parts := restoredAssistantMessage(ev.Payload.Content, parts)
 			out = append(out, SessionMessage{
-				ID:        ev.ID,
-				Role:      "assistant",
-				Content:   content,
-				Model:     ev.Payload.Model,
-				CreatedAt: ev.TS.Format(time.RFC3339),
-				Parts:     parts,
+				ID:         ev.ID,
+				Role:       "assistant",
+				Content:    content,
+				Model:      ev.Payload.Model,
+				CreatedAt:  ev.TS.Format(time.RFC3339),
+				DurationMs: ev.Payload.DurationMs,
+				Parts:      parts,
 			})
 		}
 	}
@@ -636,31 +706,36 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 	out := make([]tools.ResultPart, 0, len(parts))
 	for _, p := range parts {
 		out = append(out, tools.ResultPart{
-			Kind:         tools.PartKind(p.Kind),
-			Text:         p.Text,
-			Path:         p.Path,
-			Patch:        p.Patch,
-			Additions:    p.Additions,
-			Deletions:    p.Deletions,
-			LineCount:    p.LineCount,
-			Created:      p.Created,
-			FileAction:   p.FileAction,
-			Name:         p.Name,
-			Status:       p.Status,
-			Input:        p.Input,
-			Output:       p.Output,
-			Steps:        fromEventProgressSteps(p.Steps),
-			TaskStatus:   p.TaskStatus,
-			ChangedFiles: p.ChangedFiles,
-			Query:        p.Query,
-			Sources:      fromEventSearchSources(p.Sources),
-			Role:         p.Role,
-			RoleLabel:    p.RoleLabel,
-			ProviderID:   p.ProviderID,
-			Model:        p.Model,
-			Summary:      p.Summary,
-			Verdict:      p.Verdict,
-			Attempt:      p.Attempt,
+			Kind:             tools.PartKind(p.Kind),
+			Text:             p.Text,
+			Path:             p.Path,
+			Patch:            p.Patch,
+			Additions:        p.Additions,
+			Deletions:        p.Deletions,
+			LineCount:        p.LineCount,
+			Created:          p.Created,
+			FileAction:       p.FileAction,
+			Name:             p.Name,
+			Status:           p.Status,
+			Input:            p.Input,
+			Output:           p.Output,
+			WorkingDirectory: p.WorkingDirectory,
+			ExitCode:         p.ExitCode,
+			StartedAt:        p.StartedAt,
+			CompletedAt:      p.CompletedAt,
+			DurationMs:       p.DurationMs,
+			Steps:            fromEventProgressSteps(p.Steps),
+			TaskStatus:       p.TaskStatus,
+			ChangedFiles:     p.ChangedFiles,
+			Query:            p.Query,
+			Sources:          fromEventSearchSources(p.Sources),
+			Role:             p.Role,
+			RoleLabel:        p.RoleLabel,
+			ProviderID:       p.ProviderID,
+			Model:            p.Model,
+			Summary:          p.Summary,
+			Verdict:          p.Verdict,
+			Attempt:          p.Attempt,
 		})
 	}
 	return out
@@ -847,31 +922,36 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 	out := make([]eventlog.MessagePart, 0, len(parts))
 	for _, p := range parts {
 		out = append(out, eventlog.MessagePart{
-			Kind:         string(p.Kind),
-			Text:         p.Text,
-			Path:         p.Path,
-			Patch:        p.Patch,
-			Additions:    p.Additions,
-			Deletions:    p.Deletions,
-			LineCount:    p.LineCount,
-			Created:      p.Created,
-			FileAction:   p.FileAction,
-			Name:         p.Name,
-			Status:       p.Status,
-			Input:        p.Input,
-			Output:       p.Output,
-			Steps:        toEventProgressSteps(p.Steps),
-			TaskStatus:   p.TaskStatus,
-			ChangedFiles: p.ChangedFiles,
-			Query:        p.Query,
-			Sources:      toEventSearchSources(p.Sources),
-			Role:         p.Role,
-			RoleLabel:    p.RoleLabel,
-			ProviderID:   p.ProviderID,
-			Model:        p.Model,
-			Summary:      p.Summary,
-			Verdict:      p.Verdict,
-			Attempt:      p.Attempt,
+			Kind:             string(p.Kind),
+			Text:             p.Text,
+			Path:             p.Path,
+			Patch:            p.Patch,
+			Additions:        p.Additions,
+			Deletions:        p.Deletions,
+			LineCount:        p.LineCount,
+			Created:          p.Created,
+			FileAction:       p.FileAction,
+			Name:             p.Name,
+			Status:           p.Status,
+			Input:            p.Input,
+			Output:           p.Output,
+			WorkingDirectory: p.WorkingDirectory,
+			ExitCode:         p.ExitCode,
+			StartedAt:        p.StartedAt,
+			CompletedAt:      p.CompletedAt,
+			DurationMs:       p.DurationMs,
+			Steps:            toEventProgressSteps(p.Steps),
+			TaskStatus:       p.TaskStatus,
+			ChangedFiles:     p.ChangedFiles,
+			Query:            p.Query,
+			Sources:          toEventSearchSources(p.Sources),
+			Role:             p.Role,
+			RoleLabel:        p.RoleLabel,
+			ProviderID:       p.ProviderID,
+			Model:            p.Model,
+			Summary:          p.Summary,
+			Verdict:          p.Verdict,
+			Attempt:          p.Attempt,
 		})
 	}
 	return out

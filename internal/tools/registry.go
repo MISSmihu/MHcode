@@ -52,6 +52,13 @@ type ResultPart struct {
 	Status string `json:"status,omitempty"` // running | ok | error
 	Input  string `json:"input,omitempty"`
 	Output string `json:"output,omitempty"`
+	// Execution metadata is kept on the structured part so the UI can show
+	// durable, per-tool diagnostics after a session switch or app restart.
+	WorkingDirectory string `json:"workingDirectory,omitempty"`
+	ExitCode         *int   `json:"exitCode,omitempty"`
+	StartedAt        string `json:"startedAt,omitempty"`
+	CompletedAt      string `json:"completedAt,omitempty"`
+	DurationMs       int64  `json:"durationMs,omitempty"`
 
 	// task_progress
 	Steps        []ProgressStep `json:"steps,omitempty"`
@@ -63,13 +70,13 @@ type ResultPart struct {
 	Sources []SearchSource `json:"sources,omitempty"`
 
 	// team_role
-	Role         string `json:"role,omitempty"`
-	RoleLabel    string `json:"roleLabel,omitempty"`
-	ProviderID   string `json:"providerId,omitempty"`
-	Model        string `json:"model,omitempty"`
-	Summary      string `json:"summary,omitempty"`
-	Verdict      string `json:"verdict,omitempty"`
-	Attempt      int    `json:"attempt,omitempty"`
+	Role       string `json:"role,omitempty"`
+	RoleLabel  string `json:"roleLabel,omitempty"`
+	ProviderID string `json:"providerId,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	Verdict    string `json:"verdict,omitempty"`
+	Attempt    int    `json:"attempt,omitempty"`
 }
 
 // Result 是一次工具执行的产出。
