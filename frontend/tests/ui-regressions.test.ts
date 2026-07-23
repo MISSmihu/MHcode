@@ -48,7 +48,7 @@ describe("chat UI regressions", () => {
   });
 
   test("keeps the link remove action inside the composer chip", async () => {
-    const css = await Bun.file(new URL("../src/styles.css", import.meta.url)).text();
+    const css = (await Bun.file(new URL("../src/styles.css", import.meta.url)).text()).replace(/\r\n?/g, "\n");
     const ruleStart = css.indexOf(".composer-link-remove {\n  position: static;");
     expect(ruleStart).toBeGreaterThanOrEqual(0);
     const rule = css.slice(ruleStart, css.indexOf("}", ruleStart) + 1);
