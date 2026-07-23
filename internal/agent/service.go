@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 )
 
 type ServiceConfig struct {
+	AppVersion             string
 	SkillsDir              string
 	SkillsFS               fs.FS
 	DeepSeekBaseURL        string
@@ -84,7 +86,9 @@ type ChatResult struct {
 	State      WorkbenchState     `json:"state"`
 	// Parts 是结构化消息片段（text/diff/tool_call），供前端富渲染。
 	// 无工具调用的普通对话此字段为空，前端回退纯文本渲染。
-	Parts []tools.ResultPart `json:"parts,omitempty"`
+	Parts         []tools.ResultPart          `json:"parts,omitempty"`
+	TurnCommitted bool                        `json:"turnCommitted"`
+	ProviderError *protocol.ProviderErrorInfo `json:"providerError,omitempty"`
 }
 
 type ChatAttachment struct {
@@ -166,6 +170,7 @@ type Service struct {
 	usageStore      UsageStore
 	usageLedger     UsageLedgerState
 	providerFactory func(chatRoute) (protocol.Provider, error)
+	installationID  string
 	// projectID is kept alongside sessionID so a background runtime can update
 	// its own metadata without changing the application's active session.
 	projectID string
@@ -290,7 +295,8 @@ func NewService(config ServiceConfig) *Service {
 			Enabled:   config.UsageStore != nil,
 			LastError: strings.TrimSpace(config.UsageStoreError),
 		},
-		teamState: TeamState{Enabled: runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
+		teamState:      TeamState{Enabled: runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
+		installationID: stableInstallationID(config),
 	}
 	if config.UsageStore != nil {
 		svc.usageLedger.Path = config.UsageStore.Path()
@@ -300,6 +306,24 @@ func NewService(config ServiceConfig) *Service {
 	svc.restoreUsageMetrics()
 	svc.storeWorkbenchSnapshot(svc.workbenchStateLocked())
 	return svc
+}
+
+func stableInstallationID(config ServiceConfig) string {
+	seed := strings.TrimSpace(config.SettingsPath)
+	if seed == "" {
+		seed = strings.TrimSpace(config.SessionsDir)
+	}
+	if seed == "" {
+		seed = "mhcode-ephemeral-installation"
+	} else {
+		seed = filepath.Clean(seed)
+	}
+	sum := sha256.Sum256([]byte("mhcode-installation\x00" + seed))
+	bytes := sum[:16]
+	bytes[6] = (bytes[6] & 0x0f) | 0x50
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
 }
 
 func (s *Service) SaveRuntimeSettings(settings RuntimeSettings) (WorkbenchState, error) {
@@ -616,6 +640,137 @@ func chatTurnDurationMs(ctx context.Context) int64 {
 	return duration
 }
 
+func terminalTurnContent(status string, cause error) string {
+	if status == "cancelled" {
+		return "本轮已停止，尚未产生可保留的输出。输入内容已恢复，可修改后重新发送。"
+	}
+	message := "模型请求失败。"
+	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
+		message = redactSensitiveText(strings.TrimSpace(cause.Error()))
+	}
+	return "本轮执行失败：" + message
+}
+
+func retainedTurnContent(status, content string, parts []tools.ResultPart, reasoning string) string {
+	if content = sanitizeModelContent(content); content != "" {
+		return content
+	}
+	if hasMeaningfulResultParts(parts) {
+		if status == "cancelled" {
+			return "本轮已停止。已经完成的工具与文件操作记录已保留，可以发送“继续”接着执行。"
+		}
+		return "本轮在模型连接失败前已经执行了部分操作。执行记录已保留，可以直接重试或继续。"
+	}
+	if strings.TrimSpace(reasoning) != "" {
+		if status == "cancelled" {
+			return "本轮已停止。模型已经开始处理任务，会话上下文已保留，可以发送“继续”。"
+		}
+		return "模型已经开始处理任务，但未能完成最终回复。会话上下文已保留，可以继续。"
+	}
+	return ""
+}
+
+func hasMeaningfulResultParts(parts []tools.ResultPart) bool {
+	for _, part := range parts {
+		switch part.Kind {
+		case tools.PartText:
+			if strings.TrimSpace(part.Text) != "" {
+				return true
+			}
+		case tools.PartToolCall:
+			if strings.TrimSpace(part.Name) != "" || strings.TrimSpace(part.Input) != "" || strings.TrimSpace(part.Output) != "" {
+				return true
+			}
+		case tools.PartDiff:
+			if strings.TrimSpace(part.Path) != "" || strings.TrimSpace(part.Patch) != "" {
+				return true
+			}
+		case tools.PartFile:
+			if strings.TrimSpace(part.Path) != "" {
+				return true
+			}
+		case tools.PartProgress:
+			if len(part.Steps) > 0 || part.ChangedFiles > 0 {
+				return true
+			}
+		case tools.PartWebSearch:
+			if len(part.Sources) > 0 {
+				return true
+			}
+		case tools.PartTeamRole:
+			if strings.TrimSpace(part.Role) != "" || strings.TrimSpace(part.Summary) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func chatResultHasMeaningfulOutput(result ChatResult) bool {
+	return strings.TrimSpace(result.Content) != "" ||
+		strings.TrimSpace(result.Reasoning) != "" ||
+		hasMeaningfulResultParts(result.Parts)
+}
+
+func (s *Service) retainInterruptedTurn(
+	result *ChatResult,
+	status string,
+	requestMessages []protocol.Message,
+	baseMessageCount int,
+	prefixDiagnostic requestPrefixDiagnostic,
+) {
+	if result == nil || !chatResultHasMeaningfulOutput(*result) || len(requestMessages) == 0 {
+		return
+	}
+	currentUser := requestMessages[len(requestMessages)-1]
+	if currentUser.Role != "user" || baseMessageCount < 0 || baseMessageCount > len(s.sessionMessages) {
+		return
+	}
+
+	result.Content = retainedTurnContent(status, result.Content, result.Parts, result.Reasoning)
+	result.Parts = appendTextPartIfMissing(result.Parts, result.Content)
+	s.sessionMessages = append(s.sessionMessages[:baseMessageCount],
+		currentUser,
+		protocol.Message{Role: "assistant", Content: result.Content},
+	)
+	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
+	s.sessionState.MessageCount = len(s.sessionMessages)
+	s.sessionState.TurnCount++
+	result.TurnCommitted = true
+	result.State = s.workbenchStateLocked()
+}
+
+func terminalTurnParts(parts []tools.ResultPart, status string, plan PlanState) []tools.ResultPart {
+	terminal := make([]tools.ResultPart, len(parts))
+	copy(terminal, parts)
+	foundProgress := false
+	for index := range terminal {
+		part := &terminal[index]
+		if part.Kind == tools.PartProgress {
+			part.TaskStatus = status
+			foundProgress = true
+		}
+		if part.Kind == tools.PartToolCall && part.Status == "running" {
+			part.Status = "error"
+			if strings.TrimSpace(part.Output) == "" {
+				if status == "cancelled" {
+					part.Output = "命令已停止。"
+				} else {
+					part.Output = "工具执行未完成。"
+				}
+			}
+		}
+	}
+	if !foundProgress && len(plan.Steps) > 0 && (plan.Status == "failed" || plan.Status == "cancelled") {
+		terminal = append(terminal, tools.ResultPart{
+			Kind:       tools.PartProgress,
+			Steps:      append([]tools.ProgressStep(nil), plan.Steps...),
+			TaskStatus: status,
+		})
+	}
+	return terminal
+}
+
 type chatRoute struct {
 	Provider    ModelProviderSetting
 	ModelID     string
@@ -651,6 +806,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if prompt == "" && len(attachments) == 0 {
 		return ChatResult{State: s.workbenchStateLocked()}, errors.New("消息内容不能为空")
 	}
+	prompt, err = s.prepareScopedUserPrompt(prompt)
+	if err != nil {
+		return ChatResult{State: s.workbenchStateLocked()}, fmt.Errorf("保存本轮授权凭据失败: %w", err)
+	}
 
 	route, err := s.selectChatRoute()
 	if err != nil {
@@ -665,20 +824,58 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	turn := s.captureTurnSnapshot()
 	defer func() {
 		if err == nil {
+			result.TurnCommitted = true
 			return
 		}
 		if errors.Is(err, errTeamRunPaused) {
+			result.TurnCommitted = true
 			result.State = s.workbenchStateLocked()
 			return
 		}
-		failedPlan := clonePlanState(s.planState)
-		if rollbackErr := s.rollbackTurn(turn); rollbackErr != nil {
-			err = errors.Join(err, fmt.Errorf("turn rollback failed: %w", rollbackErr))
+		terminalStatus := "failed"
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			terminalStatus = "cancelled"
 		}
-		if failedPlan.Status == "failed" && failedPlan.Revision > turn.planState.Revision {
-			if planErr := s.persistPlanState(failedPlan.Steps, "failed"); planErr != nil {
-				err = errors.Join(err, fmt.Errorf("restore failed plan state: %w", planErr))
+		terminalPlan := clonePlanState(s.planState)
+		if terminalStatus == "cancelled" && terminalPlan.Revision > turn.planState.Revision && len(terminalPlan.Steps) > 0 {
+			terminalPlan.Status = "cancelled"
+		}
+		if !result.TurnCommitted {
+			if rollbackErr := s.rollbackTurn(turn); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("turn rollback failed: %w", rollbackErr))
 			}
+		}
+		if providerError, ok := protocol.ProviderErrorDetails(err); ok {
+			safeProviderError := providerError
+			safeProviderError.Message = redactSensitiveText(providerError.Message)
+			result.ProviderError = &safeProviderError
+			part := providerErrorNoticePart(safeProviderError)
+			result.Parts = mergeOutcomeParts(result.Parts, []tools.ResultPart{part})
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "provider_notice",
+				Message: safeProviderError.Message,
+				Parts:   []tools.ResultPart{part},
+			})
+		}
+		planTerminalAlreadyCurrent := s.planState.Revision == terminalPlan.Revision &&
+			s.planState.Status == terminalPlan.Status
+		if (terminalPlan.Status == "failed" || terminalPlan.Status == "cancelled") &&
+			terminalPlan.Revision > turn.planState.Revision && !planTerminalAlreadyCurrent {
+			if planErr := s.persistPlanState(terminalPlan.Steps, terminalPlan.Status); planErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore terminal plan state: %w", planErr))
+			}
+		}
+		result.Parts = terminalTurnParts(result.Parts, terminalStatus, terminalPlan)
+		if result.TurnCommitted {
+			result.Content = retainedTurnContent(terminalStatus, result.Content, result.Parts, result.Reasoning)
+		} else {
+			result.Content = terminalTurnContent(terminalStatus, err)
+		}
+		if result.Model == "" {
+			result.Model = route.ModelID
+		}
+		if terminalErr := s.recordTurnTerminal(terminalStatus, result.Content, result.Model, result.Parts, chatTurnDurationMs(ctx)); terminalErr != nil {
+			err = errors.Join(err, terminalErr)
 		}
 		result.State = s.workbenchStateLocked()
 	}()
@@ -723,6 +920,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, err
 	}
 
+	requestSessionID := s.providerSessionID()
+	turnID := fmt.Sprintf("turn-%d", turnStartedAt.UnixNano())
+	requestSettings := s.runtimeSettings.Normalized()
+	workspaceRoots := append([]string{requestSettings.WorkspaceRoot}, requestSettings.ExtraWritableRoots...)
 	baseRequest := protocol.ChatRequest{
 		Model:          route.ModelID,
 		Temperature:    s.temperatureForReasoning(),
@@ -732,6 +933,26 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 			"reasoning_level":   string(s.reasoning),
 			"context_window":    fmt.Sprintf("%d", compression.Budget.WindowTokens),
 			"compression_count": fmt.Sprintf("%d", s.sessionState.CompressionCount),
+			"task_kind":         "chat",
+			"project_id":        strings.TrimSpace(s.projectID),
+			"approval_policy":   strings.TrimSpace(requestSettings.ApprovalPolicy),
+		},
+		ToolChoice:        "auto",
+		ParallelToolCalls: false,
+		Store:             false,
+		Include:           []string{"reasoning.encrypted_content"},
+		PromptCacheKey:    requestSessionID,
+		SessionID:         requestSessionID,
+		ThreadID:          requestSessionID,
+		TurnID:            turnID,
+		ResponsesContext: protocol.ResponsesClientContext{
+			InstallationID:      s.installationID,
+			WindowID:            requestSessionID + ":0",
+			RequestKind:         "turn",
+			ThreadSource:        "user",
+			Sandbox:             strings.TrimSpace(requestSettings.SandboxMode),
+			WorkspaceRoots:      workspaceRoots,
+			TurnStartedAtUnixMS: turnStartedAt.UnixMilli(),
 		},
 		MaxInputTokens:    compression.Budget.InputLimitTokens,
 		TargetInputTokens: compression.Budget.TargetTokens,
@@ -761,7 +982,20 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
-		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, err
+		result := ChatResult{
+			Content:   sanitizeModelContent(completion.Content),
+			Reasoning: completion.Reasoning,
+			Model:     route.ModelID,
+			Usage:     s.metrics,
+			State:     s.workbenchStateLocked(),
+			Parts:     providerNoticeParts(completion.Notices),
+		}
+		terminalStatus := "failed"
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			terminalStatus = "cancelled"
+		}
+		s.retainInterruptedTurn(&result, terminalStatus, requestMessages, baseMessageCount, prefixDiagnostic)
+		return result, err
 	}
 	resolvedRoute := resolvedProviderRoute(chatProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
@@ -774,11 +1008,12 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	}
 
 	answer := sanitizeModelContent(completion.Content)
+	noticeParts := providerNoticeParts(completion.Notices)
 	s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
-	s.recordAssistantAndCheckpoint(answer, route.ModelID, nil, chatTurnDurationMs(ctx))
+	s.recordAssistantAndCheckpoint(answer, route.ModelID, noticeParts, chatTurnDurationMs(ctx))
 	s.markChatProviderStatus(route.Provider.ID, "ok", fmt.Sprintf("试聊成功，%s / %s 流式通道正常。", route.Provider.Name, route.ModelID))
 
 	return ChatResult{
@@ -787,6 +1022,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		Model:     route.ModelID,
 		Usage:     s.metrics,
 		State:     s.workbenchStateLocked(),
+		Parts:     noticeParts,
 	}, nil
 }
 
@@ -920,6 +1156,18 @@ func (s *Service) contextPreview() RequestContext {
 	return s.contextPreviewForInput("")
 }
 
+func (s *Service) providerSessionID() string {
+	projectID := strings.TrimSpace(s.projectID)
+	sessionID := strings.TrimSpace(s.sessionID)
+	if projectID == "" {
+		return sessionID
+	}
+	if sessionID == "" {
+		return projectID
+	}
+	return projectID + ":" + sessionID
+}
+
 func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 	profile, _ := ReasoningProfileFor(s.reasoning)
 	index := s.loadSkillsIndex()
@@ -936,6 +1184,7 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 			"Skills 正文只在触发时加载，默认只注入稳定索引。",
 			"工具结果先摘要，再用 raw_result_id 引用原文。",
 		},
+		RuntimePolicy:  s.runtimePolicyContext(),
 		Reasoning:      profile,
 		SkillsIndex:    index,
 		MCPSnapshots:   snapshots,
@@ -950,6 +1199,45 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 			"保留文件路径、行号和对象 ID。",
 		},
 	})
+}
+
+func (s *Service) runtimePolicyContext() string {
+	settings := s.runtimeSettings.Normalized()
+	capabilities := sandboxexec.DetectCapabilities()
+	workspaceRoot := filepath.Clean(strings.TrimSpace(settings.WorkspaceRoot))
+	if workspaceRoot == "." || workspaceRoot == "" {
+		workspaceRoot = "(not configured)"
+	}
+	extraRoots := "(none)"
+	if len(settings.ExtraWritableRoots) > 0 {
+		extraRoots = strings.Join(settings.ExtraWritableRoots, "; ")
+	}
+	enabled := func(value bool) string {
+		if value {
+			return "enabled"
+		}
+		return "disabled"
+	}
+	return strings.Join([]string{
+		"This is the effective MHcode runtime permission profile for the current workspace.",
+		"sandbox_mode=" + settings.SandboxMode,
+		"filesystem_access=" + settings.FilesystemAccess,
+		"network_access=" + enabled(settings.NetworkAccess),
+		"shell_access=" + enabled(settings.ShellAccess),
+		"approval_policy=" + settings.ApprovalPolicy,
+		"destructive_operations=" + enabled(settings.AllowDestructiveOps),
+		"workspace_root=" + workspaceRoot,
+		"extra_writable_roots=" + extraRoots,
+		"sandbox_backend=" + capabilities.Backend,
+		"process_tree_isolation=" + enabled(capabilities.ProcessTree),
+		"privilege_isolation=" + enabled(capabilities.PrivilegeIsolation),
+		"filesystem_os_isolation=" + enabled(capabilities.FilesystemIsolation),
+		"network_os_isolation=" + enabled(capabilities.NetworkIsolation),
+		"Filesystem and network limits that are not OS-isolated are still enforced by MHcode tool policy and approval gates.",
+		"User-supplied credentials authorize only the explicitly named target, account, and requested operation. Do not expand scope, probe unrelated systems, discover other credentials, establish persistence, or move laterally.",
+		"Use credentials only in memory for that scoped operation. Never echo secrets in replies or persist them in files, logs, project memory, plans, or tool summaries.",
+		"A user's scoped authorization does not disable provider safety policy or MHcode approval requirements.",
+	}, "\n")
 }
 
 func (s *Service) projectContextForPolicy() (stable string, volatile string) {
@@ -1396,6 +1684,7 @@ func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, erro
 			APIKey:           route.APIKey,
 			ProviderID:       route.Provider.ID,
 			DisplayName:      route.Provider.Name,
+			ClientVersion:    s.config.AppVersion,
 			APIType:          route.Provider.APIType,
 			AllowNoAuth:      route.AllowNoAuth || route.Provider.Protocol == "local",
 			ExtraHeaders:     route.Provider.ExtraHeaders,
@@ -1514,14 +1803,22 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- Append new user turns after the existing transcript. Do not reinterpret older private context as a fresh user request.",
 		"- Do not put temporary observations, retries, errors, user prose, or raw tool output into the stable contract.",
 		"- When a request requires code work, inspect the relevant files first, keep edits scoped, and preserve user changes.",
+		"",
+		"Runtime permission profile:",
+		stableSection(ctx, "runtime_policy", "Use the configured workspace sandbox and approval policy. Do not assume access that the runtime does not grant."),
+		"- Treat the profile above as the actual runtime boundary. Tool policy and approval checks remain authoritative when OS-level filesystem or network isolation is unavailable.",
+		"- Scoped credentials supplied by the user may be used only for the exact named target and requested operation, and must never be echoed or persisted.",
+		"- A token beginning with mhcode-credential:// is an opaque credential reference whose secret is held by the host. Use its ID with the ssh tool; never claim that the referenced password is unavailable or ask the user to paste it into a shell command.",
+		"- Password-based SSH authentication does not use ssh-add or ssh-agent. Never run ssh-add unless the user explicitly asks to inspect or manage local SSH keys.",
+		"- For an authorized remote deployment, use ssh test first when needed, then ssh run, upload_file, or upload_directory. Never place passwords in command text, environment variables, files, plans, tool summaries, or replies.",
 		"- For a substantive multi-step task, call update_plan before implementation and after each step changes state. Send the full checklist each time, keep at most one step in_progress, and skip it for simple questions.",
 		"- Workspace tools are already rooted at the active project. Start exploration with list_dir path '.' and use relative paths; never invent /home or other machine-specific absolute paths.",
 		"- Read, inspect, search, write, patch, copy, and delete workspace text files only through read_file, file_info, list_dir, search, write_file, apply_patch, copy_file, and delete_file. Never use run_command, PowerShell, cmd, shell redirection, cat, rg, grep, or filesystem aliases for these operations.",
 		"- Prefer read_file line ranges and expected_sha256 for edits. Move a text file as copy_file followed by delete_file so both changes remain approval-aware and rewindable.",
 		"- When the user asks to open or preview a workspace file, call open_file. Never substitute run_command, start, xdg-open, open, or PowerShell for this action.",
 		"- When the user provides a public GitHub repository, tree, or blob URL, call read_repository and inspect the real repository tree or file content before answering. Never substitute web_search snippets for repository source.",
-		"- When the user provides a non-GitHub webpage URL, call read_webpage and inspect its actual content before answering. Never claim that a search snippet is page content.",
-		"- For current public web information that is not a source repository, call web_search first and preserve source links. For comparisons or recommendations, first inspect the supplied page with read_webpage, then search using the concrete capability, product category, and important terms discovered there instead of generic words such as 'similar'. Read the most relevant result pages with read_webpage before synthesizing, exclude unrelated search results, and list only sources actually used in the answer. Use browser only when static reading reports JavaScript-only content or the user asks to interact with a page.",
+		"- When the user provides a non-GitHub webpage URL, call read_webpage and inspect its actual content before answering. read_webpage automatically falls back to the managed browser for JavaScript-rendered pages. Never claim that a search snippet is page content.",
+		"- For current public web information that is not a source repository, call web_search first and preserve source links. For comparisons or recommendations, first inspect the supplied page with read_webpage, then search using the concrete capability, product category, and important terms discovered there instead of generic words such as 'similar'. Read the most relevant result pages with read_webpage before synthesizing, exclude unrelated search results, and list only sources actually used in the answer. Use browser directly only when the user asks to interact with a page.",
 		"- For website navigation or page interaction, use the browser tool. Read a snapshot before clicking, reuse its selectors, and never launch a browser through run_command.",
 		"- For another desktop application, use computer only when it is enabled. List allowed windows first, take a screenshot before coordinate clicks, and keep all input scoped to the selected window ID.",
 		"- For UI work, prioritize usable screens, clear state, responsive layout, and controls that match the existing design system.",

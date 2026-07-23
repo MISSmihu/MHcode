@@ -24,18 +24,28 @@ const (
 	maximumWebpageLinks      = 32
 )
 
+var errWebpageRequiresBrowser = errors.New("网页没有可读取的正文；页面可能依赖 JavaScript")
+
+// WebpageBrowserRenderer renders one URL and snapshots that exact browser tab.
+// It is intentionally smaller than BrowserController so read_webpage can use a
+// read-only fallback without depending on interactive browser actions.
+type WebpageBrowserRenderer interface {
+	ReadURLSnapshot(context.Context, string) (string, error)
+}
+
 // ReadWebpageTool reads the actual response body of a public webpage. It is
 // intentionally separate from web_search so models can distinguish snippets
 // from source text and use the managed browser only for JavaScript-only pages.
 type ReadWebpageTool struct {
-	Policy SandboxPolicy
-	Client *http.Client
+	Policy  SandboxPolicy
+	Client  *http.Client
+	Browser WebpageBrowserRenderer
 }
 
 func (t ReadWebpageTool) Name() string { return "read_webpage" }
 
 func (t ReadWebpageTool) Description() string {
-	return "读取 HTTP/HTTPS 网页的真实正文，而不是搜索摘要。返回最终 URL、标题、正文和页面中的可引用链接；用户给出具体网页、要求分析页面或比较同类网站时使用。若结果提示页面依赖 JavaScript，再使用 browser 打开并读取 snapshot。"
+	return "读取 HTTP/HTTPS 网页的真实正文，而不是搜索摘要。返回最终 URL、标题、正文和页面中的可引用链接；用户给出具体网页、要求分析页面或比较同类网站时使用。静态响应没有正文时会自动通过 MHcode 内置浏览器渲染 JavaScript 并读取对应标签页快照。"
 }
 
 func (t ReadWebpageTool) InputSchema() map[string]any {
@@ -105,7 +115,7 @@ func (t ReadWebpageTool) Execute(ctx context.Context, rawArgs json.RawMessage) (
 		return webpageReadError(fmt.Sprintf("网页响应超过 %d MB 限制", maximumWebpageResponse/(1024*1024)), args.URL), nil
 	}
 	if len(bytes.TrimSpace(rawBody)) == 0 {
-		return webpageReadError("网页返回了空内容；页面可能依赖 JavaScript，请改用 browser snapshot", args.URL), nil
+		return t.readRenderedWebpage(ctx, args.URL, args.MaxChars, "网页返回了空内容")
 	}
 
 	finalURL := parsed
@@ -114,6 +124,9 @@ func (t ReadWebpageTool) Execute(ctx context.Context, rawArgs json.RawMessage) (
 	}
 	page, err := parseWebpage(rawBody, response.Header.Get("Content-Type"), finalURL, args.MaxChars)
 	if err != nil {
+		if errors.Is(err, errWebpageRequiresBrowser) {
+			return t.readRenderedWebpage(ctx, args.URL, args.MaxChars, err.Error())
+		}
 		return webpageReadError(err.Error(), args.URL), nil
 	}
 	output := formatWebpageReadOutput(page)
@@ -123,6 +136,106 @@ func (t ReadWebpageTool) Execute(ctx context.Context, rawArgs json.RawMessage) (
 			Kind: PartToolCall, Name: t.Name(), Status: "ok", Input: args.URL, Output: output,
 		}},
 	}, nil
+}
+
+type renderedWebpageSnapshot struct {
+	Title    string                           `json:"title"`
+	URL      string                           `json:"url"`
+	Text     string                           `json:"text"`
+	Elements []renderedWebpageSnapshotElement `json:"elements"`
+}
+
+type renderedWebpageSnapshotElement struct {
+	Name string `json:"name"`
+	Text string `json:"text"`
+	Href string `json:"href"`
+}
+
+func (t ReadWebpageTool) readRenderedWebpage(ctx context.Context, rawURL string, maxChars int, staticReason string) (Result, error) {
+	if t.Browser == nil {
+		return webpageReadError(staticReason+"；无法自动读取 JavaScript 页面，请在设置中启用内置浏览器", rawURL), nil
+	}
+	rawSnapshot, err := t.Browser.ReadURLSnapshot(ctx, rawURL)
+	if err != nil {
+		return webpageReadError(staticReason+"；内置浏览器自动读取失败: "+err.Error(), rawURL), nil
+	}
+	var snapshot renderedWebpageSnapshot
+	if err := json.Unmarshal([]byte(rawSnapshot), &snapshot); err != nil {
+		return webpageReadError(staticReason+"；解析内置浏览器快照失败: "+err.Error(), rawURL), nil
+	}
+	text := strings.TrimSpace(snapshot.Text)
+	if text == "" {
+		text = renderedWebpageElementText(snapshot.Elements)
+	}
+	text, truncated := clipWebpageText(text, maxChars)
+	if text == "" {
+		return webpageReadError(staticReason+"；内置浏览器完成渲染后仍没有可读取的正文", rawURL), nil
+	}
+	pageURL := rawURL
+	if parsed, validateErr := validateWebpageURL(snapshot.URL); validateErr == nil {
+		pageURL = parsed.String()
+	}
+	page := webpageDocument{
+		URL:       pageURL,
+		Title:     strings.TrimSpace(snapshot.Title),
+		Text:      text,
+		Truncated: truncated,
+		Links:     renderedWebpageLinks(snapshot.Elements, pageURL, maximumWebpageLinks),
+	}
+	output := "Read mode: MHcode managed browser snapshot\n\n" + formatWebpageReadOutput(page)
+	return Result{
+		Summary: fmt.Sprintf("静态正文为空，已通过内置浏览器读取：%s（%d 字符，%d 个链接）", page.DisplayTitle(), utf8.RuneCountInString(page.Text), len(page.Links)),
+		Parts: []ResultPart{{
+			Kind: PartToolCall, Name: t.Name(), Status: "ok", Input: rawURL, Output: output,
+		}},
+	}, nil
+}
+
+func renderedWebpageElementText(elements []renderedWebpageSnapshotElement) string {
+	seen := make(map[string]bool)
+	lines := make([]string, 0, len(elements))
+	for _, element := range elements {
+		value := compactSearchText(element.Text)
+		if value == "" {
+			value = compactSearchText(element.Name)
+		}
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		lines = append(lines, value)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderedWebpageLinks(elements []renderedWebpageSnapshotElement, pageURL string, limit int) []webpageLink {
+	base, _ := url.Parse(pageURL)
+	links := make([]webpageLink, 0, limit)
+	seen := make(map[string]bool)
+	for _, element := range elements {
+		if len(links) >= limit || strings.TrimSpace(element.Href) == "" || base == nil {
+			continue
+		}
+		resolved, err := base.Parse(strings.TrimSpace(element.Href))
+		if err != nil || !validHTTPURL(resolved.String()) {
+			continue
+		}
+		resolved.Fragment = ""
+		address := resolved.String()
+		if seen[address] {
+			continue
+		}
+		seen[address] = true
+		title := compactSearchText(element.Text)
+		if title == "" {
+			title = compactSearchText(element.Name)
+		}
+		if title == "" {
+			title = resolved.Hostname()
+		}
+		links = append(links, webpageLink{Title: title, URL: address})
+	}
+	return links
 }
 
 type webpageDocument struct {
@@ -179,7 +292,7 @@ func parseWebpage(raw []byte, contentType string, finalURL *url.URL, maxChars in
 		}
 		text, truncated := clipWebpageText(string(decoded), maxChars)
 		if text == "" {
-			return webpageDocument{}, errors.New("网页没有可读取的正文")
+			return webpageDocument{}, errWebpageRequiresBrowser
 		}
 		return webpageDocument{URL: finalURL.String(), Text: text, Truncated: truncated}, nil
 	}
@@ -191,7 +304,7 @@ func parseWebpage(raw []byte, contentType string, finalURL *url.URL, maxChars in
 	baseURL := webpageBaseURL(document, finalURL)
 	text, truncated := clipWebpageText(extractWebpageText(document), maxChars)
 	if text == "" {
-		return webpageDocument{}, errors.New("网页没有可读取的正文；页面可能依赖 JavaScript，请改用 browser snapshot")
+		return webpageDocument{}, errWebpageRequiresBrowser
 	}
 	return webpageDocument{
 		URL:         finalURL.String(),

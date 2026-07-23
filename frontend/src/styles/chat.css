@@ -891,6 +891,65 @@
   animation: spin 0.8s linear infinite;
 }
 
+.op-provider-notice {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  width: min(100%, 680px);
+  min-width: 0;
+  gap: 7px;
+  margin: 4px 0;
+  padding: 8px 10px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-primary));
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border-color));
+  border-radius: 6px;
+}
+
+.op-provider-notice.warning {
+  background: color-mix(in srgb, #c98718 8%, var(--bg-primary));
+  border-color: color-mix(in srgb, #c98718 30%, var(--border-color));
+}
+
+.op-provider-notice.error {
+  background: color-mix(in srgb, var(--red) 7%, var(--bg-primary));
+  border-color: color-mix(in srgb, var(--red) 28%, var(--border-color));
+}
+
+.op-provider-notice-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  color: var(--accent);
+}
+
+.op-provider-notice.warning .op-provider-notice-icon { color: #b97912; }
+.op-provider-notice.error .op-provider-notice-icon { color: var(--red); }
+
+.op-provider-notice-main {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.op-provider-notice-main strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.op-provider-notice-main small,
+.op-provider-notice-meta {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.op-provider-notice-main small { color: var(--text-secondary); }
+.op-provider-notice-meta { color: var(--text-muted); }
+
 /* Codex 式工具活动流：摘要保持轻量，详情按需展开。 */
 .op-activity-feed {
   display: grid;
@@ -975,6 +1034,91 @@
   border-left: 1px solid var(--border-color);
 }
 
+.op-command-list {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.op-command-entry {
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+.op-command-entry > summary {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 16px;
+  align-items: center;
+  min-height: 27px;
+  gap: 6px;
+  padding: 2px 3px;
+  list-style: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.op-command-entry > summary::-webkit-details-marker {
+  display: none;
+}
+
+.op-command-entry > summary:hover {
+  color: var(--text-primary);
+  background: rgb(128 128 128 / 6%);
+}
+
+.op-command-entry > summary code {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-family: var(--mono, ui-monospace, Menlo, Consolas, monospace);
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.op-command-state {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted);
+}
+
+.op-command-entry.error .op-command-state,
+.op-command-entry.error .op-command-meta {
+  color: var(--red);
+}
+
+.op-command-entry.running .op-command-state {
+  color: var(--accent);
+}
+
+.op-command-entry .op-activity-spinner {
+  width: 11px;
+  height: 11px;
+}
+
+.op-command-meta {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.op-command-entry > summary > svg {
+  color: var(--text-muted);
+  transition: transform .15s ease;
+}
+
+.op-command-entry[open] > summary > svg {
+  transform: rotate(90deg);
+}
+
+.op-command-entry > .op-shell-detail {
+  margin: 4px 2px 8px 24px;
+}
+
 .op-activity-detail,
 .op-activity-diff {
   min-width: 0;
@@ -1039,14 +1183,38 @@
   color: var(--red);
 }
 
+.op-shell-meta em.running {
+  color: var(--accent);
+}
+
 .op-shell-command {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
+	grid-template-columns: 14px minmax(0, 1fr) 24px;
+	align-items: start;
   gap: 7px;
   padding: 8px 9px;
   color: var(--code-text);
   background: rgb(128 128 128 / 4%);
   border-bottom: 1px solid var(--border-color);
+}
+
+.op-shell-command button,
+.op-shell-output-head button {
+	display: inline-grid;
+	place-items: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	color: var(--text-muted);
+	background: transparent;
+	border: 0;
+	border-radius: 4px;
+}
+
+.op-shell-command button:hover,
+.op-shell-output-head button:hover {
+	color: var(--text-primary);
+	background: var(--bg-hover);
 }
 
 .op-shell-command > span {
@@ -1077,6 +1245,33 @@
 .op-shell-output {
   max-height: 320px !important;
   white-space: pre !important;
+}
+
+.op-shell-output-head,
+.op-shell-output-label {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	min-height: 27px;
+	padding: 2px 7px 2px 9px;
+	color: var(--text-muted);
+	border-bottom: 1px solid var(--border-color);
+	font-size: 10px;
+	text-transform: uppercase;
+}
+
+.op-shell-output-label.error {
+	justify-content: flex-start;
+	color: var(--red);
+	border-top: 1px solid var(--border-color);
+}
+
+.op-shell-output.stderr {
+	color: color-mix(in srgb, var(--red) 78%, var(--code-text));
+}
+
+.op-shell-output.muted {
+	color: var(--text-muted);
 }
 
 .op-read-file {

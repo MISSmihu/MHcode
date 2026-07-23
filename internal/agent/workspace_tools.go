@@ -176,7 +176,40 @@ func (t TerminalTool) Execute(ctx context.Context, rawArgs json.RawMessage) (too
 		return toolError(t.Name(), err.Error()), nil
 	}
 	encoded, _ := json.Marshal(value)
-	return tools.Result{Summary: fmt.Sprintf("terminal %s completed", action), Parts: []tools.ResultPart{{Kind: tools.PartToolCall, Name: t.Name(), Status: "ok", Input: string(rawArgs), Output: string(encoded)}}}, nil
+	part := tools.ResultPart{
+		Kind: tools.PartToolCall, Name: t.Name(), Status: "ok",
+		Input: terminalActionDisplay(action, args.SessionID, args.Command), Output: string(encoded),
+	}
+	if state, ok := value.(terminal.SessionState); ok {
+		part.WorkingDirectory = state.Workdir
+		part.Stdout = state.Output
+		part.StartedAt = state.StartedAt
+		if state.Error != "" {
+			part.Stderr = state.Error
+		}
+		if !state.Running {
+			exitCode := state.ExitCode
+			part.ExitCode = &exitCode
+		}
+	}
+	return tools.Result{Summary: fmt.Sprintf("terminal %s completed", action), Parts: []tools.ResultPart{part}}, nil
+}
+
+func terminalActionDisplay(action, sessionID, command string) string {
+	if command = strings.TrimSpace(command); command != "" {
+		return command
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	switch action {
+	case "start":
+		return "启动持久终端"
+	case "state":
+		return strings.TrimSpace("读取终端状态 " + sessionID)
+	case "stop":
+		return strings.TrimSpace("停止持久终端 " + sessionID)
+	default:
+		return strings.TrimSpace(action + " " + sessionID)
+	}
 }
 
 func toolError(name, message string) tools.Result {

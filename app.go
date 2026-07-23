@@ -60,6 +60,7 @@ func NewApp() *App {
 		automations: automations,
 	}
 	app.service = agent.NewService(agent.ServiceConfig{
+		AppVersion:             appVersion,
 		SkillsDir:              "skills",
 		SkillsFS:               bundledSkills,
 		SettingsPath:           runtimeSettingsPath(),

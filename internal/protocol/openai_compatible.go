@@ -43,6 +43,7 @@ type OpenAICompatibleProvider struct {
 	APIKey           string
 	ProviderID       string
 	DisplayName      string
+	ClientVersion    string
 	APIType          string
 	HTTPClient       *http.Client
 	AllowNoAuth      bool
@@ -228,6 +229,17 @@ func (p OpenAICompatibleProvider) doRequestWithRetry(
 	body []byte,
 	accept string,
 ) (*http.Response, error) {
+	return p.doRequestWithRetryHeaders(ctx, method, path, body, accept, nil)
+}
+
+func (p OpenAICompatibleProvider) doRequestWithRetryHeaders(
+	ctx context.Context,
+	method string,
+	path string,
+	body []byte,
+	accept string,
+	internalHeaders http.Header,
+) (*http.Response, error) {
 	client := p.client()
 	var lastErr error
 	for attempt := 1; attempt <= openAICompatibleMaxAttempts; attempt++ {
@@ -243,10 +255,20 @@ func (p OpenAICompatibleProvider) doRequestWithRetry(
 		if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
 			return nil, err
 		}
+		p.applyClientIdentity(req)
+		for name, values := range internalHeaders {
+			for _, value := range values {
+				if validInternalHeaderValue(value) {
+					req.Header.Set(name, value)
+				}
+			}
+		}
 
 		resp, err := client.Do(req)
 		if err == nil {
-			if shouldRetryOpenAICompatibleStatus(resp.StatusCode) && attempt < openAICompatibleMaxAttempts {
+			if shouldRetryOpenAICompatibleStatus(resp.StatusCode) &&
+				attempt < openAICompatibleMaxAttempts &&
+				!openAICompatibleResponseHasNonRetryableError(resp) {
 				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 				_ = resp.Body.Close()
 				if err := sleepBeforeOpenAICompatibleRetry(ctx, attempt); err != nil {
@@ -266,6 +288,20 @@ func (p OpenAICompatibleProvider) doRequestWithRetry(
 		}
 	}
 	return nil, lastErr
+}
+
+func openAICompatibleResponseHasNonRetryableError(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	var envelope openAIErrorEnvelope
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	return isNonRetryableProviderErrorCode(strings.TrimSpace(fmt.Sprint(envelope.Error.Code)))
 }
 
 func shouldRetryOpenAICompatibleStatus(statusCode int) bool {
@@ -312,6 +348,20 @@ func (p OpenAICompatibleProvider) applyHeaders(req *http.Request, accept string)
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
+}
+
+func (p OpenAICompatibleProvider) applyClientIdentity(req *http.Request) {
+	userAgent := "MHcode"
+	if version := strings.TrimSpace(p.ClientVersion); version != "" {
+		userAgent += "/" + version
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("originator", "mhcode")
+}
+
+func validInternalHeaderValue(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !strings.ContainsAny(value, "\r\n")
 }
 
 func parseOpenAICompatibleStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
@@ -388,9 +438,39 @@ func openAICompatibleAPIError(resp *http.Response) error {
 		detail = compactOpenAICompatibleError(string(body))
 	}
 	if detail == "" {
-		return fmt.Errorf("OpenAI-compatible request failed (HTTP %d)", resp.StatusCode)
+		detail = "OpenAI-compatible request failed"
 	}
-	return fmt.Errorf("OpenAI-compatible request failed: %s (HTTP %d)", detail, resp.StatusCode)
+	code := strings.TrimSpace(fmt.Sprint(envelope.Error.Code))
+	if code == "<nil>" {
+		code = ""
+	}
+	return NewProviderError(ProviderErrorInfo{
+		Provider:   "openai-compatible",
+		HTTPStatus: resp.StatusCode,
+		Type:       strings.TrimSpace(envelope.Error.Type),
+		Code:       code,
+		Message:    detail,
+		RequestID:  responseRequestID(resp.Header),
+		Retryable:  shouldRetryOpenAICompatibleStatus(resp.StatusCode) && !isNonRetryableProviderErrorCode(code),
+	})
+}
+
+func isNonRetryableProviderErrorCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "cyber_policy", "invalid_prompt", "bio_policy":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseRequestID(headers http.Header) string {
+	for _, name := range []string{"x-request-id", "x-oai-request-id"} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func compactOpenAICompatibleError(value string) string {

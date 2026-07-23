@@ -523,7 +523,7 @@ func (s *Service) runTeamRole(
 		if completionErr != nil {
 			err = completionErr
 		} else {
-			outcome = toolLoopOutcome{Content: completion.Content, Reasoning: completion.Reasoning, Usage: completion.Usage}
+			outcome = toolLoopOutcome{Content: completion.Content, Reasoning: completion.Reasoning, Usage: completion.Usage, Parts: providerNoticeParts(completion.Notices)}
 		}
 	} else {
 		registry := s.buildReadOnlyRegistry()
@@ -581,6 +581,19 @@ func (s *Service) resolveTeamRoleRoute(settings TeamRoleSetting, primary chatRou
 func teamRoleRequest(base protocol.ChatRequest, role string, attempt int, route chatRoute, artifacts []teamArtifact) protocol.ChatRequest {
 	request := base
 	request.Model = route.ModelID
+	request.Metadata = make(map[string]string, len(base.Metadata)+3)
+	for key, value := range base.Metadata {
+		request.Metadata[key] = value
+	}
+	request.Metadata["request_kind"] = "team_role"
+	request.Metadata["team_role"] = role
+	request.Metadata["team_attempt"] = fmt.Sprintf("%d", attempt)
+	if threadID := strings.TrimSuffix(strings.TrimSpace(base.ThreadID), ":"); threadID != "" {
+		request.ThreadID = threadID + ":team:" + role
+	}
+	if turnID := strings.TrimSuffix(strings.TrimSpace(base.TurnID), ":"); turnID != "" {
+		request.TurnID = turnID + ":" + role + ":" + fmt.Sprintf("%d", attempt)
+	}
 	request.Messages = append([]protocol.Message(nil), base.Messages...)
 	request.Messages = append(request.Messages, protocol.Message{Role: "user", Content: teamRoleInstruction(role, attempt, artifacts)})
 	request.Tools = nil

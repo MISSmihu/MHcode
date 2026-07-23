@@ -167,6 +167,11 @@ func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, 
 	reg := s.buildReadOnlyRegistry()
 
 	planReq := baseRequest
+	planReq.Metadata = make(map[string]string, len(baseRequest.Metadata)+1)
+	for key, value := range baseRequest.Metadata {
+		planReq.Metadata[key] = value
+	}
+	planReq.Metadata["request_kind"] = "plan"
 	// 在消息尾部追加规划指令（易变尾部，不污染稳定前缀）。
 	planReq.Messages = append(append([]protocol.Message{}, baseRequest.Messages...),
 		protocol.Message{Role: "user", Content: planInstruction})

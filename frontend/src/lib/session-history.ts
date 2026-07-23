@@ -1,5 +1,32 @@
 import type { SessionMessage } from "../types";
 import type { ChatMessage } from "../ui-types";
+import type { ComposerSnapshot } from "./composer-history";
+
+export type OptimisticTurnSnapshot = ComposerSnapshot & {
+  userMessageID: string;
+  assistantMessageID: string;
+};
+
+export type OptimisticTurnRollback = {
+  messages: ChatMessage[];
+  composer: ComposerSnapshot;
+};
+
+export function rollbackOptimisticTurnState(
+  current: ChatMessage[],
+  turn: OptimisticTurnSnapshot,
+): OptimisticTurnRollback {
+  const optimisticIDs = new Set([turn.userMessageID, turn.assistantMessageID].filter(Boolean));
+  return {
+    messages: current.filter((message) => !optimisticIDs.has(message.id)),
+    composer: {
+      draft: turn.draft,
+      tail: turn.tail,
+      attachments: turn.attachments.map((attachment) => ({ ...attachment })),
+      links: turn.links.map((link) => ({ ...link })),
+    },
+  };
+}
 
 export function reconcileSessionMessages(
   current: ChatMessage[],
@@ -21,6 +48,8 @@ export function reconcileSessionMessages(
     attachments: message.attachments,
     createdAt: message.createdAt || new Date(fallbackTimestamp).toISOString(),
     durationMs: message.durationMs,
+	failed: message.status === "failed",
+	cancelled: message.status === "cancelled",
   }));
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MISSmihu/MHcode/internal/eventlog"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
@@ -17,6 +18,7 @@ type planFlowProvider struct {
 	planCalls    int
 	streamCalls  int
 	executionErr error
+	waitForStop  bool
 }
 
 func (p *planFlowProvider) Name() string { return "plan-flow" }
@@ -27,7 +29,7 @@ func (p *planFlowProvider) Complete(context.Context, protocol.ChatRequest) (prot
 	p.planCalls++
 	return protocol.CompletionResult{Content: "1. 检查工作区\n2. 写入计划产物\n3. 验证结果"}, nil
 }
-func (p *planFlowProvider) Stream(_ context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+func (p *planFlowProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
 	p.streamCalls++
 	if p.executionErr != nil {
 		return nil, p.executionErr
@@ -35,6 +37,11 @@ func (p *planFlowProvider) Stream(_ context.Context, request protocol.ChatReques
 	events := make(chan protocol.StreamEvent, 2)
 	go func() {
 		defer close(events)
+		if p.waitForStop {
+			events <- protocol.StreamEvent{Type: "delta", Delta: "已完成部分分析。"}
+			<-ctx.Done()
+			return
+		}
 		if len(request.Messages) == 0 || request.Messages[len(request.Messages)-1].Role != "tool" {
 			events <- protocol.StreamEvent{Type: "tool_calls", ToolCalls: []protocol.ToolCall{{
 				ID: "plan-write", Type: "function", Function: protocol.ToolCallFunction{
@@ -237,6 +244,41 @@ func TestPlanModeMarksApprovedPlanFailedWhenExecutionFails(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workspace, "planned.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("failed execution unexpectedly wrote a file: %v", statErr)
+	}
+}
+
+func TestPlanModeCancellationWithPartialOutputPersistsOneTerminalPlanEvent(t *testing.T) {
+	svc, _, provider := newPlanFlowService(t, ReasoningHigh)
+	svc.planMode = true
+	provider.waitForStop = true
+	svc.SetApprovalNotify(func(request ApprovalRequest) {
+		go func() { _ = svc.RespondApproval(request.ID, request.Tool, true, "once") }()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := svc.SendChatMessageWithEvents(ctx, "开始执行后停止", func(event ChatStreamEvent) {
+		if event.Type == "delta" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if !result.TurnCommitted || result.Content != "已完成部分分析。" {
+		t.Fatalf("cancelled result = %#v", result)
+	}
+
+	cancelledEvents := 0
+	for _, event := range svc.eventStore.Events() {
+		if event.Type == eventlog.EventPlanUpdate && event.Payload.PlanStatus == "cancelled" {
+			cancelledEvents++
+		}
+	}
+	if cancelledEvents != 1 {
+		t.Fatalf("cancelled plan events = %d, want 1", cancelledEvents)
+	}
+	if state := svc.WorkbenchState().PlanState; state.Status != "cancelled" {
+		t.Fatalf("cancelled plan state = %#v", state)
 	}
 }
 

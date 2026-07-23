@@ -133,26 +133,56 @@ func (s *Service) runToolLoopTurn(
 		s.adoptProviderRoute(route)
 	}
 	if err != nil {
-		// 回滚本轮追加的用户消息，保持 session 一致。
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
-		partialCompleted := hasUsablePartialToolResult(outcome.Parts)
-		if partialCompleted && planStarted {
-			if planErr := s.finishPlanState("completed"); planErr != nil {
-				err = errors.Join(err, fmt.Errorf("finish partial plan: %w", planErr))
-				partialCompleted = false
+		if outcome.Usage != nil {
+			s.metrics = usageMetricsFor(route.Provider, outcome.Usage)
+			s.recordUsageMetrics(s.metrics, route)
+		}
+		cancelled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
+		partialCompleted := !cancelled && hasUsablePartialToolResult(outcome.Parts)
+		if planStarted {
+			if partialCompleted {
+				if planErr := s.finishPlanState("completed"); planErr != nil {
+					err = errors.Join(err, fmt.Errorf("finish partial plan: %w", planErr))
+					partialCompleted = false
+				}
+			} else if cancelled {
+				if planErr := s.finishPlanState("cancelled"); planErr != nil {
+					err = errors.Join(err, fmt.Errorf("cancel plan: %w", planErr))
+				}
+			} else {
+				err = s.failStartedPlan(planStarted, err)
 			}
 		}
-		if !partialCompleted {
-			err = s.failStartedPlan(planStarted, err)
+		terminalStatus := "failed"
+		if cancelled {
+			terminalStatus = "cancelled"
 		}
 		if partialCompleted {
 			setOutcomeProgressStatus(&outcome, "completed")
-			emitOutcomeProgress(sink, outcome.Parts)
+		} else {
+			setOutcomeProgressStatus(&outcome, terminalStatus)
 		}
-		partialContent := partialToolFailureContent(outcome)
+		emitOutcomeProgress(sink, outcome.Parts)
+
+		partialContent := partialToolEvidenceContent(outcome)
+		if partialContent == "" && !cancelled {
+			partialContent = partialToolFailureContent(outcome)
+		}
+		if partialContent == "" && (strings.TrimSpace(outcome.Reasoning) != "" || hasMeaningfulResultParts(outcome.Parts)) {
+			partialContent = retainedTurnContent(terminalStatus, "", outcome.Parts, outcome.Reasoning)
+		}
 		partialParts := appendTextPartIfMissing(outcome.Parts, partialContent)
-		if partialContent != "" && len(requestMessages) > 0 {
+		result := ChatResult{
+			Content:   partialContent,
+			Reasoning: outcome.Reasoning,
+			Model:     route.ModelID,
+			Usage:     s.metrics,
+			State:     s.workbenchStateLocked(),
+			Parts:     partialParts,
+		}
+		if partialCompleted && partialContent != "" && len(requestMessages) > 0 {
 			currentUser := requestMessages[len(requestMessages)-1]
 			if currentUser.Role == "user" {
 				s.sessionMessages = append(s.sessionMessages,
@@ -162,20 +192,14 @@ func (s *Service) runToolLoopTurn(
 				s.sessionState.MessageCount = len(s.sessionMessages)
 				s.sessionState.TurnCount++
 				s.recordAssistantAndCheckpoint(partialContent, route.ModelID, partialParts, chatTurnDurationMs(ctx))
+				result.TurnCommitted = true
 			}
-		}
-		result := ChatResult{
-			Content:   partialContent,
-			Reasoning: outcome.Reasoning,
-			Model:     route.ModelID,
-			Usage:     s.metrics,
-			State:     s.workbenchStateLocked(),
-			Parts:     partialParts,
 		}
 		if partialCompleted {
 			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 			return result, nil
 		}
+		s.retainInterruptedTurn(&result, terminalStatus, requestMessages, baseMessageCount, prefixDiagnostic)
 		return result, err
 	}
 
@@ -209,6 +233,19 @@ func (s *Service) runToolLoopTurn(
 }
 
 func partialToolFailureContent(outcome toolLoopOutcome) string {
+	if content := partialToolEvidenceContent(outcome); content != "" {
+		return content
+	}
+	if hasMeaningfulResultParts(outcome.Parts) {
+		return "工具已经执行，但上游模型未能完成最终回复。执行记录已保留，可以直接重试。"
+	}
+	return ""
+}
+
+func partialToolEvidenceContent(outcome toolLoopOutcome) string {
+	if content := sanitizeModelContent(outcome.Content); content != "" {
+		return content
+	}
 	for _, part := range outcome.Parts {
 		if isSuccessfulRepositoryRead(part) {
 			return repositoryReadFallbackContent(part)
@@ -218,9 +255,6 @@ func partialToolFailureContent(outcome toolLoopOutcome) string {
 		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
 			return webSearchFallbackContent(part)
 		}
-	}
-	if len(outcome.Parts) > 0 {
-		return "工具已经执行，但上游模型未能完成最终回复。执行记录已保留，可以直接重试。"
 	}
 	return ""
 }
@@ -510,7 +544,7 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 	)
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
-		reg.Add(tools.ReadWebpageTool{Policy: policy})
+		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
 	if s.config.OpenFile != nil || s.config.PreviewFile != nil {
@@ -530,6 +564,13 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 	// run_command 仅在 ShellAccess 开启时注册（文件操作绝不经 shell）。
 	if s.runtimeSettings.ShellAccess {
 		reg.Add(tools.RunCommandTool{Policy: policy})
+	}
+	if s.runtimeSettings.NetworkAccess && s.runtimeSettings.ShellAccess {
+		reg.Add(SSHCredentialTool{
+			Policy:         policy,
+			Resolve:        s.resolveScopedSSHCredential,
+			KnownHostsPath: s.scopedSSHKnownHostsPath(),
+		})
 	}
 	if s.config.Git != nil {
 		reg.Add(GitTool{Policy: policy, Controller: s.config.Git})
@@ -571,10 +612,18 @@ func (s *Service) buildReadOnlyRegistry() *tools.Registry {
 	}
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
-		reg.Add(tools.ReadWebpageTool{Policy: policy})
+		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
 	return reg
+}
+
+func (s *Service) webpageBrowserRenderer() tools.WebpageBrowserRenderer {
+	if s.config.Browser == nil || !s.runtimeSettings.Browser.Enabled {
+		return nil
+	}
+	renderer, _ := s.config.Browser.(tools.WebpageBrowserRenderer)
+	return renderer
 }
 
 // toolDefinitions 把注册表的工具 schema 转成 provider 需要的 protocol.ToolDefinition。
@@ -902,6 +951,16 @@ func (s *Service) runToolLoopWithCompletion(
 				}
 			}
 		}
+		outcome.Parts = mergeOutcomeParts(outcome.Parts, providerNoticeParts(completion.Notices))
+		if completion.Usage != nil {
+			outcome.Usage = completion.Usage
+		}
+		if strings.TrimSpace(completion.Reasoning) != "" {
+			outcome.Reasoning = completion.Reasoning
+		}
+		if strings.TrimSpace(completion.Content) != "" {
+			outcome.Content = completion.Content
+		}
 		if err != nil {
 			// 首轮带工具失败：很可能该模型/端点不支持 tools（自定义模型常见）。
 			// 降级为不带 tools 重试一次，保证普通对话可用。
@@ -912,12 +971,6 @@ func (s *Service) runToolLoopWithCompletion(
 			setOutcomeProgressStatus(&outcome, "failed")
 			emitOutcomeProgress(sink, outcome.Parts)
 			return outcome, err
-		}
-		if completion.Usage != nil {
-			outcome.Usage = completion.Usage
-		}
-		if strings.TrimSpace(completion.Reasoning) != "" {
-			outcome.Reasoning = completion.Reasoning
 		}
 
 		// 无工具调用 → 最终答案。
@@ -982,8 +1035,31 @@ func (s *Service) runToolLoopWithCompletion(
 			}
 
 			if !guarded {
-				result, toolMsg = s.executeToolCall(ctx, reg, call)
+				toolCtx := tools.WithProgressSink(ctx, func(part tools.ResultPart) {
+					if part.Name == "" {
+						part.Name = call.Function.Name
+					}
+					if part.Input == "" {
+						part.Input = toolInput
+					}
+					part.Status = "running"
+					emitChatEvent(sink, ChatStreamEvent{
+						Type:       "tool",
+						Message:    fmt.Sprintf("正在运行 %s", call.Function.Name),
+						ToolName:   call.Function.Name,
+						ToolCallID: call.ID,
+						ToolInput:  toolInput,
+						Status:     "running",
+						Parts:      []tools.ResultPart{part},
+					})
+				})
+				result, toolMsg = s.executeToolCall(toolCtx, reg, call)
 				if err := ctx.Err(); err != nil {
+					if !hidden {
+						outcome.Parts = mergeOutcomeParts(outcome.Parts, result.Parts)
+						outcome.Changes = append(outcome.Changes, result.Changes...)
+						updateOutcomeProgressStats(&outcome)
+					}
 					setOutcomeProgressStatus(&outcome, "cancelled")
 					emitOutcomeProgress(sink, outcome.Parts)
 					return outcome, err
@@ -1072,6 +1148,20 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 			}
 			continue
 		}
+		if part.Kind == tools.PartProviderNotice {
+			identity := providerResultPartIdentity(part)
+			duplicate := false
+			for _, current := range existing {
+				if current.Kind == tools.PartProviderNotice && providerResultPartIdentity(current) == identity {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				existing = append(existing, part)
+			}
+			continue
+		}
 		if part.Kind != tools.PartProgress {
 			existing = append(existing, part)
 			continue
@@ -1089,6 +1179,20 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 		}
 	}
 	return existing
+}
+
+func providerResultPartIdentity(part tools.ResultPart) string {
+	return strings.Join([]string{
+		part.NoticeKind,
+		part.RequestedModel,
+		part.EffectiveModel,
+		part.RetryModel,
+		strings.Join(part.UseCases, ","),
+		strings.Join(part.Reasons, ","),
+		strings.Join(part.Verifications, ","),
+		strings.Join(part.MetadataKeys, ","),
+		part.ErrorCode,
+	}, "\x00")
 }
 
 func mergeWebSearchParts(existing, incoming tools.ResultPart) tools.ResultPart {
@@ -1323,6 +1427,8 @@ func applyToolResultPolicy(result tools.Result, policy string) tools.Result {
 		part := &result.Parts[index]
 		part.Input = clipContextText(part.Input, detailLimit/2)
 		part.Output = clipContextText(part.Output, detailLimit)
+		part.Stdout = clipContextText(part.Stdout, detailLimit)
+		part.Stderr = clipContextText(part.Stderr, detailLimit)
 		if part.Kind == tools.PartText {
 			part.Text = clipContextText(part.Text, detailLimit)
 		}
@@ -1365,6 +1471,13 @@ func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
 		key = "url"
 	case "run_command":
 		key = "command"
+	case "terminal":
+		command, _ := args["command"].(string)
+		action, _ := args["action"].(string)
+		sessionID, _ := args["session_id"].(string)
+		return terminalActionDisplay(action, sessionID, command)
+	case "ssh":
+		return sshToolInputForDisplay(rawArgs)
 	case "copy_file":
 		source, _ := args["source"].(string)
 		destination, _ := args["destination"].(string)

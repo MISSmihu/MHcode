@@ -5,9 +5,44 @@ import (
 	"errors"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/agent"
 )
+
+func TestChatTaskStopCancelsImmediatelyAndForceReleasesStalledTask(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	task := &chatTask{
+		id:                "stalled-task",
+		projectID:         "project",
+		sessionID:         "session",
+		cancel:            cancel,
+		acceptingGuidance: true,
+		done:              make(chan struct{}),
+	}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{task.id: task}
+	app.chat.bySession = map[string]string{chatSessionKey(task.projectID, task.sessionID): task.id}
+	app.chat.active = task
+
+	if stopped := app.StopChatMessage(task.id); !stopped {
+		t.Fatal("stop request was not accepted")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stop did not cancel the task context immediately")
+	}
+
+	app.enforceChatTaskStop(task, 10*time.Millisecond)
+	task.markDone()
+	if active := app.GetActiveChatTask(); active != nil {
+		t.Fatalf("stalled task remained active after force release: %#v", active)
+	}
+	if err := app.requireProjectSessionIdleChat(task.projectID, task.sessionID); err != nil {
+		t.Fatalf("force-released conversation remained busy: %v", err)
+	}
+}
 
 func TestChatTaskCancellationClassification(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

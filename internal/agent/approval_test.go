@@ -186,4 +186,7 @@ func TestOnFailurePolicyIsNotEquivalentToNever(t *testing.T) {
 	if !svc.needsApproval("write_file", json.RawMessage(`{"path":"a.txt","content":"x"}`)) {
 		t.Fatal("on-failure must gate file mutations")
 	}
+	if !svc.needsApproval("ssh", json.RawMessage(`{"action":"run","credential_id":"ssh-example","command":"systemctl restart app"}`)) {
+		t.Fatal("on-failure must gate remote SSH operations")
+	}
 }

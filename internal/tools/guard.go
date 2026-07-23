@@ -59,6 +59,7 @@ var (
 	ErrCommandNetworkDisabled = errors.New("network access is disabled for shell commands")
 	ErrCommandOutsideRoots    = errors.New("shell command references a path outside the allowed roots")
 	ErrShellFileOperation     = errors.New("shell file operations are disabled; use the structured workspace tools")
+	ErrShellRemoteOperation   = errors.New("remote SSH operations are disabled on the generic shell path; use the structured ssh tool")
 	ErrSymlinkMutation        = errors.New("refusing to replace a symbolic link with a regular file")
 	ErrNoWorkspaceRoot        = errors.New("未配置工作区根目录")
 )
@@ -173,6 +174,9 @@ func (p SandboxPolicy) ValidateCommand(command string) error {
 	if tool := structuredFileToolForCommand(normalized); tool != "" {
 		return fmt.Errorf("%w: use %s", ErrShellFileOperation, tool)
 	}
+	if tool := structuredRemoteToolForCommand(normalized); tool != "" {
+		return fmt.Errorf("%w: use %s", ErrShellRemoteOperation, tool)
+	}
 
 	if !p.AllowDestructiveOps && commandLooksDestructive(normalized) {
 		return ErrDestructiveDisabled
@@ -184,6 +188,20 @@ func (p SandboxPolicy) ValidateCommand(command string) error {
 		return ErrCommandOutsideRoots
 	}
 	return nil
+}
+
+func structuredRemoteToolForCommand(command string) string {
+	canonical := strings.NewReplacer(
+		`"`, " ", `'`, " ", "(", " ", ")", " ", "{", " ", "}", " ",
+		";", " ; ", "&&", " && ", "||", " || ", "|", " | ",
+	).Replace(command)
+	padded := " " + strings.Join(strings.Fields(canonical), " ") + " "
+	for _, name := range []string{"ssh", "scp", "sftp", "ssh-add", "plink", "rsync"} {
+		if strings.Contains(padded, " "+name+" ") {
+			return "ssh"
+		}
+	}
+	return ""
 }
 
 func structuredFileToolForCommand(command string) string {

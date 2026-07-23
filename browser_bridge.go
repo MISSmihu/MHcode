@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -47,6 +49,77 @@ func (b *browserToolBridge) SnapshotJSON(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("内置浏览器不可用")
 	}
 	return b.app.browser.SnapshotJSON(ctx)
+}
+
+// ReadURLSnapshot opens a managed tab and snapshots that exact tab after the
+// page has had a short window to hydrate. Keeping the tab id avoids reading a
+// different page when multiple conversations browse concurrently.
+func (b *browserToolBridge) ReadURLSnapshot(ctx context.Context, targetURL string) (string, error) {
+	opened, err := b.OpenURL(ctx, targetURL)
+	if err != nil {
+		return "", err
+	}
+	var target struct {
+		TabID string `json:"tabId"`
+	}
+	if err := json.Unmarshal([]byte(opened), &target); err != nil || strings.TrimSpace(target.TabID) == "" {
+		return "", fmt.Errorf("内置浏览器没有返回可读取的标签页")
+	}
+
+	startedAt := time.Now()
+	stableAfter := startedAt.Add(750 * time.Millisecond)
+	deadline := startedAt.Add(5 * time.Second)
+	var lastPayload string
+	var lastErr error
+	var lastContentSignature string
+	stableSnapshots := 0
+	for {
+		snapshot, snapshotErr := b.app.browser.SnapshotTab(ctx, target.TabID)
+		if snapshotErr == nil {
+			payload, marshalErr := json.Marshal(snapshot)
+			if marshalErr != nil {
+				return "", marshalErr
+			}
+			lastPayload = string(payload)
+			contentSignature := strings.TrimSpace(snapshot.Text)
+			if contentSignature == "" {
+				var semanticElements strings.Builder
+				for _, element := range snapshot.Elements {
+					semanticElements.WriteString(strings.TrimSpace(element.Name))
+					semanticElements.WriteByte('\x00')
+					semanticElements.WriteString(strings.TrimSpace(element.Text))
+					semanticElements.WriteByte('\x00')
+					semanticElements.WriteString(strings.TrimSpace(element.Href))
+					semanticElements.WriteByte('\n')
+				}
+				contentSignature = strings.TrimSpace(semanticElements.String())
+			}
+			if contentSignature != "" {
+				if contentSignature == lastContentSignature {
+					stableSnapshots++
+				} else {
+					lastContentSignature = contentSignature
+					stableSnapshots = 1
+				}
+			}
+			if (time.Now().After(stableAfter) && stableSnapshots >= 2) || time.Now().After(deadline) {
+				return lastPayload, nil
+			}
+		} else {
+			lastErr = snapshotErr
+		}
+		if time.Now().After(deadline) {
+			if lastPayload != "" {
+				return lastPayload, nil
+			}
+			return "", lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func (b *browserToolBridge) ClickSelector(ctx context.Context, selector string) error {

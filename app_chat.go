@@ -39,7 +39,12 @@ type chatTask struct {
 	cancel            context.CancelFunc
 	acceptingGuidance bool
 	guidance          []chatGuidance
+	done              chan struct{}
+	doneOnce          sync.Once
+	terminalOnce      sync.Once
 }
+
+const chatTaskStopGracePeriod = 2 * time.Second
 
 type chatGuidance struct {
 	id          string
@@ -75,6 +80,7 @@ type ChatTaskEvent struct {
 	Guidance    string                         `json:"guidance,omitempty"`
 	Attachments []agent.ChatAttachment         `json:"attachments,omitempty"`
 	Result      *agent.ChatResult              `json:"result,omitempty"`
+	Forced      bool                           `json:"forced,omitempty"`
 }
 
 func (a *App) StartChatMessage(prompt string) (string, error) {
@@ -159,6 +165,7 @@ func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessio
 		startedAt:         time.Now().Format(time.RFC3339Nano),
 		cancel:            cancel,
 		acceptingGuidance: true,
+		done:              make(chan struct{}),
 	}
 
 	a.chat.mu.Lock()
@@ -204,7 +211,12 @@ func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessio
 }
 
 func (a *App) StopChatMessage(taskID string) bool {
-	return a.cancelActiveChatTask(strings.TrimSpace(taskID))
+	task := a.cancelActiveChatTask(strings.TrimSpace(taskID))
+	if task == nil {
+		return false
+	}
+	go a.enforceChatTaskStop(task, chatTaskStopGracePeriod)
+	return true
 }
 
 func (a *App) GuideChatMessage(taskID, guidanceID, prompt string) (bool, error) {
@@ -309,6 +321,7 @@ func chatSessionKey(projectID, sessionID string) string {
 }
 
 func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, attachments []agent.ChatAttachment) {
+	defer task.markDone()
 	a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "started", Message: "正在准备上下文"})
 	emitProgress := func(progress agent.ChatStreamEvent) {
 		a.emitChatTaskEvent(ChatTaskEvent{
@@ -346,9 +359,7 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 
 		guidance, ok := a.takeNextChatGuidance(task)
 		if !ok {
-			task.cancel()
-			a.reloadCompletedChatTask(task)
-			a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "completed", Model: result.Model, Result: &result})
+			a.completeChatTask(task, ChatTaskEvent{TaskID: task.id, Type: "completed", Model: result.Model, Result: &result})
 			return
 		}
 
@@ -367,21 +378,61 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 		guidanceTurn = true
 	}
 
-	a.finishChatTask(task)
 	wasCancelled := chatTaskWasCancelled(ctx, err)
-	task.cancel()
-	a.reloadCompletedChatTask(task)
 
 	if err != nil {
 		if wasCancelled {
-			a.emitChatTaskEvent(ChatTaskEvent{
+			a.completeChatTask(task, ChatTaskEvent{
 				TaskID: task.id, Type: "cancelled", Message: "已停止生成",
 				Model: result.Model, Result: &result,
 			})
 			return
 		}
-		a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "failed", Message: err.Error(), Model: result.Model, Result: &result})
+		a.completeChatTask(task, ChatTaskEvent{TaskID: task.id, Type: "failed", Message: err.Error(), Model: result.Model, Result: &result})
 		return
+	}
+}
+
+func (task *chatTask) markDone() {
+	if task == nil || task.done == nil {
+		return
+	}
+	task.doneOnce.Do(func() { close(task.done) })
+}
+
+func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
+	if task == nil {
+		return
+	}
+	task.terminalOnce.Do(func() {
+		a.finishChatTask(task)
+		if task.cancel != nil {
+			task.cancel()
+		}
+		a.reloadCompletedChatTask(task)
+		a.emitChatTaskEvent(event)
+	})
+}
+
+func (a *App) enforceChatTaskStop(task *chatTask, grace time.Duration) {
+	if task == nil || task.done == nil {
+		return
+	}
+	if grace <= 0 {
+		grace = chatTaskStopGracePeriod
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-task.done:
+		return
+	case <-timer.C:
+		a.completeChatTask(task, ChatTaskEvent{
+			TaskID:  task.id,
+			Type:    "cancelled",
+			Message: "任务未在取消期限内退出，已强制结束并转入后台清理。",
+			Forced:  true,
+		})
 	}
 }
 
@@ -424,19 +475,22 @@ func chatTaskWasCancelled(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 }
 
-func (a *App) cancelActiveChatTask(taskID string) bool {
+func (a *App) cancelActiveChatTask(taskID string) *chatTask {
 	a.chat.mu.Lock()
-	defer a.chat.mu.Unlock()
 	task := a.chat.tasks[strings.TrimSpace(taskID)]
 	if task == nil && a.chat.active != nil && (taskID == "" || a.chat.active.id == taskID) {
 		task = a.chat.active
 	}
 	if task == nil || (taskID != "" && task.id != taskID) {
-		return false
+		a.chat.mu.Unlock()
+		return nil
 	}
 	task.acceptingGuidance = false
-	task.cancel()
-	return true
+	a.chat.mu.Unlock()
+	if task.cancel != nil {
+		task.cancel()
+	}
+	return task
 }
 
 func (a *App) cancelAllChatTasks() {

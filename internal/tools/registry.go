@@ -9,13 +9,14 @@ import (
 type PartKind string
 
 const (
-	PartText      PartKind = "text"
-	PartDiff      PartKind = "diff"
-	PartToolCall  PartKind = "tool_call"
-	PartFile      PartKind = "file"
-	PartProgress  PartKind = "task_progress"
-	PartWebSearch PartKind = "web_search_results"
-	PartTeamRole  PartKind = "team_role"
+	PartText           PartKind = "text"
+	PartDiff           PartKind = "diff"
+	PartToolCall       PartKind = "tool_call"
+	PartFile           PartKind = "file"
+	PartProgress       PartKind = "task_progress"
+	PartWebSearch      PartKind = "web_search_results"
+	PartTeamRole       PartKind = "team_role"
+	PartProviderNotice PartKind = "provider_notice"
 )
 
 type ProgressStep struct {
@@ -52,6 +53,8 @@ type ResultPart struct {
 	Status string `json:"status,omitempty"` // running | ok | error
 	Input  string `json:"input,omitempty"`
 	Output string `json:"output,omitempty"`
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
 	// Execution metadata is kept on the structured part so the UI can show
 	// durable, per-tool diagnostics after a session switch or app restart.
 	WorkingDirectory string `json:"workingDirectory,omitempty"`
@@ -77,6 +80,22 @@ type ResultPart struct {
 	Summary    string `json:"summary,omitempty"`
 	Verdict    string `json:"verdict,omitempty"`
 	Attempt    int    `json:"attempt,omitempty"`
+
+	// provider_notice
+	NoticeKind     string   `json:"noticeKind,omitempty"`
+	Severity       string   `json:"severity,omitempty"`
+	Message        string   `json:"message,omitempty"`
+	RequestedModel string   `json:"requestedModel,omitempty"`
+	EffectiveModel string   `json:"effectiveModel,omitempty"`
+	RetryModel     string   `json:"retryModel,omitempty"`
+	UseCases       []string `json:"useCases,omitempty"`
+	Reasons        []string `json:"reasons,omitempty"`
+	Verifications  []string `json:"verifications,omitempty"`
+	MetadataKeys   []string `json:"metadataKeys,omitempty"`
+	RequestID      string   `json:"requestId,omitempty"`
+	ErrorCode      string   `json:"errorCode,omitempty"`
+	HTTPStatus     int      `json:"httpStatus,omitempty"`
+	Retryable      *bool    `json:"retryable,omitempty"`
 }
 
 // Result 是一次工具执行的产出。

@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/vault"
@@ -149,6 +151,41 @@ func TestServiceRuntimeSettingsPersist(t *testing.T) {
 	}
 }
 
+func TestRuntimePolicyContextDescribesEffectiveAuthorization(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	defer service.Close()
+	settings := DefaultRuntimeSettings()
+	settings.SandboxMode = "workspace-write"
+	settings.FilesystemAccess = "workspace-write"
+	settings.NetworkAccess = false
+	settings.ShellAccess = true
+	settings.ApprovalPolicy = "on-request"
+	settings.AllowDestructiveOps = false
+	settings.WorkspaceRoot = t.TempDir()
+	settings.ExtraWritableRoots = []string{t.TempDir()}
+	service.runtimeSettings = settings.Normalized()
+
+	policy := service.runtimePolicyContext()
+	for _, expected := range []string{
+		"sandbox_mode=workspace-write",
+		"filesystem_access=workspace-write",
+		"network_access=disabled",
+		"shell_access=enabled",
+		"approval_policy=on-request",
+		"destructive_operations=disabled",
+		"workspace_root=" + service.runtimeSettings.WorkspaceRoot,
+		"extra_writable_roots=" + strings.Join(service.runtimeSettings.ExtraWritableRoots, "; "),
+		"sandbox_backend=",
+		"User-supplied credentials authorize only the explicitly named target, account, and requested operation.",
+		"Never echo secrets in replies or persist them in files, logs, project memory, plans, or tool summaries.",
+		"A user's scoped authorization does not disable provider safety policy or MHcode approval requirements.",
+	} {
+		if !strings.Contains(policy, expected) {
+			t.Errorf("runtime policy missing %q:\n%s", expected, policy)
+		}
+	}
+}
+
 func TestServicePersistsMultipleCustomModelProviders(t *testing.T) {
 	settingsPath := t.TempDir() + "/runtime-settings.json"
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath})
@@ -264,6 +301,40 @@ func TestServiceSendDeepSeekMessageUpdatesUsage(t *testing.T) {
 	}
 	if !strings.Contains(result.State.DeepSeek.LastCheckMessage, "试聊成功") {
 		t.Fatalf("deepseek message = %q, want chat success notice", result.State.DeepSeek.LastCheckMessage)
+	}
+}
+
+func TestServiceReplacesSSHPasswordBeforeProviderRequestAndPersistence(t *testing.T) {
+	const password = "provider-must-not-see-this-password"
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBody, _ = io.ReadAll(r.Body)
+		writeOpenAIReply(w, requestIsStream(requestBody), "ready", "")
+	}))
+	defer server.Close()
+
+	secrets := vault.NewMemoryVault()
+	service := NewService(ServiceConfig{
+		SkillsDir:       t.TempDir(),
+		DeepSeekBaseURL: server.URL,
+		SessionsDir:     t.TempDir(),
+		SettingsPath:    filepath.Join(t.TempDir(), "runtime-settings.json"),
+		Vault:           secrets,
+	})
+	defer service.Close()
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := service.SendDeepSeekMessage(context.Background(), "IP: 192.0.2.10用户名：root\n密码："+password+"\n请部署网站")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(requestBody), password) || !strings.Contains(string(requestBody), scopedCredentialScheme) {
+		t.Fatalf("provider request did not use an opaque credential reference: %s", requestBody)
+	}
+	history := service.GetSessionMessages()
+	if len(history) < 1 || strings.Contains(history[0].Content, password) || !strings.Contains(history[0].Content, scopedCredentialScheme) {
+		t.Fatalf("persisted user message = %#v", history)
 	}
 }
 
@@ -934,7 +1005,7 @@ func TestConfiguredRelayCarriesSelectedGPT56ReasoningToResponsesPayload(t *testi
 	}
 }
 
-func TestSendChatMessageWithEventsCancellationRollsBackTurn(t *testing.T) {
+func TestSendChatMessageWithEventsCancellationRetainsPartialTurn(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
@@ -952,7 +1023,7 @@ func TestSendChatMessageWithEventsCancellationRollsBackTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	_, err := service.SendChatMessageWithEvents(ctx, "cancel me", func(event ChatStreamEvent) {
+	result, err := service.SendChatMessageWithEvents(ctx, "cancel me", func(event ChatStreamEvent) {
 		if event.Type == "delta" {
 			cancel()
 		}
@@ -960,17 +1031,127 @@ func TestSendChatMessageWithEventsCancellationRollsBackTurn(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
-	if service.sessionState.TurnCount != 0 {
+	if !result.TurnCommitted || result.Content != "partial" {
+		t.Fatalf("cancelled result = %#v", result)
+	}
+	if service.sessionState.TurnCount != 1 {
 		t.Fatalf("turn count = %d after cancelled turn", service.sessionState.TurnCount)
 	}
-	if len(service.sessionMessages) == 0 || service.sessionMessages[len(service.sessionMessages)-1].Role == "user" {
-		t.Fatalf("cancelled user message was not rolled back: %#v", service.sessionMessages)
+	if len(service.sessionMessages) < 2 || service.sessionMessages[len(service.sessionMessages)-2].Content != "cancel me" || service.sessionMessages[len(service.sessionMessages)-1].Content != "partial" {
+		t.Fatalf("cancelled partial turn was not retained: %#v", service.sessionMessages)
 	}
 	reloaded := NewService(config)
+	foundUser := false
+	foundCancelled := false
 	for _, message := range reloaded.GetSessionMessages() {
 		if message.Content == "cancel me" {
-			t.Fatalf("cancelled message survived restart: %#v", message)
+			foundUser = true
 		}
+		if message.Status == "cancelled" {
+			foundCancelled = true
+			if message.Content != "partial" {
+				t.Fatalf("cancelled partial response = %#v", message)
+			}
+		}
+	}
+	if !foundUser || !foundCancelled {
+		t.Fatalf("retained cancelled turn missing after reload: user=%v cancelled=%v", foundUser, foundCancelled)
+	}
+	foundContext := false
+	for _, message := range reloaded.sessionMessages {
+		if message.Role == "user" && message.Content == "cancel me" {
+			foundContext = true
+		}
+	}
+	if !foundContext {
+		t.Fatalf("cancelled user request is missing from continuation context: %#v", reloaded.sessionMessages)
+	}
+}
+
+func TestSendChatMessageWithEventsCancellationRollsBackZeroOutputTurn(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		startedOnce.Do(func() { close(started) })
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	config := ServiceConfig{SkillsDir: t.TempDir(), DeepSeekBaseURL: server.URL, SessionsDir: t.TempDir()}
+	service := NewService(config)
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	type sendResult struct {
+		result ChatResult
+		err    error
+	}
+	done := make(chan sendResult, 1)
+	go func() {
+		result, err := service.SendChatMessageWithEvents(ctx, "restore this draft", nil)
+		done <- sendResult{result: result, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("provider request did not start")
+	}
+	cancel()
+	result := <-done
+	if !errors.Is(result.err, context.Canceled) || result.result.TurnCommitted {
+		t.Fatalf("zero-output cancellation = %#v, err=%v", result.result, result.err)
+	}
+	if service.sessionState.TurnCount != 0 {
+		t.Fatalf("turn count = %d after zero-output cancellation", service.sessionState.TurnCount)
+	}
+	for _, message := range service.GetSessionMessages() {
+		if message.Content == "restore this draft" {
+			t.Fatalf("zero-output user turn survived rollback: %#v", message)
+		}
+	}
+}
+
+func TestSendChatMessageFailureRollsBackTurnAndPersistsTerminalState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	sessions := t.TempDir()
+	config := ServiceConfig{SkillsDir: t.TempDir(), DeepSeekBaseURL: server.URL, SessionsDir: sessions}
+	service := NewService(config)
+	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := service.SendChatMessageWithEvents(context.Background(), "fail me", nil)
+	if err == nil {
+		t.Fatal("provider failure unexpectedly succeeded")
+	}
+	if service.sessionState.TurnCount != 0 {
+		t.Fatalf("turn count = %d after failed turn", service.sessionState.TurnCount)
+	}
+
+	reloaded := NewService(config)
+	foundFailed := false
+	for _, message := range reloaded.GetSessionMessages() {
+		if message.Content == "fail me" {
+			t.Fatalf("failed optimistic message survived restart: %#v", message)
+		}
+		if message.Status == "failed" {
+			foundFailed = true
+			if strings.TrimSpace(message.Content) == "" {
+				t.Fatalf("failed terminal record has no explanation: %#v", message)
+			}
+		}
+	}
+	if !foundFailed {
+		t.Fatal("failed turn did not leave a durable terminal record")
 	}
 }
 

@@ -40,12 +40,21 @@ func (gitControllerStub) SwitchBranch(context.Context, string, string) (workspac
 	return workspacegit.Status{Available: true}, nil
 }
 
-type terminalControllerStub struct{ writes int }
+type terminalControllerStub struct {
+	writes int
+	state  terminal.SessionState
+}
 
 func (t *terminalControllerStub) StartRestricted(string, sandboxexec.Limits) (terminal.SessionState, error) {
+	if t.state.ID != "" {
+		return t.state, nil
+	}
 	return terminal.SessionState{ID: "session"}, nil
 }
 func (t *terminalControllerStub) State(string) (terminal.SessionState, error) {
+	if t.state.ID != "" {
+		return t.state, nil
+	}
 	return terminal.SessionState{ID: "session"}, nil
 }
 func (t *terminalControllerStub) WriteLine(string, string) error { t.writes++; return nil }
@@ -67,6 +76,26 @@ func TestTerminalToolAppliesCommandPolicy(t *testing.T) {
 	result, err := tool.Execute(context.Background(), args)
 	if err != nil || !result.IsError || controller.writes != 0 {
 		t.Fatalf("result=%#v writes=%d err=%v", result, controller.writes, err)
+	}
+}
+
+func TestTerminalToolReturnsStructuredSessionMetadata(t *testing.T) {
+	root := t.TempDir()
+	exitCode := 7
+	controller := &terminalControllerStub{state: terminal.SessionState{
+		ID: "session", Workdir: root, Running: false, StartedAt: "2026-07-23T12:00:00Z",
+		ExitCode: exitCode, Output: "stdout line", Error: "stderr line",
+	}}
+	tool := TerminalTool{Policy: tools.SandboxPolicy{WorkspaceRoot: root}, Controller: controller}
+	args, _ := json.Marshal(map[string]any{"action": "state", "session_id": "session"})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil || result.IsError || len(result.Parts) != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	part := result.Parts[0]
+	if part.Input != "读取终端状态 session" || part.WorkingDirectory != root || part.Stdout != "stdout line" || part.Stderr != "stderr line" ||
+		part.StartedAt != "2026-07-23T12:00:00Z" || part.ExitCode == nil || *part.ExitCode != exitCode {
+		t.Fatalf("terminal metadata = %#v", part)
 	}
 }
 

@@ -63,7 +63,10 @@ func (p *failoverProvider) Stream(ctx context.Context, request protocol.ChatRequ
 					}
 				}
 				if event.Type == "error" && !seenOutput {
-					streamErr := errors.New(event.Error)
+					streamErr := error(errors.New(event.Error))
+					if event.ProviderError != nil {
+						streamErr = protocol.NewProviderError(*event.ProviderError)
+					}
 					if isProviderFailoverError(ctx, streamErr) && p.advance(currentIndex, streamErr) {
 						retry = true
 						break streamLoop
@@ -183,6 +186,9 @@ func (p *failoverProvider) advance(index int, cause error) bool {
 func isProviderFailoverError(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		return false
+	}
+	if info, ok := protocol.ProviderErrorDetails(err); ok {
+		return info.Retryable
 	}
 	return isRetryablePostToolCompletionError(ctx, err)
 }

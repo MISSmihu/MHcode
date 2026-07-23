@@ -1,8 +1,24 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasUsablePartialResult } from "../src/lib/chat-results";
+import { hasMeaningfulTurnOutput, hasUsablePartialResult } from "../src/lib/chat-results";
 
 describe("chat UI regressions", () => {
+  test("streams, deduplicates, and renders provider safety notices", async () => {
+    const [app, messageContent, css, types] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
+      Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+    ]);
+    expect(app.match(/case "provider_notice"/g)?.length).toBe(2);
+    expect(app).toContain("providerNoticeIdentity(part)");
+    expect(messageContent).toContain("<ProviderNotice");
+    expect(messageContent).toContain("服务端调整了本轮模型");
+    expect(css).toContain(".op-provider-notice {");
+    expect(css).toContain("color-mix(in srgb, var(--accent)");
+    expect(types).toContain('kind: "provider_notice"');
+  });
+
   test("keeps a one-line user message compact", async () => {
     const css = await Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text();
     expect(css).toContain(".op-user-bubble .md-body p { margin: 0; }");
@@ -19,14 +35,16 @@ describe("chat UI regressions", () => {
     expect(editorRule).toContain("text-decoration: none;");
   });
 
-  test("keeps a URL-only composer aligned from the left", async () => {
+	test("keeps URL chips on a separate row below one native editor", async () => {
     const [app, css] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
     ]);
-    expect(app).toContain('"starts-with-link": composerLinks().length > 0 && promptDraft().trim().length === 0');
-    expect(css).toContain(".composer-rich-input.starts-with-link .composer-text-editor:empty");
-    expect(css).toContain("flex: 0 0 0;");
+	expect(app).toContain('<textarea');
+	expect(app).toContain('class="composer-link-row"');
+	expect(app).not.toContain("composerTailEditorRef");
+	expect(css).toContain(".composer-link-row {");
+	expect(css).toContain(".composer-text-editor::placeholder");
   });
 
   test("keeps the link remove action inside the composer chip", async () => {
@@ -40,9 +58,11 @@ describe("chat UI regressions", () => {
     expect(rule).not.toContain("right: -7px;");
   });
 
-  test("supports composer undo and redo across rich input regions", async () => {
+	test("uses one native composer while retaining toolbar undo and redo", async () => {
     const app = await Bun.file(new URL("../src/app.tsx", import.meta.url)).text();
-    expect(app).toContain("handleComposerHistoryShortcut(event)");
+	expect(app).toContain("ref={composerEditorRef}");
+	expect(app).toContain("event.currentTarget.value");
+	expect(app).not.toContain("composerTailEditorRef");
     expect(app).toContain("undoComposerInput");
     expect(app).toContain("redoComposerInput");
     expect(app).toContain('title="撤销输入 (Ctrl+Z)"');
@@ -362,5 +382,41 @@ describe("chat UI regressions", () => {
       status: "error",
       output: "HTTP 403",
     }])).toBe(false);
+  });
+
+  test("only restores the composer when a stopped turn produced no meaningful output", async () => {
+    const app = await Bun.file(new URL("../src/app.tsx", import.meta.url)).text();
+    expect(app).toContain('case "cancelled": {');
+    expect(app).toContain("hasMeaningfulTurnOutput(result, eventTask?.assistantMessage)");
+    expect(app).toMatch(/if \(!retainedTurn\) \{\s*rollbackOptimisticTurn\(eventProjectID, eventSessionID\);/);
+    expect(app).toMatch(/if \(accepted\) \{[\s\S]{0,220}Do not erase the turn here\.[\s\S]{0,80}return;/);
+    expect(app).toMatch(/case "cancelled": \{[\s\S]{0,1600}cancelled: true/);
+  });
+
+  test("recognizes partial text, reasoning, and terminal activity as retained output", () => {
+    expect(hasMeaningfulTurnOutput({ content: "partial", turnCommitted: true })).toBe(true);
+    expect(hasMeaningfulTurnOutput({ content: "", turnCommitted: false }, { content: "", reasoning: "started", parts: [] })).toBe(false);
+    expect(hasMeaningfulTurnOutput({ content: "", turnCommitted: false }, {
+      content: "",
+      parts: [{ kind: "tool_call", name: "terminal", status: "ok", input: "Get-ChildItem" }],
+    })).toBe(false);
+    expect(hasMeaningfulTurnOutput({ content: "", turnCommitted: false }, {
+      content: "",
+      parts: [{ kind: "provider_notice", noticeKind: "policy_error", message: "blocked" }],
+    })).toBe(false);
+  });
+
+  test("groups shell, terminal, and SSH actions into nested command rows", async () => {
+    const [messageContent, css] = await Promise.all([
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
+    ]);
+    expect(messageContent).toContain('<CommandActivityList parts={props.item.parts} />');
+    expect(messageContent).toContain('class="op-command-entry"');
+    expect(messageContent).toContain('case "ssh": return "command";');
+    expect(messageContent).toContain('props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh"');
+    expect(css).toContain(".op-command-list {");
+    expect(css).toContain(".op-command-entry > summary {");
+    expect(css).toContain(".op-command-entry[open] > summary > svg {");
   });
 });

@@ -21,11 +21,35 @@ type ChatRequest struct {
 	ThinkingMode    string            `json:"thinkingMode,omitempty"`
 	ReasoningEffort string            `json:"reasoningEffort,omitempty"`
 	Metadata        map[string]string `json:"metadata,omitempty"`
+	// Responses API controls. They remain internal for other protocols.
+	ToolChoice        string                 `json:"-"`
+	ParallelToolCalls bool                   `json:"-"`
+	Store             bool                   `json:"-"`
+	Include           []string               `json:"-"`
+	PromptCacheKey    string                 `json:"-"`
+	SessionID         string                 `json:"-"`
+	ThreadID          string                 `json:"-"`
+	TurnID            string                 `json:"-"`
+	ResponsesContext  ResponsesClientContext `json:"-"`
 	// Tools 为空时表示普通对话；非空时启用 function-calling（仅支持 ToolCaller 的 provider 生效）。
 	Tools []ToolDefinition `json:"tools,omitempty"`
 	// Internal context budget hints. Providers never serialize these fields.
 	MaxInputTokens    int `json:"-"`
 	TargetInputTokens int `json:"-"`
+}
+
+// ResponsesClientContext describes the real MHcode turn using the metadata
+// shape understood by Codex-compatible Responses endpoints. It is transport
+// context only: it never claims Codex identity, authentication, or account
+// entitlements.
+type ResponsesClientContext struct {
+	InstallationID      string   `json:"-"`
+	WindowID            string   `json:"-"`
+	RequestKind         string   `json:"-"`
+	ThreadSource        string   `json:"-"`
+	Sandbox             string   `json:"-"`
+	WorkspaceRoots      []string `json:"-"`
+	TurnStartedAtUnixMS int64    `json:"-"`
 }
 
 type Message struct {
@@ -83,11 +107,13 @@ type ToolCallFunction struct {
 
 // CompletionResult 是一次非流式补全结果：要么带文本，要么带工具调用。
 type CompletionResult struct {
-	Content      string
-	Reasoning    string
-	ToolCalls    []ToolCall
-	Usage        *TokenUsage
-	Continuation *ProviderContinuation
+	Content        string
+	Reasoning      string
+	ToolCalls      []ToolCall
+	Usage          *TokenUsage
+	Continuation   *ProviderContinuation
+	EffectiveModel string
+	Notices        []ProviderNotice
 }
 
 // ProviderContinuation carries opaque, signed reasoning state between tool
@@ -106,13 +132,15 @@ type TokenUsage struct {
 }
 
 type StreamEvent struct {
-	Type         string                `json:"type"`
-	Delta        string                `json:"delta,omitempty"`
-	Error        string                `json:"error,omitempty"`
-	Usage        *TokenUsage           `json:"usage,omitempty"`
-	ToolCalls    []ToolCall            `json:"toolCalls,omitempty"`
-	FinishReason string                `json:"finishReason,omitempty"`
-	Continuation *ProviderContinuation `json:"-"`
+	Type          string                `json:"type"`
+	Delta         string                `json:"delta,omitempty"`
+	Error         string                `json:"error,omitempty"`
+	ProviderError *ProviderErrorInfo    `json:"providerError,omitempty"`
+	Notice        *ProviderNotice       `json:"notice,omitempty"`
+	Usage         *TokenUsage           `json:"usage,omitempty"`
+	ToolCalls     []ToolCall            `json:"toolCalls,omitempty"`
+	FinishReason  string                `json:"finishReason,omitempty"`
+	Continuation  *ProviderContinuation `json:"-"`
 }
 
 type Provider interface {

@@ -192,7 +192,7 @@ func (s *Service) needsApproval(toolName string, rawArgs json.RawMessage) bool {
 		return false
 	}
 	switch toolName {
-	case "write_file", "apply_patch", "copy_file", "delete_file", "run_command":
+	case "write_file", "apply_patch", "copy_file", "delete_file", "run_command", "ssh":
 		return true
 	case "git":
 		return gitActionNeedsApproval(rawArgs)
@@ -272,6 +272,10 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 		request.Kind = "terminal"
 		request.Command = truncateApprovalArgs(rawArgs)
 		request.Summary = "请求操作持久终端"
+	} else if name == "ssh" {
+		request.Kind = "ssh"
+		request.Command = sshToolInputForDisplay(rawArgs)
+		request.Summary = "请求连接用户授权的 SSH 主机"
 	} else if strings.HasPrefix(name, "mcp__") {
 		request.Kind = "mcp"
 		request.Command = truncateApprovalArgs(rawArgs)

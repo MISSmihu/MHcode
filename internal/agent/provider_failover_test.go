@@ -99,3 +99,67 @@ func TestFailoverProviderStopsWhileCandidateStreamIsOpen(t *testing.T) {
 	}
 	close(stalled)
 }
+
+func TestFailoverProviderDoesNotRetryTypedPolicyCompletionError(t *testing.T) {
+	secondCalled := false
+	provider := &failoverProvider{candidates: []routedProvider{
+		{route: chatRoute{Provider: ModelProviderSetting{ID: "one", Name: "one"}, ModelID: "one"}, provider: failoverProviderStub{
+			name: "one", complete: func(protocol.ChatRequest) (protocol.CompletionResult, error) {
+				return protocol.CompletionResult{}, protocol.NewProviderError(protocol.ProviderErrorInfo{
+					Code: "cyber_policy", Message: "temporarily unavailable by policy", Retryable: false,
+				})
+			},
+		}},
+		{route: chatRoute{Provider: ModelProviderSetting{ID: "two", Name: "two"}, ModelID: "two"}, provider: failoverProviderStub{
+			name: "two", complete: func(protocol.ChatRequest) (protocol.CompletionResult, error) {
+				secondCalled = true
+				return protocol.CompletionResult{Content: "unexpected"}, nil
+			},
+		}},
+	}}
+	_, err := provider.Complete(context.Background(), protocol.ChatRequest{})
+	info, ok := protocol.ProviderErrorDetails(err)
+	if !ok || info.Code != "cyber_policy" || info.Retryable {
+		t.Fatalf("error = %v, info = %#v, ok = %v", err, info, ok)
+	}
+	if secondCalled || provider.ActiveRoute().Provider.ID != "one" {
+		t.Fatalf("policy error switched provider: called=%v route=%#v", secondCalled, provider.ActiveRoute())
+	}
+}
+
+func TestFailoverProviderDoesNotRetryTypedPolicyStreamError(t *testing.T) {
+	policyStream := make(chan protocol.StreamEvent, 1)
+	policyStream <- protocol.StreamEvent{
+		Type: "error", Error: "temporarily unavailable by policy",
+		ProviderError: &protocol.ProviderErrorInfo{Code: "cyber_policy", Message: "temporarily unavailable by policy", Retryable: false},
+	}
+	close(policyStream)
+	secondCalled := false
+	provider := &failoverProvider{candidates: []routedProvider{
+		{route: chatRoute{Provider: ModelProviderSetting{ID: "one", Name: "one"}, ModelID: "one"}, provider: failoverProviderStub{
+			name: "one", stream: func(protocol.ChatRequest) (<-chan protocol.StreamEvent, error) { return policyStream, nil },
+		}},
+		{route: chatRoute{Provider: ModelProviderSetting{ID: "two", Name: "two"}, ModelID: "two"}, provider: failoverProviderStub{
+			name: "two", stream: func(protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+				secondCalled = true
+				unexpected := make(chan protocol.StreamEvent)
+				close(unexpected)
+				return unexpected, nil
+			},
+		}},
+	}}
+	events, err := provider.Stream(context.Background(), protocol.ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received protocol.StreamEvent
+	for event := range events {
+		received = event
+	}
+	if received.ProviderError == nil || received.ProviderError.Code != "cyber_policy" {
+		t.Fatalf("event = %#v", received)
+	}
+	if secondCalled || provider.ActiveRoute().Provider.ID != "one" {
+		t.Fatalf("policy stream switched provider: called=%v route=%#v", secondCalled, provider.ActiveRoute())
+	}
+}

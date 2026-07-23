@@ -175,7 +175,7 @@ import {
 } from "./format";
 import { formatElapsedDuration } from "./lib/duration";
 import { errorMessage } from "./lib/errors";
-import { reconcileSessionMessages } from "./lib/session-history";
+import { reconcileSessionMessages, rollbackOptimisticTurnState } from "./lib/session-history";
 import { clearGuidanceMessages, dequeueMessage, enqueueMessage, prioritizeMessage, removeMessage, takeMessageForEditing } from "./lib/message-queue";
 import type { ComposerLink, QueuedComposerMessage } from "./lib/message-queue";
 import {
@@ -186,7 +186,8 @@ import {
   undoComposerSnapshot,
 } from "./lib/composer-history";
 import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
-import { hasUsablePartialResult } from "./lib/chat-results";
+import { hasMeaningfulTurnOutput } from "./lib/chat-results";
+import { redactSensitiveTextForDisplay } from "./lib/sensitive-text";
 import type { UIAppearancePreferences } from "./ui-appearance";
 import {
   applyUIAppearance,
@@ -242,6 +243,7 @@ type SessionTaskRuntime = {
   startedAt: string;
   assistantMessage: ChatMessage;
   progress?: TaskProgressPart;
+  optimisticRolledBack?: boolean;
 };
 
 type SessionViewState = {
@@ -297,10 +299,6 @@ function App() {
   const [activeChatTaskID, setActiveChatTaskID] = createSignal("");
   const [streamingMessageID, setStreamingMessageID] = createSignal("");
   const [activeTaskProgress, setActiveTaskProgress] = createSignal<TaskProgressPart>();
-  const [submittedPrompt, setSubmittedPrompt] = createSignal("");
-  const [submittedTail, setSubmittedTail] = createSignal("");
-  const [submittedAttachments, setSubmittedAttachments] = createSignal<ChatAttachment[]>([]);
-  const [submittedLinks, setSubmittedLinks] = createSignal<ComposerLink[]>([]);
   const [queuedMessages, setQueuedMessages] = createSignal<QueuedComposerMessage[]>([]);
   const [queuedMessagesBySession, setQueuedMessagesBySession] = createSignal<Record<string, QueuedComposerMessage[]>>({});
   const [resettingSession, setResettingSession] = createSignal(false);
@@ -380,8 +378,7 @@ function App() {
   let chatScrollRef: HTMLElement | undefined;
   let shellRef: HTMLElement | undefined;
   let workbenchRef: HTMLDivElement | undefined;
-  let composerEditorRef: HTMLDivElement | undefined;
-  let composerTailEditorRef: HTMLDivElement | undefined;
+	let composerEditorRef: HTMLTextAreaElement | undefined;
   let composerImageInputRef: HTMLInputElement | undefined;
   let workspaceFileRequestID = 0;
   let projectActionMenuRef: HTMLDivElement | undefined;
@@ -593,17 +590,11 @@ function App() {
   });
 
   createEffect(() => {
-    const value = promptDraft();
+	const value = composerEditableText(promptDraft(), composerTailDraft());
     const editor = composerEditorRef;
-    if (!editor || document.activeElement === editor || composerEditorText(editor) === value) return;
-    editor.textContent = value;
-  });
-
-  createEffect(() => {
-    const value = composerTailDraft();
-    const editor = composerTailEditorRef;
-    if (!editor || document.activeElement === editor || composerEditorText(editor) === value) return;
-    editor.textContent = value;
+	if (!editor || editor.value === value) return;
+	editor.value = value;
+	resizeComposerEditor(editor);
   });
 
   const handleBrowserPreviewRequest = async (preview: BrowserPreview) => {
@@ -842,7 +833,7 @@ function App() {
         reviewOpen: false,
         sidePanelView: "browser" as SidePanelView,
       };
-      const composed = composeComposerPrompt(task.prompt, task.links, task.tail);
+      const composed = redactSensitiveTextForDisplay(composeComposerPrompt(task.prompt, task.links, task.tail));
       let nextMessages = [...existing.messages];
       if ((composed || task.attachments.length > 0) && !nextMessages.some((message) => message.id === task.userMessageID)) {
         nextMessages.push({
@@ -869,31 +860,50 @@ function App() {
     const key = sessionIdentityKey(projectID, sessionID);
     const task = sessionTaskRuntimes()[key];
     if (!task) return;
-    const optimisticIDs = new Set([task.userMessageID, task.messageID].filter(Boolean));
+    const restoreComposer = !task.optimisticRolledBack && Boolean(
+      task.userMessageID || task.prompt || task.tail || task.attachments.length > 0 || task.links.length > 0,
+    );
+    const turn = {
+      userMessageID: task.userMessageID,
+      assistantMessageID: task.messageID,
+      draft: task.prompt,
+      tail: task.tail,
+      attachments: task.attachments,
+      links: task.links,
+    };
+    const restoredComposer = rollbackOptimisticTurnState([], turn).composer;
+    setSessionTaskRuntimes((current) => {
+      const currentTask = current[key];
+      if (!currentTask || currentTask.optimisticRolledBack) return current;
+      return { ...current, [key]: { ...currentTask, optimisticRolledBack: true } };
+    });
     setSessionViewStates((current) => {
       const existing = current[key];
       if (!existing) return current;
+      const rollback = rollbackOptimisticTurnState(existing.messages, turn);
       return {
         ...current,
         [key]: {
           ...existing,
-          messages: existing.messages.filter((message) => !optimisticIDs.has(message.id)),
+          messages: rollback.messages,
           activeTaskProgress: undefined,
-          composerDraft: task.prompt,
-          composerTail: task.tail,
-          composerAttachments: task.attachments.map((attachment) => ({ ...attachment })),
-          composerLinks: task.links.map((link) => ({ ...link })),
+          composerDraft: restoreComposer ? rollback.composer.draft : existing.composerDraft,
+          composerTail: restoreComposer ? rollback.composer.tail : existing.composerTail,
+          composerAttachments: restoreComposer ? rollback.composer.attachments : existing.composerAttachments,
+          composerLinks: restoreComposer ? rollback.composer.links : existing.composerLinks,
         },
       };
     });
     if (projectID === activeProjectID() && sessionID === activeSessionID()) {
-      setMessages((current) => current.filter((message) => !optimisticIDs.has(message.id)));
+      setMessages((current) => rollbackOptimisticTurnState(current, turn).messages);
       setActiveTaskProgress(undefined);
-      setComposerDraft(task.prompt);
-      setComposerTail(task.tail);
-      setComposerAttachments(task.attachments.map((attachment) => ({ ...attachment })));
-      setComposerLinks(task.links.map((link) => ({ ...link })));
-      resetComposerHistory();
+      if (restoreComposer) {
+        setComposerDraft(restoredComposer.draft);
+        setComposerTail(restoredComposer.tail);
+        setComposerAttachments(restoredComposer.attachments);
+        setComposerLinks(restoredComposer.links);
+        resetComposerHistory();
+      }
     }
   };
 
@@ -903,7 +913,7 @@ function App() {
     const attachments = event.attachments?.map((attachment) => ({ ...attachment })) ?? [];
     const startedAt = new Date().toISOString();
     const userMessage: ChatMessage = {
-      ...createChatMessage("user", guidance),
+      ...createChatMessage("user", redactSensitiveTextForDisplay(guidance)),
       id: `user-guidance-${event.guidanceId || Date.now()}`,
       attachments,
     };
@@ -959,6 +969,13 @@ function App() {
       case "reasoning":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, reasoning: (message.reasoning ?? "") + (event.delta ?? ""), status: "正在推理" }));
         break;
+      case "provider_notice":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
+          status: event.message || message.status || "正在处理供应商响应",
+        }));
+        break;
       case "tool":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
@@ -1009,6 +1026,12 @@ function App() {
       }
       case "cancelled": {
         const result = event.result;
+        const task = sessionTaskRuntimes()[sessionIdentityKey(projectID, sessionID)];
+        const retainedTurn = hasMeaningfulTurnOutput(result, task?.assistantMessage);
+        if (!retainedTurn) {
+          rollbackOptimisticTurn(projectID, sessionID);
+          return;
+        }
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
           content: result?.content || message.content,
@@ -1017,16 +1040,18 @@ function App() {
           usage: result?.usage || message.usage,
           parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, "cancelled"),
           durationMs: result?.durationMs ?? message.durationMs,
-          streaming: false,
+          failed: false,
           cancelled: true,
-          status: undefined,
+          streaming: false,
+          status: "已停止",
         }));
         break;
       }
       case "failed": {
         const result = event.result;
-        const partialToolCompleted = hasUsablePartialResult(result?.parts);
-        if (!partialToolCompleted) {
+        const task = sessionTaskRuntimes()[sessionIdentityKey(projectID, sessionID)];
+        const retainedTurn = hasMeaningfulTurnOutput(result, task?.assistantMessage);
+        if (!retainedTurn) {
           rollbackOptimisticTurn(projectID, sessionID);
           return;
         }
@@ -1036,9 +1061,10 @@ function App() {
           reasoning: result?.reasoning || message.reasoning,
           model: result?.model || message.model,
           usage: result?.usage || message.usage,
-          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, partialToolCompleted ? "completed" : "failed"),
+          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, "failed"),
           durationMs: result?.durationMs ?? message.durationMs,
-          failed: !partialToolCompleted,
+          failed: true,
+          cancelled: false,
           streaming: false,
           status: undefined,
         }));
@@ -1068,16 +1094,20 @@ function App() {
       removed = true;
       return next;
     });
+	if (removed) {
+	  setSessionViewStates((current) => {
+		const view = current[finishedKey];
+		if (!view || !view.activeTaskProgress) return current;
+		return { ...current, [finishedKey]: { ...view, activeTaskProgress: undefined } };
+	  });
+	}
     const belongsToVisibleTask = visibleProjectID === finishedProjectID && visibleSessionID === finishedSessionID
       && (!finishedTaskID || !visibleTaskID || visibleTaskID === finishedTaskID);
     if (removed && belongsToVisibleTask) {
       setSendingMessage(false);
       setActiveChatTaskID("");
       setStreamingMessageID("");
-      setSubmittedPrompt("");
-      setSubmittedTail("");
-      setSubmittedAttachments([]);
-      setSubmittedLinks([]);
+	  setActiveTaskProgress(undefined);
       setPendingReasoningLevel(undefined);
       return pendingReasoning && pendingReasoning !== profile().id ? pendingReasoning : undefined;
     }
@@ -1175,6 +1205,15 @@ function App() {
           compressionStatus: undefined,
         }));
         break;
+      case "provider_notice":
+        updateStreamingMessage((message) => ({
+          ...message,
+          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
+          status: event.message || message.status || "正在处理供应商响应",
+          statusKind: undefined,
+          compressionStatus: undefined,
+        }));
+        break;
       case "tool":
         updateStreamingMessage((message) => ({
           ...message,
@@ -1244,10 +1283,6 @@ function App() {
           guidedTask.assistantMessage,
         ]);
         setStreamingMessageID(guidedTask.assistantMessage.id);
-        setSubmittedPrompt(guidance);
-        setSubmittedTail("");
-        setSubmittedAttachments(guidanceAttachments);
-        setSubmittedLinks([]);
         break;
       }
       case "completed": {
@@ -1288,54 +1323,71 @@ function App() {
       }
       case "cancelled": {
         setQueuedMessages(clearGuidanceMessages);
-        setComposerDraft(submittedPrompt());
-        setComposerTail(submittedTail());
-        setComposerAttachments(submittedAttachments());
-        setComposerLinks(submittedLinks());
-        resetComposerHistory();
         const result = event.result;
+        const retainedTurn = hasMeaningfulTurnOutput(result, eventTask?.assistantMessage);
         if (result) {
           setState(result.state);
         }
-        updateStreamingMessage((message) => ({
-          ...message,
-          content: result?.content || message.content,
-          reasoning: result?.reasoning || message.reasoning,
-          model: result?.model || message.model,
-          usage: result?.usage || message.usage,
-          parts: settleLiveProgress(result?.parts?.length ? result.parts : message.parts, "cancelled"),
-          durationMs: result?.durationMs ?? message.durationMs,
-          streaming: false,
-          cancelled: true,
-          status: undefined,
-        }));
-        settleActiveTaskProgress("cancelled");
-        if (activeTaskProgress()) updateSessionTaskProgress(eventProjectID, eventSessionID, { ...cloneTaskProgress(activeTaskProgress()!), taskStatus: "cancelled" });
-        void applyPendingReasoning(finishChatTask(eventProjectID, eventSessionID, event.taskId));
+        if (!retainedTurn) {
+          rollbackOptimisticTurn(eventProjectID, eventSessionID);
+        } else {
+          setError("");
+          updateStreamingMessage((current) => ({
+            ...current,
+            content: result?.content || current.content,
+            reasoning: result?.reasoning || current.reasoning,
+            model: result?.model || current.model,
+            usage: result?.usage || current.usage,
+            parts: settleLiveProgress(result?.parts?.length ? result.parts : current.parts, "cancelled"),
+            durationMs: result?.durationMs ?? current.durationMs,
+            failed: false,
+            cancelled: true,
+            streaming: false,
+            status: "已停止",
+          }));
+        }
+        const resultProgress = findTaskProgress(result?.parts);
+        if (resultProgress) {
+          updateSessionTaskProgress(eventProjectID, eventSessionID, {
+            ...cloneTaskProgress(resultProgress),
+            taskStatus: "cancelled",
+          });
+        } else {
+          settleActiveTaskProgress("cancelled");
+        }
+        const pendingReasoning = finishChatTask(eventProjectID, eventSessionID, event.taskId);
+        void (async () => {
+          if (!event.forced && eventProjectID === activeProjectID() && eventSessionID === activeSessionID()) {
+            await restoreSessionMessages(true, eventProjectID, eventSessionID);
+          }
+          await applyPendingReasoning(pendingReasoning);
+          void refreshProjectsAndSessions();
+        })();
         break;
       }
       case "failed": {
         setQueuedMessages(clearGuidanceMessages);
         const message = chatFailureMessage(event.message || "模型请求失败。");
         const result = event.result;
-        const partialToolCompleted = hasUsablePartialResult(result?.parts);
+        const retainedTurn = hasMeaningfulTurnOutput(result, eventTask?.assistantMessage);
         if (result) {
           setState(result.state);
         }
-        setError(partialToolCompleted ? "" : message);
-        if (!partialToolCompleted) {
+        setError(retainedTurn ? "" : message);
+        if (!retainedTurn) {
           rollbackOptimisticTurn(eventProjectID, eventSessionID);
         }
-        if (partialToolCompleted) {
+        if (retainedTurn) {
           updateStreamingMessage((current) => ({
             ...current,
             content: result?.content || current.content || message,
             reasoning: result?.reasoning || current.reasoning,
             model: result?.model || current.model,
             usage: result?.usage || current.usage,
-            parts: settleLiveProgress(result?.parts?.length ? result.parts : current.parts, "completed"),
+            parts: settleLiveProgress(result?.parts?.length ? result.parts : current.parts, "failed"),
             durationMs: result?.durationMs ?? current.durationMs,
-            failed: false,
+            failed: true,
+            cancelled: false,
             streaming: false,
             status: undefined,
           }));
@@ -1344,12 +1396,19 @@ function App() {
         if (resultProgress) {
           updateSessionTaskProgress(eventProjectID, eventSessionID, {
             ...cloneTaskProgress(resultProgress),
-            taskStatus: partialToolCompleted ? "completed" : "failed",
+            taskStatus: "failed",
           });
         } else {
-          settleActiveTaskProgress(partialToolCompleted ? "completed" : "failed");
+          settleActiveTaskProgress("failed");
         }
-        void applyPendingReasoning(finishChatTask(eventProjectID, eventSessionID, event.taskId));
+		const pendingReasoning = finishChatTask(eventProjectID, eventSessionID, event.taskId);
+		void (async () => {
+		  if (eventProjectID === activeProjectID() && eventSessionID === activeSessionID()) {
+			await restoreSessionMessages(true, eventProjectID, eventSessionID);
+		  }
+		  await applyPendingReasoning(pendingReasoning);
+		  void refreshProjectsAndSessions();
+		})();
         break;
       }
     }
@@ -1755,15 +1814,19 @@ function App() {
 
   const setComposerDraft = (value: string) => {
     setPromptDraft(value);
-    if (composerEditorRef && composerEditorText(composerEditorRef) !== value) {
-      composerEditorRef.textContent = value;
+	const editable = composerEditableText(value, composerTailDraft());
+	if (composerEditorRef && composerEditorRef.value !== editable) {
+	  composerEditorRef.value = editable;
+	  resizeComposerEditor(composerEditorRef);
     }
   };
 
   const setComposerTail = (value: string) => {
     setComposerTailDraftSignal(value);
-    if (composerTailEditorRef && composerEditorText(composerTailEditorRef) !== value) {
-      composerTailEditorRef.textContent = value;
+	const editable = composerEditableText(promptDraft(), value);
+	if (composerEditorRef && composerEditorRef.value !== editable) {
+	  composerEditorRef.value = editable;
+	  resizeComposerEditor(composerEditorRef);
     }
   };
 
@@ -1801,7 +1864,7 @@ function App() {
 
   const focusComposerAfterHistoryMove = () => {
     queueMicrotask(() => {
-      const editor = composerLinks().length > 0 ? composerTailEditorRef : composerEditorRef;
+	  const editor = composerEditorRef;
       editor?.focus();
       if (editor) placeCaretAtEnd(editor);
     });
@@ -1825,24 +1888,8 @@ function App() {
     focusComposerAfterHistoryMove();
   };
 
-  const handleComposerHistoryShortcut = (event: KeyboardEvent): boolean => {
-    if (event.isComposing || event.altKey || (!event.ctrlKey && !event.metaKey)) return false;
-    const key = event.key.toLowerCase();
-    if (key === "z") {
-      event.preventDefault();
-      event.shiftKey ? redoComposerInput() : undoComposerInput();
-      return true;
-    }
-    if (key === "y") {
-      event.preventDefault();
-      redoComposerInput();
-      return true;
-    }
-    return false;
-  };
-
   const focusComposerEnd = () => {
-    const editor = composerLinks().length > 0 ? composerTailEditorRef : composerEditorRef;
+	const editor = composerEditorRef;
     editor?.focus();
     if (editor) placeCaretAtEnd(editor);
   };
@@ -1853,12 +1900,6 @@ function App() {
     setComposerLinks([]);
     resetComposerHistory();
     queueMicrotask(focusComposerEnd);
-  };
-
-  const addComposerLinks = (links: ComposerLink[]) => {
-    if (links.length === 0) return;
-    const current = currentComposerSnapshot();
-    commitComposerSnapshot({ ...current, links: mergeComposerLinks(current.links, links) });
   };
 
   const removeComposerLink = (url: string) => {
@@ -1878,18 +1919,19 @@ function App() {
     });
   };
 
-  const absorbComposerURLs = (value: string, target: "prefix" | "tail" = "prefix") => {
+	const absorbComposerURLs = (value: string) => {
     const links = extractComposerLinks(value);
     if (links.length === 0) return false;
-    addComposerLinks(links);
+	const current = currentComposerSnapshot();
     const text = removeComposerURLs(value, links);
-    if (target === "tail") {
-      setComposerTail(text);
-    } else {
-      setComposerDraft(text);
-    }
+	commitComposerSnapshot({
+	  ...current,
+	  draft: text,
+	  tail: "",
+	  links: mergeComposerLinks(current.links, links),
+	});
     queueMicrotask(() => {
-      const editor = composerTailEditorRef ?? composerEditorRef;
+	  const editor = composerEditorRef;
       editor?.focus();
       if (editor) placeCaretAtEnd(editor);
     });
@@ -1923,7 +1965,7 @@ function App() {
     }
   };
 
-  const handleComposerPaste = (event: ClipboardEvent, target: "prefix" | "tail") => {
+	const handleComposerPaste = (event: ClipboardEvent) => {
     const files = Array.from(event.clipboardData?.items ?? [])
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
       .map((item) => item.getAsFile())
@@ -1933,14 +1975,18 @@ function App() {
     if (files.length === 0 && links.length === 0) return;
     event.preventDefault();
     if (files.length > 0) void addComposerImages(files);
-    if (links.length > 0) addComposerLinks(links);
     const remainingText = links.length > 0 ? removeComposerURLs(pastedText, links) : pastedText;
-    const editor = target === "tail" ? composerTailEditorRef : composerEditorRef;
+	const editor = composerEditorRef;
     if (remainingText) insertTextAtSelection(editor, remainingText);
-    if (target === "tail") {
-      if (editor) setComposerTail(composerEditorText(editor));
-    } else if (editor) {
-      setComposerDraft(composerEditorText(editor));
+	if (editor) {
+	  const current = currentComposerSnapshot();
+	  commitComposerSnapshot({
+		...current,
+		draft: editor.value,
+		tail: "",
+		links: mergeComposerLinks(current.links, links),
+	  });
+	  resizeComposerEditor(editor);
     }
     if (links.length > 0) queueMicrotask(focusComposerEnd);
   };
@@ -1985,7 +2031,7 @@ function App() {
     setChatNearBottom(true);
     setMessages((current) => [
       ...current,
-      { ...createChatMessage("user", prompt), id: optimisticUserMessageID, attachments },
+      { ...createChatMessage("user", redactSensitiveTextForDisplay(prompt)), id: optimisticUserMessageID, attachments },
       assistantMessage,
     ]);
     setComposerDraft("");
@@ -1993,10 +2039,6 @@ function App() {
     setComposerAttachments([]);
     setComposerLinks([]);
     resetComposerHistory();
-    setSubmittedPrompt(draft);
-    setSubmittedTail(tail);
-    setSubmittedAttachments(attachments);
-    setSubmittedLinks(links);
     setStreamingMessageID(assistantMessageID);
     setSendingMessage(true);
     const sessionKey = sessionIdentityKey(projectID, sessionID);
@@ -2020,12 +2062,14 @@ function App() {
     let taskID = "";
     try {
       taskID = await startChatMessageForSession(projectID, sessionID, prompt, attachments);
+      let registered = false;
       setSessionTaskRuntimes((current) => {
         const task = current[sessionKey];
         if (!task) return current;
+        registered = true;
         return { ...current, [sessionKey]: { ...task, taskID } };
       });
-      if (projectID === activeProjectID() && sessionID === activeSessionID()) {
+      if (registered && projectID === activeProjectID() && sessionID === activeSessionID()) {
         setActiveChatTaskID(taskID);
       }
     } catch (err) {
@@ -2132,7 +2176,11 @@ function App() {
     updateStreamingMessage((message) => ({ ...message, status: "正在停止" }));
     try {
       const accepted = await stopChatMessage(taskID);
-      if (accepted) return;
+      if (accepted) {
+        // The terminal event is authoritative: it knows whether text, reasoning
+        // or tool activity must be retained. Do not erase the turn here.
+        return;
+      }
 
       const activeTasks = await getActiveChatTasks();
       const stillRunning = activeTasks.some((task) => task.taskId === taskID || (task.projectId === projectID && task.sessionId === sessionID));
@@ -2140,14 +2188,6 @@ function App() {
         setError("停止请求未被当前任务接受，请重试。");
         return;
       }
-      updateStreamingMessage((message) => ({
-        ...message,
-        parts: settleLiveProgress(message.parts, "cancelled"),
-        streaming: false,
-        cancelled: true,
-        status: undefined,
-      }));
-      settleActiveTaskProgress("cancelled");
       const pendingReasoning = finishChatTask(projectID, sessionID, taskID);
       await restoreSessionMessages(true, projectID, sessionID);
       await applyPendingReasoning(pendingReasoning);
@@ -2220,17 +2260,13 @@ function App() {
     setSendingMessage(true);
     setActiveChatTaskID(task.taskID);
     setStreamingMessageID(task.messageID);
-    setSubmittedPrompt(task.prompt);
-    setSubmittedTail(task.tail);
-    setSubmittedAttachments(task.attachments);
-    setSubmittedLinks(task.links);
     setActiveTaskProgress(task.progress ? cloneTaskProgress(task.progress) : undefined);
     setMessages((current) => {
-      const composed = composeComposerPrompt(task.prompt, task.links, task.tail);
-      const hasUser = current.some((message) => message.role === "user" && message.content === composed);
+      const composed = redactSensitiveTextForDisplay(composeComposerPrompt(task.prompt, task.links, task.tail));
+      const hasUser = Boolean(task.userMessageID) && current.some((message) => message.id === task.userMessageID);
       const withUser = [
         ...current,
-        ...(!composed || hasUser ? [] : [{ ...createChatMessage("user", composed), attachments: task.attachments }]),
+        ...(!composed || hasUser ? [] : [{ ...createChatMessage("user", composed), id: task.userMessageID, attachments: task.attachments }]),
       ];
       const existingIndex = withUser.findIndex((message) => message.id === task.messageID);
       if (existingIndex < 0) return [...withUser, task.assistantMessage];
@@ -3818,7 +3854,7 @@ function App() {
                       onOpenWorkspaceFile={handleOpenWorkspaceFile}
                       onOpenURL={requestOpenURL}
                     />
-                    <Show when={(message.streaming && !message.parts?.some((part) => part.kind === "tool_call")) || message.cancelled}>
+					<Show when={message.streaming || message.cancelled}>
                       <div class="op-stream-state" classList={{ cancelled: message.cancelled }}>
                             <Show when={message.streaming}>
                           <Show when={message.statusKind === "compression"} fallback={<span class="op-thinking-spinner" />}>
@@ -3831,6 +3867,9 @@ function App() {
                           </Show>
                         </Show>
                         <span>{message.status || (message.cancelled ? "已停止" : "正在生成")}</span>
+						<Show when={message.streaming}>
+						  <span class="op-stream-elapsed"><Clock3 size={12} aria-hidden="true" /><LiveElapsed startedAt={message.createdAt} /></span>
+						</Show>
                       </div>
                     </Show>
                     <Show when={!message.streaming && message.durationMs !== undefined && (message.content || message.parts?.length)}>
@@ -4086,7 +4125,7 @@ function App() {
                         {index() + 1}
                       </span>
                       <button class="composer-queue-copy" type="button" disabled={queued.guidance} title={queued.guidance ? "等待当前 Agent 应用" : "编辑这条排队消息"} onClick={() => editQueuedMessage(queued.id)}>
-                        {composeComposerPrompt(queued.draft, queued.links, queued.tail) || `${queued.attachments.length} 张图片`}
+                        {redactSensitiveTextForDisplay(composeComposerPrompt(queued.draft, queued.links, queued.tail)) || `${queued.attachments.length} 张图片`}
                       </button>
                       <button
                         class="composer-queue-guide"
@@ -4105,37 +4144,34 @@ function App() {
                 </For>
               </div>
             </Show>
-            <div
-              class="composer-rich-input"
-              classList={{ "starts-with-link": composerLinks().length > 0 && promptDraft().trim().length === 0 }}
-              onClick={(event) => {
-              if (event.currentTarget === event.target) focusComposerEnd();
-              }}
-            >
-              <div
-                ref={composerEditorRef}
-                class="composer-text-editor"
-                role="textbox"
-                aria-label="向 MHcode 提问，或描述要修改的代码"
-                aria-multiline="true"
-                data-placeholder="向 MHcode 提问，或描述要修改的代码"
-                contentEditable={true}
-                spellcheck={false}
-                onInput={(event) => {
-                  const value = composerEditorText(event.currentTarget);
-                  commitComposerSnapshot({ ...currentComposerSnapshot(), draft: value });
-                  if (/\s$/.test(value)) absorbComposerURLs(value, "prefix");
-                }}
-                onBlur={(event) => absorbComposerURLs(composerEditorText(event.currentTarget), "prefix")}
-                onPaste={(event) => handleComposerPaste(event, "prefix")}
-                onKeyDown={(event) => {
-                  if (handleComposerHistoryShortcut(event)) return;
-                  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-                    event.preventDefault();
-                    void sendMessage();
-                  }
-                }}
-              />
+			<div class="composer-rich-input" onClick={(event) => {
+			  if (event.currentTarget === event.target) focusComposerEnd();
+			}}>
+			  <textarea
+				ref={composerEditorRef}
+				class="composer-text-editor"
+				aria-label="向 MHcode 提问，或描述要修改的代码"
+				placeholder="向 MHcode 提问，或描述要修改的代码"
+				rows={1}
+				spellcheck={false}
+				onInput={(event) => {
+				  const value = event.currentTarget.value;
+				  commitComposerSnapshot({ ...currentComposerSnapshot(), draft: value, tail: "" });
+				  resizeComposerEditor(event.currentTarget);
+				  if (/\s$/.test(value)) absorbComposerURLs(value);
+				}}
+				onBlur={(event) => absorbComposerURLs(event.currentTarget.value)}
+				onPaste={handleComposerPaste}
+				onKeyDown={(event) => {
+				  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+					event.preventDefault();
+					void sendMessage();
+				  }
+				}}
+			  />
+			</div>
+			<Show when={composerLinks().length > 0}>
+			  <div class="composer-link-row" aria-label="已识别的链接">
               <For each={composerLinks()}>
                 {(link) => (
                   <span class="composer-link-chip" title={link.url}>
@@ -4145,37 +4181,8 @@ function App() {
                   </span>
                 )}
               </For>
-              <Show when={composerLinks().length > 0 || composerTailDraft().length > 0}>
-                <div
-                  ref={composerTailEditorRef}
-                  class="composer-tail-editor"
-                  role="textbox"
-                  aria-label="在链接后继续输入"
-                  aria-multiline="true"
-                  contentEditable={true}
-                  spellcheck={false}
-                  onInput={(event) => {
-                    const value = composerEditorText(event.currentTarget);
-                    commitComposerSnapshot({ ...currentComposerSnapshot(), tail: value });
-                    if (/\s$/.test(value)) absorbComposerURLs(value, "tail");
-                  }}
-                  onBlur={(event) => absorbComposerURLs(composerEditorText(event.currentTarget), "tail")}
-                  onPaste={(event) => handleComposerPaste(event, "tail")}
-                  onKeyDown={(event) => {
-                    if (handleComposerHistoryShortcut(event)) return;
-                    if (event.key === "Backspace" && !composerEditorText(event.currentTarget) && composerLinks().length > 0) {
-                      event.preventDefault();
-                      removeComposerLink(composerLinks()[composerLinks().length - 1].url);
-                      return;
-                    }
-                    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
-                      event.preventDefault();
-                      void sendMessage();
-                    }
-                  }}
-                />
-              </Show>
-            </div>
+			  </div>
+			</Show>
             <div class="composer-toolbar">
               <div>
                 <input
@@ -4599,11 +4606,23 @@ function splitComposerPrompt(value: string): { text: string; tail: string; links
   return { text: removeComposerURLs(value, links), tail: "", links };
 }
 
-function composerEditorText(editor: HTMLDivElement): string {
-  return editor.innerText.replace(/\r/g, "").replace(/\n$/, "");
+function composerEditableText(draft: string, tail: string): string {
+  if (!tail) return draft;
+  if (!draft) return tail;
+  return `${draft}${/\s$/.test(draft) || /^\s/.test(tail) ? "" : " "}${tail}`;
+}
+
+function resizeComposerEditor(editor: HTMLTextAreaElement): void {
+  editor.style.height = "auto";
+  editor.style.height = `${Math.min(118, Math.max(30, editor.scrollHeight))}px`;
 }
 
 function placeCaretAtEnd(element: HTMLElement): void {
+	if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+	  const end = element.value.length;
+	  element.setSelectionRange(end, end);
+	  return;
+	}
   const selection = window.getSelection();
   if (!selection) return;
   const range = document.createRange();
@@ -4613,23 +4632,12 @@ function placeCaretAtEnd(element: HTMLElement): void {
   selection.addRange(range);
 }
 
-function insertTextAtSelection(editor: HTMLDivElement | undefined, text: string): void {
+function insertTextAtSelection(editor: HTMLTextAreaElement | undefined, text: string): void {
   if (!editor || !text) return;
   editor.focus();
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0 || !editor.contains(selection.anchorNode)) {
-    editor.append(document.createTextNode(text));
-    placeCaretAtEnd(editor);
-    return;
-  }
-  const range = selection.getRangeAt(0);
-  range.deleteContents();
-  const node = document.createTextNode(text);
-  range.insertNode(node);
-  range.setStartAfter(node);
-  range.collapse(true);
-  selection.removeAllRanges();
-  selection.addRange(range);
+	const start = editor.selectionStart ?? editor.value.length;
+	const end = editor.selectionEnd ?? start;
+	editor.setRangeText(text, start, end, "end");
 }
 
 function chatFailureMessage(message: string): string {
@@ -4644,6 +4652,15 @@ function chatFailureMessage(message: string): string {
     return "模型服务连接超时。请检查网络后重试，或切换模型供应商。";
   }
   return normalized || "模型请求失败。";
+}
+
+function LiveElapsed(props: { startedAt: string }) {
+	const startedAt = new Date(props.startedAt).getTime();
+	const elapsedNow = () => Math.max(0, Date.now() - (Number.isFinite(startedAt) ? startedAt : Date.now()));
+	const [elapsed, setElapsed] = createSignal(elapsedNow());
+	const timer = window.setInterval(() => setElapsed(elapsedNow()), 1_000);
+	onCleanup(() => window.clearInterval(timer));
+	return <span>{formatElapsedDuration(elapsed())}</span>;
 }
 
 function updateLiveToolParts(parts: MessagePart[] | undefined, event: ChatTaskEvent): MessagePart[] {
@@ -4789,9 +4806,35 @@ function mergeLiveToolResultParts(
       }
       continue;
     }
+    if (part.kind === "provider_notice") {
+      const identity = providerNoticeIdentity(part);
+      const index = next.findIndex((item) => item.kind === "provider_notice" && providerNoticeIdentity(item) === identity);
+      if (index >= 0) {
+        next[index] = { ...next[index], ...part } as MessagePart;
+      } else {
+        next.push(part);
+      }
+      continue;
+    }
     next.push(part);
   }
   return next;
+}
+
+function providerNoticeIdentity(part: Extract<MessagePart, { kind: "provider_notice" }>): string {
+  return [
+    part.noticeKind,
+    part.requestedModel,
+    part.effectiveModel,
+    part.retryModel,
+    part.errorCode,
+    part.httpStatus,
+    part.message,
+    ...(part.useCases ?? []),
+    ...(part.reasons ?? []),
+    ...(part.verifications ?? []),
+    ...(part.metadataKeys ?? []),
+  ].join("\u0000");
 }
 
 function mergeWebSearchMessageParts(

@@ -2,6 +2,24 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.1 - 2026-07-24
+
+### Agent execution and remote operations
+
+- Add host-managed SSH connection testing, remote command execution, and file/directory upload tools. Passwords are stored in Windows Credential Manager and are never exposed to the model or command line.
+- Make task cancellation immediate, with forced cleanup after a short grace period so stalled provider or tool calls cannot leave a conversation permanently stopping.
+- Preserve structured progress, tool results, provider events, and terminal details in the conversation timeline.
+
+### Conversation safety and recovery
+
+- Redact SSH credentials from optimistic messages, queued messages, session history, and Agent context while retaining an opaque credential reference for authorized operations.
+- Correct failed and interrupted turn handling so uncommitted messages return to the composer only when the model produced no usable output.
+- Keep ordinary provider failures distinct from upstream security-policy errors and preserve the correct terminal state across conversation switches.
+
+### Verification
+
+- Go tests and vet, frontend type checking and tests, production frontend build, and Wails Windows build pass.
+
 ## v0.3.0 - 2026-07-22
 
 ### Agent 与模型协议

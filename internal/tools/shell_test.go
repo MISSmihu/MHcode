@@ -3,10 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -17,6 +19,21 @@ func TestRunCommandShellDisabled(t *testing.T) {
 	res, _ := tool.Execute(context.Background(), args)
 	if !res.IsError {
 		t.Fatal("ShellAccess=false 时应拒绝执行")
+	}
+}
+
+func TestRunCommandRoutesRemoteOperationsToStructuredSSH(t *testing.T) {
+	policy := SandboxPolicy{
+		WorkspaceRoot:    t.TempDir(),
+		FilesystemAccess: "workspace-write",
+		NetworkAccess:    true,
+		ShellAccess:      true,
+	}
+	for _, command := range []string{"ssh root@example.com", "scp index.html root@example.com:/var/www", "sftp root@example.com", "ssh-add -L"} {
+		err := policy.ValidateCommand(command)
+		if !errors.Is(err, ErrShellRemoteOperation) {
+			t.Fatalf("command %q error = %v, want ErrShellRemoteOperation", command, err)
+		}
 	}
 }
 
@@ -63,6 +80,52 @@ func TestRunCommandEcho(t *testing.T) {
 	}
 	if part.StartedAt == "" || part.CompletedAt == "" || part.DurationMs < 1 {
 		t.Fatalf("execution metadata is incomplete: %#v", part)
+	}
+}
+
+func TestRunCommandStreamsStructuredOutputWhileRunning(t *testing.T) {
+	root := t.TempDir()
+	policy := SandboxPolicy{WorkspaceRoot: root, FilesystemAccess: "workspace-write", NetworkAccess: true, ShellAccess: true, MaxCommandSeconds: 30}
+	tool := RunCommandTool{Policy: policy}
+	command := `printf first; sleep 0.25; printf second >&2`
+	if runtime.GOOS == "windows" {
+		script := append(append([]byte(nil), utf8BOM...), []byte("Write-Output 'first'\nStart-Sleep -Milliseconds 250\n[Console]::Error.WriteLine('second')\n")...)
+		if err := os.WriteFile(filepath.Join(root, "stream-output.ps1"), script, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command = `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File stream-output.ps1`
+	}
+	args, _ := json.Marshal(map[string]string{"command": command})
+	var mu sync.Mutex
+	progress := make([]ResultPart, 0, 4)
+	ctx := WithProgressSink(context.Background(), func(part ResultPart) {
+		mu.Lock()
+		progress = append(progress, part)
+		mu.Unlock()
+	})
+	result, err := tool.Execute(ctx, args)
+	if err != nil || result.IsError {
+		t.Fatalf("run result=%#v err=%v", result, err)
+	}
+	mu.Lock()
+	updates := append([]ResultPart(nil), progress...)
+	mu.Unlock()
+	if len(updates) < 2 {
+		t.Fatalf("progress updates = %#v, want start plus output", updates)
+	}
+	if updates[0].Status != "running" || updates[0].Input != command || updates[0].WorkingDirectory != policy.WorkspaceRoot || updates[0].StartedAt == "" {
+		t.Fatalf("initial progress metadata = %#v", updates[0])
+	}
+	seenFirst := false
+	for _, update := range updates {
+		seenFirst = seenFirst || strings.Contains(update.Stdout, "first")
+	}
+	if !seenFirst {
+		t.Fatalf("stdout was not streamed: %#v", updates)
+	}
+	part := result.Parts[0]
+	if !strings.Contains(part.Stdout, "first") || !strings.Contains(part.Stderr, "second") {
+		t.Fatalf("final stdout/stderr = %q / %q", part.Stdout, part.Stderr)
 	}
 }
 

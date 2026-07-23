@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { reconcileSessionMessages } from "../src/lib/session-history";
+import { reconcileSessionMessages, rollbackOptimisticTurnState } from "../src/lib/session-history";
 import type { ChatMessage } from "../src/ui-types";
 
 const current: ChatMessage[] = [
@@ -13,6 +13,35 @@ const current: ChatMessage[] = [
 ];
 
 describe("session history reconciliation", () => {
+  test("removes only the failed optimistic turn and restores a deep-cloned composer", () => {
+    const attachment = { name: "screen.png", mimeType: "image/png", data: "base64-data" };
+    const link = { url: "https://example.com", domain: "example.com", label: "Example" };
+    const messages: ChatMessage[] = [
+      current[0],
+      { id: "optimistic-user", role: "user", content: "retry me", createdAt: "2026-07-19T00:00:01.000Z" },
+      { id: "optimistic-assistant", role: "assistant", content: "", createdAt: "2026-07-19T00:00:02.000Z", streaming: true },
+    ];
+
+    const rollback = rollbackOptimisticTurnState(messages, {
+      userMessageID: "optimistic-user",
+      assistantMessageID: "optimistic-assistant",
+      draft: "retry me",
+      tail: "more context",
+      attachments: [attachment],
+      links: [link],
+    });
+
+    expect(rollback.messages).toEqual([current[0]]);
+    expect(rollback.composer).toEqual({
+      draft: "retry me",
+      tail: "more context",
+      attachments: [attachment],
+      links: [link],
+    });
+    expect(rollback.composer.attachments[0]).not.toBe(attachment);
+    expect(rollback.composer.links[0]).not.toBe(link);
+  });
+
   test("keeps optimistic messages when a completion sync is temporarily empty", () => {
     expect(reconcileSessionMessages(current, [], true)).toBe(current);
   });
@@ -41,4 +70,14 @@ describe("session history reconciliation", () => {
       { id: "event-2", eventId: "event-2", role: "assistant", content: "persisted reply", durationMs: 12_450 },
     ]);
   });
+
+	test("restores durable failed and cancelled task states", () => {
+	  expect(reconcileSessionMessages([], [
+		{ id: "failed", role: "assistant", content: "failed", createdAt: "2026-07-19T02:00:00.000Z", status: "failed" },
+		{ id: "cancelled", role: "assistant", content: "stopped", createdAt: "2026-07-19T02:00:01.000Z", status: "cancelled" },
+	  ], false)).toMatchObject([
+		{ id: "failed", failed: true, cancelled: false },
+		{ id: "cancelled", failed: false, cancelled: true },
+	  ]);
+	});
 });

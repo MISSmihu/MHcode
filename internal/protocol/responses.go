@@ -10,15 +10,28 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf16"
+)
+
+const (
+	responsesInstallationMetadataKey = "x-codex-installation-id"
+	responsesWindowMetadataKey       = "x-codex-window-id"
+	responsesTurnMetadataKey         = "x-codex-turn-metadata"
 )
 
 type responsesRequest struct {
-	Model        string               `json:"model"`
-	Instructions string               `json:"instructions,omitempty"`
-	Input        []responsesInputItem `json:"input"`
-	Stream       bool                 `json:"stream"`
-	Tools        []responsesTool      `json:"tools,omitempty"`
-	Reasoning    *responsesReasoning  `json:"reasoning,omitempty"`
+	Model             string               `json:"model"`
+	Instructions      string               `json:"instructions,omitempty"`
+	Input             []responsesInputItem `json:"input"`
+	Stream            bool                 `json:"stream"`
+	Tools             []responsesTool      `json:"tools,omitempty"`
+	ToolChoice        string               `json:"tool_choice"`
+	ParallelToolCalls bool                 `json:"parallel_tool_calls"`
+	Reasoning         *responsesReasoning  `json:"reasoning,omitempty"`
+	Store             bool                 `json:"store"`
+	Include           []string             `json:"include"`
+	PromptCacheKey    string               `json:"prompt_cache_key,omitempty"`
+	ClientMetadata    map[string]string    `json:"client_metadata,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -57,9 +70,14 @@ type responsesTool struct {
 }
 
 type responsesResponse struct {
-	Output []responsesOutputItem `json:"output"`
-	Usage  *responsesUsage       `json:"usage,omitempty"`
-	Error  *responsesError       `json:"error,omitempty"`
+	ID              string                `json:"id,omitempty"`
+	Model           string                `json:"model,omitempty"`
+	Headers         map[string]any        `json:"headers,omitempty"`
+	Metadata        map[string]any        `json:"metadata,omitempty"`
+	SafetyBuffering json.RawMessage       `json:"safety_buffering,omitempty"`
+	Output          []responsesOutputItem `json:"output"`
+	Usage           *responsesUsage       `json:"usage,omitempty"`
+	Error           *responsesError       `json:"error,omitempty"`
 }
 
 type responsesOutputItem struct {
@@ -84,41 +102,51 @@ type responsesUsage struct {
 
 type responsesError struct {
 	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+	Code    any    `json:"code,omitempty"`
 }
 
 type responsesStreamEnvelope struct {
-	Type     string              `json:"type"`
-	Delta    string              `json:"delta,omitempty"`
-	Item     responsesOutputItem `json:"item,omitempty"`
-	Response responsesResponse   `json:"response,omitempty"`
-	Error    *responsesError     `json:"error,omitempty"`
+	Type            string              `json:"type"`
+	Delta           string              `json:"delta,omitempty"`
+	Item            responsesOutputItem `json:"item,omitempty"`
+	Headers         map[string]any      `json:"headers,omitempty"`
+	Metadata        map[string]any      `json:"metadata,omitempty"`
+	SafetyBuffering json.RawMessage     `json:"safety_buffering,omitempty"`
+	Response        responsesResponse   `json:"response,omitempty"`
+	Error           *responsesError     `json:"error,omitempty"`
+}
+
+type responsesSafetyBuffering struct {
+	UseCases   []string `json:"use_cases,omitempty"`
+	Reasons    []string `json:"reasons,omitempty"`
+	RetryModel string   `json:"retry_model,omitempty"`
+}
+
+type responsesTransportMetadata struct {
+	ServerModel      string
+	RequestID        string
+	SafetyRetryModel string
+	HTTPStatus       int
 }
 
 func (p OpenAICompatibleProvider) streamResponses(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error) {
 	if err := p.validateResponsesRequest(request); err != nil {
 		return nil, err
 	}
-	instructions, input := responsesInputFromProtocol(request.Messages)
-	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
-	body := responsesRequest{
-		Model:        request.Model,
-		Instructions: instructions,
-		Input:        input,
-		Stream:       true,
-		Tools:        responsesToolsFromProtocol(request.Tools),
-	}
-	if reasoning.Effort != "" {
-		body.Reasoning = &responsesReasoning{Effort: reasoning.Effort}
-	}
+	body := p.responsesRequest(request, true)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "reasoning", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys(
+		"model", "instructions", "input", "reasoning", "stream", "tools", "tool_choice",
+		"parallel_tool_calls", "store", "include", "prompt_cache_key", "client_metadata",
+	))
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.doRequestWithRetry(ctx, http.MethodPost, "/responses", encoded, "text/event-stream")
+	resp, err := p.doRequestWithRetryHeaders(ctx, http.MethodPost, "/responses", encoded, "text/event-stream", responsesHeadersForRequest(request, p.ClientVersion))
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI Responses request failed: %w", err)
 	}
@@ -127,10 +155,12 @@ func (p OpenAICompatibleProvider) streamResponses(ctx context.Context, request C
 		return nil, openAICompatibleAPIError(resp)
 	}
 	events := make(chan StreamEvent, 16)
+	transportMetadata := responsesTransportMetadataFromHeaders(resp.Header)
+	transportMetadata.HTTPStatus = resp.StatusCode
 	go func() {
 		defer close(events)
 		defer resp.Body.Close()
-		parseResponsesStream(ctx, resp.Body, events)
+		parseResponsesStream(ctx, resp.Body, events, request.Model, transportMetadata)
 	}()
 	return events, nil
 }
@@ -139,27 +169,19 @@ func (p OpenAICompatibleProvider) completeResponses(ctx context.Context, request
 	if err := p.validateResponsesRequest(request); err != nil {
 		return CompletionResult{}, err
 	}
-	instructions, input := responsesInputFromProtocol(request.Messages)
-	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
-	body := responsesRequest{
-		Model:        request.Model,
-		Instructions: instructions,
-		Input:        input,
-		Stream:       false,
-		Tools:        responsesToolsFromProtocol(request.Tools),
-	}
-	if reasoning.Effort != "" {
-		body.Reasoning = &responsesReasoning{Effort: reasoning.Effort}
-	}
+	body := p.responsesRequest(request, false)
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "instructions", "input", "reasoning", "stream", "tools"))
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys(
+		"model", "instructions", "input", "reasoning", "stream", "tools", "tool_choice",
+		"parallel_tool_calls", "store", "include", "prompt_cache_key", "client_metadata",
+	))
 	if err != nil {
 		return CompletionResult{}, err
 	}
-	resp, err := p.doRequestWithRetry(ctx, http.MethodPost, "/responses", encoded, "application/json")
+	resp, err := p.doRequestWithRetryHeaders(ctx, http.MethodPost, "/responses", encoded, "application/json", responsesHeadersForRequest(request, p.ClientVersion))
 	if err != nil {
 		return CompletionResult{}, fmt.Errorf("OpenAI Responses request failed: %w", err)
 	}
@@ -171,10 +193,192 @@ func (p OpenAICompatibleProvider) completeResponses(ctx context.Context, request
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		return CompletionResult{}, fmt.Errorf("decode OpenAI Responses completion: %w", err)
 	}
-	if payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "" {
-		return CompletionResult{}, errors.New(payload.Error.Message)
+	if payload.Error != nil {
+		return CompletionResult{}, NewProviderError(providerErrorFromResponses(payload.Error, resp.StatusCode, responseRequestID(resp.Header)))
 	}
-	return completionFromResponses(payload), nil
+	result := completionFromResponses(payload)
+	transportMetadata := responsesTransportMetadataFromHeaders(resp.Header)
+	result.Notices = responsesNotices(request.Model, payload, nil, transportMetadata)
+	result.EffectiveModel = effectiveResponsesModel(payload, nil, transportMetadata.ServerModel)
+	return result, nil
+}
+
+func (p OpenAICompatibleProvider) responsesRequest(request ChatRequest, stream bool) responsesRequest {
+	instructions, input := responsesInputFromProtocol(request.Messages)
+	reasoning := reasoningOptionsForRequest("openai-compatible", p.BaseURL, p.ReasoningProfile, request)
+	toolChoice := strings.TrimSpace(request.ToolChoice)
+	if toolChoice == "" {
+		toolChoice = "auto"
+	}
+	include := append([]string(nil), request.Include...)
+	if len(include) == 0 {
+		include = []string{"reasoning.encrypted_content"}
+	}
+	promptCacheKey := strings.TrimSpace(request.PromptCacheKey)
+	if promptCacheKey == "" {
+		promptCacheKey = strings.TrimSpace(request.SessionID)
+	}
+	metadata, _ := responsesClientMetadata(request, p.ClientVersion)
+	body := responsesRequest{
+		Model:             request.Model,
+		Instructions:      instructions,
+		Input:             input,
+		Stream:            stream,
+		Tools:             responsesToolsFromProtocol(request.Tools),
+		ToolChoice:        toolChoice,
+		ParallelToolCalls: request.ParallelToolCalls,
+		Store:             request.Store,
+		Include:           include,
+		PromptCacheKey:    promptCacheKey,
+		ClientMetadata:    metadata,
+	}
+	if reasoning.Effort != "" {
+		body.Reasoning = &responsesReasoning{Effort: reasoning.Effort}
+	}
+	return body
+}
+
+func responsesHeadersForRequest(request ChatRequest, clientVersion string) http.Header {
+	headers := make(http.Header)
+	for name, value := range map[string]string{
+		"session-id":          request.SessionID,
+		"thread-id":           request.ThreadID,
+		"x-client-request-id": request.ThreadID,
+		"x-mhcode-turn-id":    request.TurnID,
+	} {
+		if validInternalHeaderValue(value) {
+			headers.Set(name, strings.TrimSpace(value))
+		}
+	}
+	metadata, turnMetadata := responsesClientMetadata(request, clientVersion)
+	if value := metadata[responsesWindowMetadataKey]; validInternalHeaderValue(value) {
+		headers.Set(responsesWindowMetadataKey, value)
+	}
+	if validInternalHeaderValue(turnMetadata) {
+		headers.Set(responsesTurnMetadataKey, turnMetadata)
+	}
+	return headers
+}
+
+func responsesClientMetadata(request ChatRequest, clientVersion string) (map[string]string, string) {
+	sessionID := strings.TrimSpace(request.SessionID)
+	threadID := strings.TrimSpace(request.ThreadID)
+	if threadID == "" {
+		threadID = sessionID
+	}
+	context := request.ResponsesContext
+	installationID := strings.TrimSpace(context.InstallationID)
+	windowID := strings.TrimSpace(context.WindowID)
+	if windowID == "" && threadID != "" {
+		windowID = threadID + ":0"
+	}
+	turnID := strings.TrimSpace(request.TurnID)
+	requestKind := strings.TrimSpace(context.RequestKind)
+	if requestKind == "" && (sessionID != "" || threadID != "") {
+		requestKind = "turn"
+	}
+	threadSource := strings.TrimSpace(context.ThreadSource)
+	if threadSource == "" && requestKind == "turn" {
+		threadSource = "user"
+	}
+
+	payload := make(map[string]any, len(request.Metadata)+12)
+	setStringValue(payload, "installation_id", installationID)
+	setStringValue(payload, "session_id", sessionID)
+	setStringValue(payload, "thread_id", threadID)
+	setStringValue(payload, "turn_id", turnID)
+	setStringValue(payload, "window_id", windowID)
+	setStringValue(payload, "request_kind", requestKind)
+	setStringValue(payload, "thread_source", threadSource)
+	setStringValue(payload, "sandbox", strings.TrimSpace(context.Sandbox))
+	if context.TurnStartedAtUnixMS > 0 {
+		payload["turn_started_at_unix_ms"] = context.TurnStartedAtUnixMS
+	}
+	if workspaces := responsesWorkspaceMetadata(context.WorkspaceRoots); len(workspaces) > 0 {
+		payload["workspaces"] = workspaces
+	}
+	setStringValue(payload, "client_name", "MHcode")
+	setStringValue(payload, "client_version", strings.TrimSpace(clientVersion))
+	for key, value := range request.Metadata {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || reservedResponsesMetadataKey(key) {
+			continue
+		}
+		payload[key] = value
+	}
+
+	if len(payload) == 1 && payload["client_name"] == "MHcode" {
+		return nil, ""
+	}
+	turnMetadata, err := asciiJSON(payload)
+	if err != nil {
+		return nil, ""
+	}
+	metadata := make(map[string]string, 6)
+	setStringMetadata(metadata, responsesInstallationMetadataKey, installationID)
+	setStringMetadata(metadata, "session_id", sessionID)
+	setStringMetadata(metadata, "thread_id", threadID)
+	setStringMetadata(metadata, "turn_id", turnID)
+	setStringMetadata(metadata, responsesWindowMetadataKey, windowID)
+	metadata[responsesTurnMetadataKey] = turnMetadata
+	return metadata, turnMetadata
+}
+
+func responsesWorkspaceMetadata(roots []string) map[string]map[string]any {
+	workspaces := make(map[string]map[string]any)
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root != "" {
+			workspaces[root] = map[string]any{}
+		}
+	}
+	return workspaces
+}
+
+func setStringValue(target map[string]any, key, value string) {
+	if value = strings.TrimSpace(value); value != "" {
+		target[key] = value
+	}
+}
+
+func setStringMetadata(target map[string]string, key, value string) {
+	if value = strings.TrimSpace(value); value != "" {
+		target[key] = value
+	}
+}
+
+func reservedResponsesMetadataKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "installation_id", responsesInstallationMetadataKey,
+		"session_id", "thread_id", "turn_id", "window_id", responsesWindowMetadataKey,
+		"request_kind", "thread_source", "sandbox", "workspaces", "turn_started_at_unix_ms",
+		responsesTurnMetadataKey:
+		return true
+	default:
+		return false
+	}
+}
+
+func asciiJSON(value any) (string, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	var output strings.Builder
+	output.Grow(len(encoded))
+	for _, char := range string(encoded) {
+		switch {
+		case char <= 0x7f:
+			output.WriteRune(char)
+		case char <= 0xffff:
+			_, _ = fmt.Fprintf(&output, `\u%04x`, char)
+		default:
+			high, low := utf16.EncodeRune(char)
+			_, _ = fmt.Fprintf(&output, `\u%04x\u%04x`, high, low)
+		}
+	}
+	return output.String(), nil
 }
 
 func (p OpenAICompatibleProvider) validateResponsesRequest(request ChatRequest) error {
@@ -263,10 +467,39 @@ func responsesToolsFromProtocol(definitions []ToolDefinition) []responsesTool {
 	return tools
 }
 
-func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- StreamEvent) {
+func parseResponsesStream(
+	ctx context.Context,
+	body io.Reader,
+	events chan<- StreamEvent,
+	requestedModel string,
+	transport responsesTransportMetadata,
+) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	toolCalls := make(map[string]ToolCall)
+	noticesSeen := make(map[string]bool)
+	lastServerModel := ""
+	emitServerModel := func(model string) {
+		model = strings.TrimSpace(model)
+		if model == "" || strings.EqualFold(model, lastServerModel) {
+			return
+		}
+		lastServerModel = model
+		events <- StreamEvent{Type: "server_model", Delta: model}
+	}
+	emitNotice := func(notice ProviderNotice) {
+		key := providerNoticeKey(notice)
+		if noticesSeen[key] {
+			return
+		}
+		noticesSeen[key] = true
+		copy := notice
+		events <- StreamEvent{Type: "provider_notice", Notice: &copy}
+	}
+	emitServerModel(transport.ServerModel)
+	for _, notice := range responsesNotices(requestedModel, responsesResponse{}, nil, transport) {
+		emitNotice(notice)
+	}
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -291,6 +524,11 @@ func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- Str
 		if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
 			events <- StreamEvent{Type: "error", Error: "decode OpenAI Responses stream: " + err.Error()}
 			return
+		}
+		effectiveModel := effectiveResponsesModel(envelope.Response, &envelope, transport.ServerModel)
+		emitServerModel(effectiveModel)
+		for _, notice := range responsesNotices(requestedModel, envelope.Response, &envelope, transport) {
+			emitNotice(notice)
 		}
 		switch envelope.Type {
 		case "response.output_text.delta":
@@ -317,11 +555,12 @@ func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- Str
 			events <- StreamEvent{Type: "done"}
 			return
 		case "response.failed", "error":
-			message := "OpenAI Responses request failed"
-			if envelope.Error != nil && strings.TrimSpace(envelope.Error.Message) != "" {
-				message = envelope.Error.Message
+			responseError := envelope.Error
+			if responseError == nil {
+				responseError = envelope.Response.Error
 			}
-			events <- StreamEvent{Type: "error", Error: message}
+			info := providerErrorFromResponses(responseError, transport.HTTPStatus, transport.RequestID)
+			events <- StreamEvent{Type: "error", Error: info.Message, ProviderError: &info}
 			return
 		}
 	}
@@ -333,8 +572,255 @@ func parseResponsesStream(ctx context.Context, body io.Reader, events chan<- Str
 	events <- StreamEvent{Type: "done"}
 }
 
+func responsesTransportMetadataFromHeaders(headers http.Header) responsesTransportMetadata {
+	return responsesTransportMetadata{
+		ServerModel:      firstHeaderValue(headers, "OpenAI-Model", "X-OpenAI-Model"),
+		RequestID:        responseRequestID(headers),
+		SafetyRetryModel: firstHeaderValue(headers, "x-codex-safety-buffering-faster-model"),
+	}
+}
+
+func firstHeaderValue(headers http.Header, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func responsesNotices(
+	requestedModel string,
+	response responsesResponse,
+	envelope *responsesStreamEnvelope,
+	transport responsesTransportMetadata,
+) []ProviderNotice {
+	notices := make([]ProviderNotice, 0, 4)
+	effectiveModel := effectiveResponsesModel(response, envelope, transport.ServerModel)
+	if effectiveModel != "" && requestedModel != "" && !strings.EqualFold(effectiveModel, requestedModel) {
+		notices = append(notices, ProviderNotice{
+			Kind:           ProviderNoticeModelReroute,
+			Severity:       "warning",
+			RequestedModel: requestedModel,
+			EffectiveModel: effectiveModel,
+			RequestID:      transport.RequestID,
+		})
+	}
+
+	bufferingPayload := response.SafetyBuffering
+	if envelope != nil && len(envelope.SafetyBuffering) > 0 {
+		bufferingPayload = envelope.SafetyBuffering
+	}
+	buffering := parseResponsesSafetyBuffering(bufferingPayload, transport.SafetyRetryModel)
+	if buffering != nil {
+		notices = append(notices, ProviderNotice{
+			Kind:       ProviderNoticeSafetyBuffering,
+			Severity:   "info",
+			RetryModel: strings.TrimSpace(buffering.RetryModel),
+			UseCases:   cleanNoticeValues(buffering.UseCases),
+			Reasons:    cleanNoticeValues(buffering.Reasons),
+			RequestID:  transport.RequestID,
+		})
+	}
+
+	metadata := response.Metadata
+	if envelope != nil && len(envelope.Metadata) > 0 {
+		metadata = envelope.Metadata
+	}
+	if len(metadata) > 0 {
+		verifications := knownModelVerifications(metadata["openai_verification_recommendation"])
+		if len(verifications) > 0 {
+			notices = append(notices, ProviderNotice{
+				Kind:          ProviderNoticeModelVerification,
+				Severity:      "warning",
+				Verifications: verifications,
+				RequestID:     transport.RequestID,
+			})
+		}
+		if moderation, ok := metadata["openai_chatgpt_moderation_metadata"]; ok && moderation != nil {
+			notices = append(notices, ProviderNotice{
+				Kind:         ProviderNoticeModeration,
+				Severity:     "info",
+				MetadataKeys: metadataKeys(moderation),
+				RequestID:    transport.RequestID,
+			})
+		}
+	}
+	return notices
+}
+
+func parseResponsesSafetyBuffering(raw json.RawMessage, fallbackModel string) *responsesSafetyBuffering {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "false" || trimmed == "null" {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil
+	}
+	useCasesRaw, hasUseCases := fields["use_cases"]
+	reasonsRaw, hasReasons := fields["reasons"]
+	if !hasUseCases || !hasReasons {
+		return nil
+	}
+	buffering := &responsesSafetyBuffering{}
+	if json.Unmarshal(useCasesRaw, &buffering.UseCases) != nil || json.Unmarshal(reasonsRaw, &buffering.Reasons) != nil {
+		return nil
+	}
+	if retryModelRaw, present := fields["retry_model"]; present {
+		// Explicit null intentionally disables the header fallback, matching Codex.
+		_ = json.Unmarshal(retryModelRaw, &buffering.RetryModel)
+	} else {
+		buffering.RetryModel = strings.TrimSpace(fallbackModel)
+	}
+	return buffering
+}
+
+func knownModelVerifications(value any) []string {
+	values := stringValues(value)
+	known := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "trusted_access_for_cyber" {
+			known = append(known, value)
+		}
+	}
+	return known
+}
+
+func effectiveResponsesModel(response responsesResponse, envelope *responsesStreamEnvelope, transportModel string) string {
+	if model := headerModelValue(response.Headers); model != "" {
+		return model
+	}
+	if envelope != nil {
+		if model := headerModelValue(envelope.Headers); model != "" {
+			return model
+		}
+	}
+	if model := strings.TrimSpace(transportModel); model != "" {
+		return model
+	}
+	if model := strings.TrimSpace(response.Model); model != "" {
+		return model
+	}
+	return ""
+}
+
+func headerModelValue(headers map[string]any) string {
+	for name, value := range headers {
+		if !strings.EqualFold(name, "openai-model") && !strings.EqualFold(name, "x-openai-model") {
+			continue
+		}
+		values := stringValues(value)
+		if len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
+}
+
+func stringValues(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		return cleanNoticeValues([]string{typed})
+	case []string:
+		return cleanNoticeValues(typed)
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				values = append(values, text)
+			}
+		}
+		return cleanNoticeValues(values)
+	default:
+		return nil
+	}
+}
+
+func cleanNoticeValues(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	seen := make(map[string]bool)
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func metadataKeys(value any) []string {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		if key = strings.TrimSpace(key); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func providerNoticeKey(notice ProviderNotice) string {
+	return strings.Join([]string{
+		notice.Kind,
+		notice.RequestedModel,
+		notice.EffectiveModel,
+		notice.RetryModel,
+		strings.Join(notice.UseCases, ","),
+		strings.Join(notice.Reasons, ","),
+		strings.Join(notice.Verifications, ","),
+		strings.Join(notice.MetadataKeys, ","),
+	}, "\x00")
+}
+
+func providerErrorFromResponses(responseError *responsesError, status int, requestID string) ProviderErrorInfo {
+	info := ProviderErrorInfo{
+		Provider:   "openai-compatible",
+		HTTPStatus: status,
+		Message:    "OpenAI Responses request failed",
+		RequestID:  requestID,
+	}
+	if responseError == nil {
+		return info
+	}
+	if message := compactOpenAICompatibleError(responseError.Message); message != "" {
+		info.Message = message
+	}
+	info.Type = strings.TrimSpace(responseError.Type)
+	info.Code = strings.TrimSpace(fmt.Sprint(responseError.Code))
+	if info.Code == "<nil>" {
+		info.Code = ""
+	}
+	info.Retryable = providerErrorRetryable(info.Code, info.Type, status)
+	return info
+}
+
+func providerErrorRetryable(code, errorType string, status int) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	errorType = strings.ToLower(strings.TrimSpace(errorType))
+	if isNonRetryableProviderErrorCode(code) {
+		return false
+	}
+	if status > 0 {
+		return shouldRetryOpenAICompatibleStatus(status)
+	}
+	for _, value := range []string{code, errorType} {
+		switch value {
+		case "rate_limit_exceeded", "server_error", "overloaded", "timeout", "request_timeout":
+			return true
+		}
+	}
+	return false
+}
+
 func completionFromResponses(response responsesResponse) CompletionResult {
-	result := CompletionResult{}
+	result := CompletionResult{EffectiveModel: effectiveResponsesModel(response, nil, "")}
 	var text strings.Builder
 	reasoningItems := make([]responsesInputItem, 0, 2)
 	for _, item := range response.Output {

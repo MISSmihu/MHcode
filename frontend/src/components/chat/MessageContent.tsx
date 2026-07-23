@@ -1,7 +1,8 @@
-import { For, Match, Switch, Show, createMemo, createSignal } from "solid-js";
+import { For, Match, Switch, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import {
   AlertCircle,
   Check,
+	Copy,
   ChevronDown,
   ChevronRight,
   Circle,
@@ -15,7 +16,9 @@ import {
   LoaderCircle,
   Monitor,
   Pencil,
+  Route,
   Search,
+  ShieldAlert,
   TerminalSquare,
   Undo2,
   Users,
@@ -71,6 +74,9 @@ export function MessageContent(props: {
                 <TeamRun parts={(block as TeamRenderBlock).parts} />
               </Show>
             </Match>
+            <Match when={block.kind === "provider"}>
+              <ProviderNotice part={(block as ProviderRenderBlock).part} />
+            </Match>
           </Switch>
         )}
       </For>
@@ -94,10 +100,12 @@ type FilePart = Extract<MessagePart, { kind: "file" }>;
 export type TaskProgressPart = Extract<MessagePart, { kind: "task_progress" }>;
 type WebSearchPart = Extract<MessagePart, { kind: "web_search_results" }>;
 export type TeamPart = Extract<MessagePart, { kind: "team_role" }>;
+type ProviderNoticePart = Extract<MessagePart, { kind: "provider_notice" }>;
 type TextRenderBlock = { kind: "text"; part: TextPart };
 type ActivityRenderBlock = { kind: "activity"; parts: MessagePart[] };
 type TeamRenderBlock = { kind: "team"; parts: TeamPart[] };
-type RenderBlock = TextRenderBlock | ActivityRenderBlock | TeamRenderBlock;
+type ProviderRenderBlock = { kind: "provider"; part: ProviderNoticePart };
+type RenderBlock = TextRenderBlock | ActivityRenderBlock | TeamRenderBlock | ProviderRenderBlock;
 type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "browser" | "computer" | "open" | "file" | "tool";
 type ActivityItem = { category: ActivityCategory; parts: MessagePart[] };
 
@@ -158,27 +166,60 @@ function ActivityRow(props: {
         <ChevronRight class="op-activity-chevron" size={14} aria-hidden="true" />
       </summary>
       <div class="op-activity-body">
-        <For each={props.item.parts}>
-          {(part) => (
-            <Switch>
-              <Match when={part.kind === "tool_call"}>
-                <ToolDetail
-                  part={part as ToolPart}
-                  hideOutput={props.item.parts.some((item) => item.kind === "web_search_results")}
-                  onOpenWorkspaceFile={props.onOpenWorkspaceFile}
-                />
-              </Match>
-              <Match when={part.kind === "diff"}>
-                <DiffDetail part={part as DiffPart} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
-              </Match>
-              <Match when={part.kind === "web_search_results"}>
-                <WebSearchResults part={part as WebSearchPart} onOpenURL={props.onOpenURL} />
-              </Match>
-            </Switch>
-          )}
-        </For>
+        <Show when={props.item.category === "command"} fallback={
+          <For each={props.item.parts}>
+            {(part) => (
+              <Switch>
+                <Match when={part.kind === "tool_call"}>
+                  <ToolDetail
+                    part={part as ToolPart}
+                    hideOutput={props.item.parts.some((item) => item.kind === "web_search_results")}
+                    onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+                  />
+                </Match>
+                <Match when={part.kind === "diff"}>
+                  <DiffDetail part={part as DiffPart} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
+                </Match>
+                <Match when={part.kind === "web_search_results"}>
+                  <WebSearchResults part={part as WebSearchPart} onOpenURL={props.onOpenURL} />
+                </Match>
+              </Switch>
+            )}
+          </For>
+        }>
+          <CommandActivityList parts={props.item.parts} />
+        </Show>
       </div>
     </details>
+  );
+}
+
+function CommandActivityList(props: { parts: MessagePart[] }) {
+  const commands = createMemo(() => props.parts.filter((part): part is ToolPart => part.kind === "tool_call"));
+  return (
+    <div class="op-command-list">
+      <For each={commands()}>
+        {(part) => (
+          <details class="op-command-entry" classList={{ [part.status ?? "ok"]: true }}>
+            <summary title={commandDisplayInput(part)}>
+              <span class="op-command-state" aria-hidden="true">
+                <Show when={part.status === "running"} fallback={
+                  <Show when={part.status === "error"} fallback={<Check size={12} />}>
+                    <AlertCircle size={12} />
+                  </Show>
+                }>
+                  <span class="op-activity-spinner" />
+                </Show>
+              </span>
+              <code>{commandDisplayInput(part)}</code>
+              <span class="op-command-meta">{commandPartStatus(part)}</span>
+              <ChevronRight size={13} aria-hidden="true" />
+            </summary>
+            <ShellToolDetail part={part} />
+          </details>
+        )}
+      </For>
+    </div>
   );
 }
 
@@ -203,7 +244,7 @@ function ToolDetail(props: {
   hideOutput?: boolean;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 }) {
-  if (props.part.name === "run_command") {
+  if (props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh") {
     return <ShellToolDetail part={props.part} />;
   }
   const readReference = createMemo(() => props.part.name === "read_file"
@@ -265,24 +306,91 @@ function ToolDetail(props: {
 
 function ShellToolDetail(props: { part: ToolPart }) {
   const duration = () => props.part.durationMs !== undefined ? formatElapsedDuration(props.part.durationMs) : "";
+	const [copied, setCopied] = createSignal<"command" | "output" | "">("");
+	const stdout = () => props.part.stdout ?? (props.part.stderr ? "" : props.part.output ?? "");
+	const stderr = () => props.part.stderr ?? "";
+	const combinedOutput = () => [stdout(), stderr()].filter(Boolean).join("\n") || props.part.output || "";
+	const copy = async (kind: "command" | "output", value: string) => {
+		if (!value) return;
+		await navigator.clipboard.writeText(value);
+		setCopied(kind);
+		window.setTimeout(() => setCopied(""), 1_200);
+	};
   return (
     <div class="op-activity-detail op-shell-detail">
       <div class="op-activity-detail-head">
-        <span class="op-shell-title"><TerminalSquare size={13} /><code>Shell</code></span>
+        <span class="op-shell-title"><TerminalSquare size={13} /><code>{props.part.name === "terminal" ? "Terminal" : props.part.name === "ssh" ? "SSH" : "Shell"}</code></span>
         <span class="op-shell-meta">
+		  <Show when={props.part.status === "running"}>
+			<em class="running"><LivePartElapsed startedAt={props.part.startedAt} /></em>
+		  </Show>
           <Show when={props.part.exitCode !== undefined}>
             <em classList={{ error: props.part.exitCode !== 0 }}>exit {props.part.exitCode}</em>
           </Show>
           <Show when={duration()}><em>{duration()}</em></Show>
         </span>
       </div>
-      <div class="op-shell-command"><span aria-hidden="true">$</span><code>{props.part.input || "(empty command)"}</code></div>
+	  <div class="op-shell-command">
+		<span aria-hidden="true">$</span><code>{commandDisplayInput(props.part)}</code>
+		<button type="button" title="复制命令" aria-label="复制命令" onClick={() => void copy("command", commandDisplayInput(props.part))}>
+		  <Show when={copied() === "command"} fallback={<Copy size={12} />}><Check size={12} /></Show>
+		</button>
+	  </div>
       <Show when={props.part.workingDirectory}>
         <div class="op-shell-workdir" title={props.part.workingDirectory}>cwd <code>{props.part.workingDirectory}</code></div>
       </Show>
-      <pre class="op-shell-output">{props.part.output || "(no output)"}</pre>
+	  <div class="op-shell-output-head">
+		<span>输出</span>
+		<button type="button" title="复制输出" aria-label="复制输出" onClick={() => void copy("output", combinedOutput())}>
+		  <Show when={copied() === "output"} fallback={<Copy size={12} />}><Check size={12} /></Show>
+		</button>
+	  </div>
+	  <Show when={stdout()} fallback={<Show when={!stderr()}><pre class="op-shell-output muted">{props.part.status === "running" ? "等待命令输出…" : "(无输出)"}</pre></Show>}>
+		<pre class="op-shell-output stdout">{stdout()}</pre>
+	  </Show>
+	  <Show when={stderr()}>
+		<div class="op-shell-output-label error">stderr</div>
+		<pre class="op-shell-output stderr">{stderr()}</pre>
+	  </Show>
     </div>
   );
+}
+
+function commandDisplayInput(part: ToolPart): string {
+  const input = part.input?.trim() ?? "";
+  if (part.name !== "terminal" || !input.startsWith("{")) {
+    return input || (part.name === "terminal" ? "终端操作" : "(空命令)");
+  }
+  try {
+    const args = JSON.parse(input) as { action?: string; command?: string; session_id?: string };
+    if (args.command?.trim()) return args.command.trim();
+    const session = args.session_id?.trim() ? ` ${args.session_id.trim()}` : "";
+    switch (args.action?.trim().toLowerCase()) {
+      case "start": return "启动持久终端";
+      case "state": return `读取终端状态${session}`;
+      case "stop": return `停止持久终端${session}`;
+      default: return `${args.action?.trim() || "终端操作"}${session}`;
+    }
+  } catch {
+    return input;
+  }
+}
+
+function commandPartStatus(part: ToolPart): string {
+  const duration = part.durationMs !== undefined ? ` · ${formatElapsedDuration(part.durationMs)}` : "";
+  if (part.status === "running") return "正在运行";
+  if (part.status === "error") return `失败${duration}`;
+  if (part.exitCode !== undefined && part.exitCode !== 0) return `exit ${part.exitCode}${duration}`;
+  return `已运行${duration}`;
+}
+
+function LivePartElapsed(props: { startedAt?: string }) {
+	const startedAt = new Date(props.startedAt ?? "").getTime();
+	const readElapsed = () => Math.max(0, Date.now() - (Number.isFinite(startedAt) ? startedAt : Date.now()));
+	const [elapsed, setElapsed] = createSignal(readElapsed());
+	const timer = window.setInterval(() => setElapsed(readElapsed()), 1_000);
+	onCleanup(() => window.clearInterval(timer));
+	return <>{formatElapsedDuration(elapsed())}</>;
 }
 
 function DiffDetail(props: {
@@ -418,6 +526,10 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       }
       continue;
     }
+    if (part.kind === "provider_notice") {
+      blocks.push({ kind: "provider", part });
+      continue;
+    }
     const previous = blocks.at(-1);
     if (previous?.kind === "activity") {
       previous.parts.push(part);
@@ -467,8 +579,11 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
   if (part.kind === "web_search_results") return "web";
   if (part.kind === "task_progress") return "tool";
   if (part.kind === "team_role") return "tool";
+  if (part.kind === "provider_notice") return "tool";
   switch (part.name) {
-    case "run_command": return "command";
+    case "run_command":
+    case "terminal":
+    case "ssh": return "command";
     case "read_file": return "read";
     case "file_info": return "read";
     case "list_dir": return "directory";
@@ -485,6 +600,68 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
     case "delete_file": return "edit";
     default: return "tool";
   }
+}
+
+function ProviderNotice(props: { part: ProviderNoticePart }) {
+  const title = () => {
+    switch (props.part.noticeKind) {
+      case "model_reroute": return "服务端调整了本轮模型";
+      case "safety_buffering": return "服务端安全检查";
+      case "model_verification": return "供应商建议验证访问资格";
+      case "moderation": return "供应商内容安全元数据";
+      case "policy_error": return "请求被供应商安全策略阻止";
+      case "provider_error": return "供应商请求失败";
+      default: return "供应商运行通知";
+    }
+  };
+  const summary = () => {
+    if (props.part.noticeKind === "model_reroute") {
+      return `${props.part.requestedModel || "请求模型"} → ${props.part.effectiveModel || "实际模型"}`;
+    }
+    if (props.part.noticeKind === "safety_buffering") {
+      return props.part.retryModel ? `必要时由 ${props.part.retryModel} 继续处理` : "本轮正在由上游安全路由处理";
+    }
+    if (props.part.noticeKind === "model_verification") {
+      return (props.part.verifications ?? []).join("、") || "上游返回了账户验证建议";
+    }
+    if (props.part.noticeKind === "moderation") {
+      return props.part.metadataKeys?.length ? `已读取 ${props.part.metadataKeys.length} 项元数据` : "已读取本轮元数据";
+    }
+    if (props.part.noticeKind === "policy_error") {
+      return props.part.message || "上游拒绝了本轮请求";
+    }
+    if (props.part.noticeKind === "provider_error") {
+      return props.part.message || "上游服务未完成本轮请求";
+    }
+    return props.part.message || "已收到供应商运行信息";
+  };
+  const details = () => [
+    ...(props.part.useCases?.length ? [`用途：${props.part.useCases.join("、")}`] : []),
+    ...(props.part.reasons?.length ? [`原因：${props.part.reasons.join("、")}`] : []),
+    ...(props.part.errorCode ? [`错误代码：${props.part.errorCode}`] : []),
+    ...(props.part.httpStatus ? [`HTTP：${props.part.httpStatus}`] : []),
+    ...(props.part.retryable === false ? ["该错误不可自动重试"] : []),
+    ...(props.part.requestId ? [`请求 ID：${props.part.requestId}`] : []),
+  ];
+  return (
+    <section class="op-provider-notice" classList={{
+      warning: props.part.severity === "warning",
+      error: props.part.severity === "error",
+    }} aria-label={title()}>
+      <span class="op-provider-notice-icon" aria-hidden="true">
+        <Show when={props.part.noticeKind === "model_reroute"} fallback={<ShieldAlert size={15} />}>
+          <Route size={15} />
+        </Show>
+      </span>
+      <span class="op-provider-notice-main">
+        <strong>{title()}</strong>
+        <small>{summary()}</small>
+        <Show when={details().length > 0}>
+          <span class="op-provider-notice-meta">{details().join(" · ")}</span>
+        </Show>
+      </span>
+    </section>
+  );
 }
 
 export function TeamRun(props: { parts: TeamPart[]; docked?: boolean }) {
@@ -614,38 +791,39 @@ function activityLabel(item: ActivityItem): string {
   const tools = item.parts.filter((part): part is ToolPart => part.kind === "tool_call");
   const files = uniqueStrings(item.parts.flatMap((part) => part.kind === "diff" || part.kind === "file" ? [part.path] : []));
   const input = tools.find((part) => part.input)?.input ?? "";
+	const running = activityStatus(item) === "running";
   switch (item.category) {
     case "command":
-      return tools.length > 1 ? `运行了 ${tools.length} 个命令` : "运行了命令";
+	  return running ? (tools.length > 1 ? `正在运行 ${tools.length} 个命令` : "正在运行命令") : tools.length > 1 ? `运行了 ${tools.length} 个命令` : "运行了命令";
     case "edit":
-      return files.length > 1 ? `编辑了 ${files.length} 个文件` : files[0] ? `编辑了 ${baseName(files[0])}` : "编辑了文件";
+	  return running ? "正在编辑文件" : files.length > 1 ? `编辑了 ${files.length} 个文件` : files[0] ? `编辑了 ${baseName(files[0])}` : "编辑了文件";
     case "read":
-      return tools.length > 1 ? `读取了 ${tools.length} 个文件` : input ? `读取了 ${baseName(input)}` : "读取了文件";
+	  return running ? (input ? `正在读取 ${baseName(input)}` : "正在读取文件") : tools.length > 1 ? `读取了 ${tools.length} 个文件` : input ? `读取了 ${baseName(input)}` : "读取了文件";
     case "directory":
-      return input ? `查看了目录 ${input}` : "查看了目录";
+	  return running ? (input ? `正在查看目录 ${input}` : "正在查看目录") : input ? `查看了目录 ${input}` : "查看了目录";
     case "search":
-      return input ? `搜索了代码“${compactLabel(input)}”` : "搜索了代码";
+	  return running ? (input ? `正在搜索代码“${compactLabel(input)}”` : "正在搜索代码") : input ? `搜索了代码“${compactLabel(input)}”` : "搜索了代码";
     case "web":
       if (tools.some((part) => part.name === "read_webpage")) {
-        return input ? `读取了网页 ${compactLabel(input)}` : "读取了网页正文";
+		return running ? (input ? `正在读取网页 ${compactLabel(input)}` : "正在读取网页正文") : input ? `读取了网页 ${compactLabel(input)}` : "读取了网页正文";
       }
-      return input ? `搜索了网络“${compactLabel(input)}”` : "搜索了网络";
+	  return running ? (input ? `正在搜索网络“${compactLabel(input)}”` : "正在搜索网络") : input ? `搜索了网络“${compactLabel(input)}”` : "搜索了网络";
     case "repository":
-      return input ? `读取了仓库 ${compactLabel(input)}` : "读取了代码仓库";
+	  return running ? (input ? `正在读取仓库 ${compactLabel(input)}` : "正在读取代码仓库") : input ? `读取了仓库 ${compactLabel(input)}` : "读取了代码仓库";
     case "image": {
       const count = Math.max(1, files.filter(isImagePath).length);
       return `查看了 ${count} 张图像`;
     }
     case "browser":
-      return input.startsWith("http") ? "打开了网页" : "使用了内置浏览器";
+	  return running ? "正在使用内置浏览器" : input.startsWith("http") ? "打开了网页" : "使用了内置浏览器";
     case "computer":
-      return input ? `操作了窗口（${compactLabel(input)}）` : "操作了其他窗口";
+	  return running ? "正在操作其他窗口" : input ? `操作了窗口（${compactLabel(input)}）` : "操作了其他窗口";
     case "open":
       return input ? `打开了 ${baseName(input)}` : "打开了文件";
     case "file":
       return files.length > 1 ? `生成了 ${files.length} 个文件` : files[0] ? `生成了 ${baseName(files[0])}` : "生成了文件";
     default:
-      return tools.length > 1 ? `运行了 ${tools.length} 个工具` : `运行了 ${friendlyToolName(tools[0]?.name)}`;
+	  return running ? `正在运行 ${friendlyToolName(tools[0]?.name)}` : tools.length > 1 ? `运行了 ${tools.length} 个工具` : `运行了 ${friendlyToolName(tools[0]?.name)}`;
   }
 }
 

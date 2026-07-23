@@ -586,6 +586,16 @@ export type ChatResult = {
   usage: UsageMetrics;
   state: WorkbenchState;
   parts?: MessagePart[];
+  turnCommitted?: boolean;
+  providerError?: {
+    provider?: string;
+    httpStatus?: number;
+    type?: string;
+    code?: string;
+    message: string;
+    requestId?: string;
+    retryable: boolean;
+  };
 };
 
 export type ChatTaskState = {
@@ -605,7 +615,7 @@ export type ChatTaskEvent = {
   taskId: string;
   projectId?: string;
   sessionId?: string;
-  type: "started" | "status" | "context_compression" | "delta" | "reasoning" | "usage" | "tool" | "completed" | "failed" | "cancelled" | string;
+  type: "started" | "status" | "context_compression" | "delta" | "reasoning" | "provider_notice" | "usage" | "tool" | "completed" | "failed" | "cancelled" | string;
   delta?: string;
   message?: string;
   model?: string;
@@ -646,6 +656,7 @@ export type ChatTaskEvent = {
   guidance?: string;
   attachments?: ChatAttachment[];
   result?: ChatResult;
+  forced?: boolean;
 };
 
 export type BrowserPreview = {
@@ -767,6 +778,8 @@ export type MessagePart =
       status?: "running" | "ok" | "error";
       input?: string;
       output?: string;
+	  stdout?: string;
+	  stderr?: string;
       toolCallId?: string;
       workingDirectory?: string;
       exitCode?: number;
@@ -797,6 +810,23 @@ export type MessagePart =
       summary?: string;
       verdict?: "approved" | "changes_required" | "unknown" | string;
       attempt?: number;
+    }
+  | {
+      kind: "provider_notice";
+      noticeKind: "model_reroute" | "safety_buffering" | "model_verification" | "moderation" | "policy_error" | string;
+      severity?: "info" | "warning" | "error" | string;
+      message?: string;
+      requestedModel?: string;
+      effectiveModel?: string;
+      retryModel?: string;
+      useCases?: string[];
+      reasons?: string[];
+      verifications?: string[];
+      metadataKeys?: string[];
+      requestId?: string;
+      errorCode?: string;
+      httpStatus?: number;
+      retryable?: boolean;
     };
 
 // 事件日志的可回退检查点（对应后端 agent.CheckpointInfo）。
@@ -860,6 +890,7 @@ export type SessionMessage = {
   durationMs?: number;
   parts?: MessagePart[];
   attachments?: ChatAttachment[];
+	status?: "failed" | "cancelled" | string;
 };
 
 // 侧边栏树的项目节点（对应后端 agent.ProjectNode），含它的会话。

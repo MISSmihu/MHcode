@@ -3,11 +3,23 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+type fakeWebpageBrowserRenderer struct {
+	snapshot string
+	err      error
+	url      string
+}
+
+func (f *fakeWebpageBrowserRenderer) ReadURLSnapshot(_ context.Context, targetURL string) (string, error) {
+	f.url = targetURL
+	return f.snapshot, f.err
+}
 
 func TestReadWebpageToolExtractsActualContentAndLinks(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -43,7 +55,42 @@ func TestReadWebpageToolExtractsActualContentAndLinks(t *testing.T) {
 	}
 }
 
-func TestReadWebpageToolReportsJavaScriptOnlyPage(t *testing.T) {
+func TestReadWebpageToolRendersJavaScriptOnlyPage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body><script>document.body.textContent = "loaded"</script></body></html>`))
+	}))
+	defer server.Close()
+
+	snapshot, err := json.Marshal(map[string]any{
+		"title": "豆包",
+		"url":   server.URL + "/chat",
+		"text":  "这是 JavaScript 渲染后的真实页面正文。",
+		"elements": []map[string]string{
+			{"name": "帮助中心", "href": "/help"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderer := &fakeWebpageBrowserRenderer{snapshot: string(snapshot)}
+	tool := ReadWebpageTool{Policy: SandboxPolicy{NetworkAccess: true}, Client: server.Client(), Browser: renderer}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"url":"`+server.URL+`"}`))
+	if err != nil || result.IsError {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if renderer.url != server.URL {
+		t.Fatalf("renderer URL = %q, want %q", renderer.url, server.URL)
+	}
+	output := result.Parts[0].Output
+	for _, expected := range []string{"MHcode managed browser snapshot", "Title: 豆包", "JavaScript 渲染后的真实页面正文", server.URL + "/help"} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("output missing %q:\n%s", expected, output)
+		}
+	}
+}
+
+func TestReadWebpageToolReportsUnavailableBrowserForJavaScriptPage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = w.Write([]byte(`<html><body><script>document.body.textContent = "loaded"</script></body></html>`))
@@ -52,7 +99,22 @@ func TestReadWebpageToolReportsJavaScriptOnlyPage(t *testing.T) {
 
 	tool := ReadWebpageTool{Policy: SandboxPolicy{NetworkAccess: true}, Client: server.Client()}
 	result, err := tool.Execute(context.Background(), json.RawMessage(`{"url":"`+server.URL+`"}`))
-	if err != nil || !result.IsError || !strings.Contains(result.Summary, "browser snapshot") {
+	if err != nil || !result.IsError || !strings.Contains(result.Summary, "启用内置浏览器") {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
+func TestReadWebpageToolReportsBrowserRenderingFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body></body></html>`))
+	}))
+	defer server.Close()
+
+	renderer := &fakeWebpageBrowserRenderer{err: errors.New("browser unavailable")}
+	tool := ReadWebpageTool{Policy: SandboxPolicy{NetworkAccess: true}, Client: server.Client(), Browser: renderer}
+	result, err := tool.Execute(context.Background(), json.RawMessage(`{"url":"`+server.URL+`"}`))
+	if err != nil || !result.IsError || !strings.Contains(result.Summary, "browser unavailable") {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 }

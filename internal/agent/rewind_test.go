@@ -31,6 +31,30 @@ func TestSessionMessagesRestoreTimingAndToolMetadata(t *testing.T) {
 	}
 }
 
+func TestProviderNoticePersistsAcrossServiceRestart(t *testing.T) {
+	sessionsDir := t.TempDir()
+	config := ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: sessionsDir}
+	retryable := false
+	service := NewService(config)
+	service.recordAssistantAndCheckpoint("request blocked", "gpt-requested", []tools.ResultPart{{
+		Kind: tools.PartProviderNotice, NoticeKind: "policy_error", Severity: "error",
+		Message: "request blocked", RequestID: "req-policy", ErrorCode: "cyber_policy",
+		HTTPStatus: 400, Retryable: &retryable,
+	}})
+	service.Close()
+
+	restored := NewService(config)
+	defer restored.Close()
+	history := restored.GetSessionMessages()
+	if len(history) != 1 || len(history[0].Parts) != 1 {
+		t.Fatalf("restored history = %#v", history)
+	}
+	part := history[0].Parts[0]
+	if part.Kind != tools.PartProviderNotice || part.NoticeKind != "policy_error" || part.ErrorCode != "cyber_policy" || part.RequestID != "req-policy" || part.Retryable == nil || *part.Retryable {
+		t.Fatalf("restored provider notice = %#v", part)
+	}
+}
+
 func TestGetSessionMessagesUpgradesLegacyWebSearchFailure(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
 	_, err := svc.eventStore.Append(eventlog.EventPayload{

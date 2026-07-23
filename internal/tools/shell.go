@@ -82,24 +82,30 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 	var stdout, stderr cappedCommandOutput
 	stdout.limit = maxCommandOutputBytes / 2
 	stderr.limit = maxCommandOutputBytes / 2
+	startedAt := time.Now()
+	reporter := &commandProgressReporter{
+		ctx:         ctx,
+		command:     args.Command,
+		workDir:     workDir,
+		startedAt:   startedAt,
+		stdout:      &stdout,
+		stderr:      &stderr,
+		minInterval: 120 * time.Millisecond,
+	}
+	stdout.notify = reporter.emit
+	stderr.notify = reporter.emit
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	startedAt := time.Now()
+	reporter.emitNow()
 	process, startErr := sandboxexec.Start(cmd, t.Policy.ProcessLimits())
 	runErr := startErr
 	if startErr == nil {
 		runErr = process.Wait()
 	}
 	completedAt := time.Now()
-	output := DecodeCommandOutput(stdout.Bytes())
+	stdoutOutput := DecodeCommandOutput(stdout.Bytes())
 	stderrOutput := DecodeCommandOutput(stderr.Bytes())
-	if strings.TrimSpace(stderrOutput) != "" {
-		if strings.TrimSpace(output) != "" {
-			output = strings.TrimRight(output, "\r\n") + "\n[stderr]\n" + stderrOutput
-		} else {
-			output = stderrOutput
-		}
-	}
+	output := commandOutputForDisplay(stdoutOutput, stderrOutput)
 	if dropped := stdout.Dropped() + stderr.Dropped(); dropped > 0 {
 		output += fmt.Sprintf("\n... [command output truncated: %d bytes]", dropped)
 	}
@@ -132,6 +138,8 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 				Status:           status,
 				Input:            args.Command,
 				Output:           output,
+				Stdout:           stdoutOutput,
+				Stderr:           stderrOutput,
 				WorkingDirectory: workDir,
 				ExitCode:         intPointer(exitCode),
 				StartedAt:        startedAt.Format(time.RFC3339Nano),
@@ -159,11 +167,11 @@ type cappedCommandOutput struct {
 	buffer  bytes.Buffer
 	limit   int
 	written int
+	notify  func()
 }
 
 func (w *cappedCommandOutput) Write(p []byte) (int, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.written += len(p)
 	remaining := w.limit - w.buffer.Len()
 	if remaining > 0 {
@@ -171,6 +179,11 @@ func (w *cappedCommandOutput) Write(p []byte) (int, error) {
 			remaining = len(p)
 		}
 		_, _ = w.buffer.Write(p[:remaining])
+	}
+	notify := w.notify
+	w.mu.Unlock()
+	if notify != nil {
+		notify()
 	}
 	return len(p), nil
 }
@@ -188,6 +201,62 @@ func (w *cappedCommandOutput) Dropped() int {
 		return 0
 	}
 	return w.written - w.buffer.Len()
+}
+
+type commandProgressReporter struct {
+	ctx         context.Context
+	command     string
+	workDir     string
+	startedAt   time.Time
+	stdout      *cappedCommandOutput
+	stderr      *cappedCommandOutput
+	minInterval time.Duration
+
+	mu       sync.Mutex
+	lastEmit time.Time
+}
+
+func (r *commandProgressReporter) emit() {
+	r.publish(false)
+}
+
+func (r *commandProgressReporter) emitNow() {
+	r.publish(true)
+}
+
+func (r *commandProgressReporter) publish(force bool) {
+	now := time.Now()
+	r.mu.Lock()
+	if !force && !r.lastEmit.IsZero() && now.Sub(r.lastEmit) < r.minInterval {
+		r.mu.Unlock()
+		return
+	}
+	r.lastEmit = now
+	r.mu.Unlock()
+
+	stdout := DecodeCommandOutput(r.stdout.Bytes())
+	stderr := DecodeCommandOutput(r.stderr.Bytes())
+	EmitProgress(r.ctx, ResultPart{
+		Kind:             PartToolCall,
+		Name:             "run_command",
+		Status:           "running",
+		Input:            r.command,
+		Output:           commandOutputForDisplay(stdout, stderr),
+		Stdout:           stdout,
+		Stderr:           stderr,
+		WorkingDirectory: r.workDir,
+		StartedAt:        r.startedAt.Format(time.RFC3339Nano),
+	})
+}
+
+func commandOutputForDisplay(stdout, stderr string) string {
+	if strings.TrimSpace(stderr) == "" {
+		return stdout
+	}
+	if strings.TrimSpace(stdout) == "" {
+		return stderr
+	}
+	return strings.TrimRight(stdout, "\r\n") + "\n[stderr]\n" + stderr
 }
 
 func safeCommandEnvironment() []string {

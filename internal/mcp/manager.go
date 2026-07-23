@@ -159,7 +159,7 @@ func (m *Manager) connectServer(ctx context.Context, config ServerConfig, key st
 		return server
 	}
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "mhcode", Title: "MHcode", Version: "0.3.0"}, &sdkmcp.ClientOptions{
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "mhcode", Title: "MHcode", Version: "0.3.1"}, &sdkmcp.ClientOptions{
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		KeepAlive: 30 * time.Second,
 		ToolListChangedHandler: func(context.Context, *sdkmcp.ToolListChangedRequest) {

@@ -111,8 +111,32 @@ func (s *Service) recordUserEventWithAttachments(content string, attachments []C
 		return
 	}
 	_, _ = s.eventStore.Append(eventlog.EventPayload{
-		Role: "user", Content: content, Attachments: toEventAttachments(attachments),
+		Role: "user", Content: redactSensitiveText(content), Attachments: toEventAttachments(attachments),
 	}, eventlog.EventUserMessage)
+}
+
+func (s *Service) recordTurnTerminal(status, content, model string, parts []tools.ResultPart, durationMs int64) error {
+	if s.eventStore == nil {
+		return nil
+	}
+	_, err := s.eventStore.Append(eventlog.EventPayload{
+		Role:       "assistant",
+		Content:    redactSensitiveText(content),
+		Model:      model,
+		DurationMs: durationMs,
+		Parts:      toEventParts(parts),
+		Status:     status,
+	}, eventlog.EventTurnTerminal)
+	if err != nil {
+		return fmt.Errorf("记录任务终止状态失败: %w", err)
+	}
+	if s.projects != nil {
+		projectID, sessionID := s.projectID, s.sessionID
+		if projectID != "" && sessionID != "" {
+			_ = s.projects.TouchSession(projectID, sessionID)
+		}
+	}
+	return nil
 }
 
 // recordFileSnapshot 在文件被修改后记录快照事件：把「改动前内容」写入内容寻址 blob。
@@ -469,6 +493,7 @@ func (s *Service) rebuildSessionFromEvents() {
 		rebuilt = append(rebuilt, *systemMsg)
 	}
 	turns := 0
+	pendingUser := false
 	s.planState = PlanState{}
 	s.teamResume = nil
 	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
@@ -478,9 +503,20 @@ func (s *Service) rebuildSessionFromEvents() {
 			rebuilt = append(rebuilt, protocol.Message{
 				Role: "user", Content: ev.Payload.Content, Attachments: protocolAttachments(fromEventAttachments(ev.Payload.Attachments)),
 			})
+			pendingUser = true
 		case eventlog.EventAssistantMessage:
 			content, _ := restoredAssistantMessage(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
 			rebuilt = append(rebuilt, protocol.Message{Role: "assistant", Content: content})
+			pendingUser = false
+		case eventlog.EventTurnTerminal:
+			// A retained interrupted turn has its user event on the branch. A
+			// zero-output failure is rolled back before the terminal marker, so it
+			// must not become an orphan assistant message in future model context.
+			if pendingUser {
+				rebuilt = append(rebuilt, protocol.Message{Role: "assistant", Content: ev.Payload.Content})
+				pendingUser = false
+				turns++
+			}
 		case eventlog.EventCheckpoint:
 			turns++
 		case eventlog.EventPlanUpdate:
@@ -541,6 +577,7 @@ type SessionMessage struct {
 	DurationMs  int64              `json:"durationMs,omitempty"`
 	Parts       []tools.ResultPart `json:"parts,omitempty"`
 	Attachments []ChatAttachment   `json:"attachments,omitempty"`
+	Status      string             `json:"status,omitempty"`
 }
 
 // GetSessionMessages 返回当前活动会话的历史消息（从事件日志重建），
@@ -623,6 +660,17 @@ func sessionMessagesFromEventStore(store *eventlog.Store) []SessionMessage {
 				CreatedAt:  ev.TS.Format(time.RFC3339),
 				DurationMs: ev.Payload.DurationMs,
 				Parts:      parts,
+			})
+		case eventlog.EventTurnTerminal:
+			out = append(out, SessionMessage{
+				ID:         ev.ID,
+				Role:       "assistant",
+				Content:    ev.Payload.Content,
+				Model:      ev.Payload.Model,
+				CreatedAt:  ev.TS.Format(time.RFC3339),
+				DurationMs: ev.Payload.DurationMs,
+				Parts:      fromEventParts(ev.Payload.Parts),
+				Status:     ev.Payload.Status,
 			})
 		}
 	}
@@ -719,6 +767,8 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 			Status:           p.Status,
 			Input:            p.Input,
 			Output:           p.Output,
+			Stdout:           p.Stdout,
+			Stderr:           p.Stderr,
 			WorkingDirectory: p.WorkingDirectory,
 			ExitCode:         p.ExitCode,
 			StartedAt:        p.StartedAt,
@@ -736,6 +786,20 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 			Summary:          p.Summary,
 			Verdict:          p.Verdict,
 			Attempt:          p.Attempt,
+			NoticeKind:       p.NoticeKind,
+			Severity:         p.Severity,
+			Message:          p.Message,
+			RequestedModel:   p.RequestedModel,
+			EffectiveModel:   p.EffectiveModel,
+			RetryModel:       p.RetryModel,
+			UseCases:         append([]string(nil), p.UseCases...),
+			Reasons:          append([]string(nil), p.Reasons...),
+			Verifications:    append([]string(nil), p.Verifications...),
+			MetadataKeys:     append([]string(nil), p.MetadataKeys...),
+			RequestID:        p.RequestID,
+			ErrorCode:        p.ErrorCode,
+			HTTPStatus:       p.HTTPStatus,
+			Retryable:        p.Retryable,
 		})
 	}
 	return out
@@ -935,6 +999,8 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 			Status:           p.Status,
 			Input:            p.Input,
 			Output:           p.Output,
+			Stdout:           p.Stdout,
+			Stderr:           p.Stderr,
 			WorkingDirectory: p.WorkingDirectory,
 			ExitCode:         p.ExitCode,
 			StartedAt:        p.StartedAt,
@@ -952,6 +1018,20 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 			Summary:          p.Summary,
 			Verdict:          p.Verdict,
 			Attempt:          p.Attempt,
+			NoticeKind:       p.NoticeKind,
+			Severity:         p.Severity,
+			Message:          p.Message,
+			RequestedModel:   p.RequestedModel,
+			EffectiveModel:   p.EffectiveModel,
+			RetryModel:       p.RetryModel,
+			UseCases:         append([]string(nil), p.UseCases...),
+			Reasons:          append([]string(nil), p.Reasons...),
+			Verifications:    append([]string(nil), p.Verifications...),
+			MetadataKeys:     append([]string(nil), p.MetadataKeys...),
+			RequestID:        p.RequestID,
+			ErrorCode:        p.ErrorCode,
+			HTTPStatus:       p.HTTPStatus,
+			Retryable:        p.Retryable,
 		})
 	}
 	return out

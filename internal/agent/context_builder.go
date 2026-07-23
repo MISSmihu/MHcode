@@ -14,6 +14,7 @@ type ContextSection struct {
 type StableContext struct {
 	ProductIdentity string               `json:"productIdentity"`
 	SystemRules     []string             `json:"systemRules"`
+	RuntimePolicy   string               `json:"runtimePolicy"`
 	Reasoning       ReasoningProfile     `json:"reasoning"`
 	SkillsIndex     []skills.IndexEntry  `json:"skillsIndex"`
 	MCPSnapshots    []mcp.ServerSnapshot `json:"mcpSnapshots"`
@@ -46,6 +47,7 @@ func (ContextBuilder) Build(stable StableContext, volatile VolatileContext) Requ
 	prefix := []ContextSection{
 		{Name: "product_identity", Content: stable.ProductIdentity},
 		{Name: "system_rules", Content: joinLines(stable.SystemRules)},
+		{Name: "runtime_policy", Content: stable.RuntimePolicy},
 		{Name: "reasoning", Content: string(stable.Reasoning.ID) + ":" + stable.Reasoning.Budget.CachePolicy},
 		{Name: "skills_index", Content: skills.FormatStableIndex(stable.SkillsIndex)},
 		{Name: "mcp_schema_snapshot", Content: mcp.FormatSnapshots(stable.MCPSnapshots)},

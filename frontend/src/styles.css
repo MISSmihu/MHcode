@@ -3654,66 +3654,49 @@ body[data-theme="light"],
 }
 
 .composer-rich-input {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  align-content: flex-start;
+	display: block;
   min-width: 0;
-  min-height: 44px;
+	min-height: 38px;
   max-height: 118px;
-  gap: 5px;
-  overflow-y: auto;
+	overflow: hidden;
   cursor: text;
 }
 
-.composer-text-editor,
-.composer-tail-editor {
-  display: inline-block;
-  flex: 0 1 auto;
-  width: fit-content;
-  min-width: 1ch;
-  max-width: 100%;
-  min-height: 26px;
-  max-height: 110px;
-  padding: 2px 0;
+.composer-text-editor {
+	display: block;
+	width: 100%;
+	min-width: 0;
+	min-height: 34px;
+	max-height: 118px;
+	margin: 0;
+	padding: 5px 1px;
+	resize: none;
   overflow-y: auto;
   color: var(--text-primary);
+	font: inherit;
+	font-size: 14px;
+	letter-spacing: 0;
   background: transparent;
   border: 0;
   outline: 0;
-  line-height: 1.56;
+	line-height: 1.5;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+	caret-color: var(--text-primary);
 }
 
-.composer-text-editor:empty {
-  flex: 1 1 140px;
-  min-width: 80px;
-}
-
-.composer-rich-input.starts-with-link .composer-text-editor:empty {
-  flex: 0 0 0;
-  width: 0;
-  min-width: 0;
-  min-height: 0;
-  max-height: 0;
-  padding: 0;
-  overflow: hidden;
-}
-
-.composer-rich-input.starts-with-link .composer-text-editor:empty::before {
-  content: none;
-}
-
-.composer-tail-editor {
-  flex: 1 1 80px;
-  min-width: 28px;
-}
-
-.composer-text-editor:empty::before {
+.composer-text-editor::placeholder {
   color: var(--text-muted);
-  content: attr(data-placeholder);
-  pointer-events: none;
+	opacity: 1;
+}
+
+.composer-link-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	min-width: 0;
+	gap: 5px;
+	padding-top: 1px;
 }
 
 .composer-link-chip {
@@ -6674,6 +6657,15 @@ code,
 
 .op-stream-state.cancelled {
   color: var(--text-secondary);
+}
+
+.op-stream-elapsed {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding-left: 8px;
+	border-left: 1px solid var(--border-color);
+	font-variant-numeric: tabular-nums;
 }
 
 .op-compression-icon {
