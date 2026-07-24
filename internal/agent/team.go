@@ -529,7 +529,7 @@ func (s *Service) runTeamRole(
 		registry := s.buildReadOnlyRegistry()
 		budget := teamToolBudget(role, maxToolCalls)
 		if role == TeamRoleImplementer {
-			registry = s.buildToolRegistry()
+			registry = s.buildWorkerToolRegistry()
 		}
 		outcome, err = s.runStreamingToolLoop(ctx, provider, registry, request, budget, roleSink)
 	}

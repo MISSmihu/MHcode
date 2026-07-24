@@ -1,13 +1,14 @@
 // 设置中心与各设置面板、共享控件、抽屉侧栏面板（从 app.tsx 抽离）。
-import { For, Index, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Index, Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
+import { Portal } from "solid-js/web";
 import {
   AlertTriangle, Archive, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Bot, Braces,
-  Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Command, Cpu, Database, Download, ExternalLink, FileText,
+  Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Command, Cpu, Database, Download, ExternalLink, Eye, FileCode2, FileText,
   Folder, FolderOpen, Gauge, GitBranch, Globe2, Hash, HardDrive, Keyboard, KeyRound, LayoutList,
   ListFilter, LockKeyhole, MessageSquarePlus, Monitor, Moon, Network, Palette, Plug,
   Play, Plus, RefreshCw, Save, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles,
-  Square, Sun, Terminal, Trash2, User, Wrench, X, Zap,
+  Square, Sun, Terminal, Trash2, User, WrapText, Wrench, X, Zap,
   Users,
 } from "lucide-solid";
 import { ReasoningMenu } from "./components/ReasoningMenu";
@@ -21,6 +22,7 @@ import type {
   ProjectNode,
   ReasoningLevel,
   RuntimeSettings,
+  SkillDetail,
   TeamRole,
   UpdateState,
   UsageMetrics,
@@ -48,9 +50,15 @@ import {
   browserClearData, checkForUpdates, deleteAutomationTask, deleteBrowserCredential, downloadUpdate, getAppInfo,
   getAutomationState, getUpdateState, installUpdate, onAutomationState, onUpdateState, openAppRepositoryPage,
   openUpdateReleasePage, revealAppConfigFile, revealAppExecutable, runAutomationTaskNow, saveAutomationTask,
-  saveBrowserCredential, setAutomationTaskEnabled, stopAutomationTask,
+  saveBrowserCredential, setAutomationTaskEnabled, stopAutomationTask, openSkillFile, readSkillDetail, revealSkillFile,
 } from "./services/workbench";
 import type { ConfirmationRequest } from "./components/ConfirmDialog";
+import { handleCodeCopyClick, renderMarkdown } from "./lib/markdown";
+
+const SkillCodeViewer = lazy(async () => {
+  const module = await import("./components/CodeViewer");
+  return { default: module.CodeViewer };
+});
 
 export type SettingsCenterProps = {
   activeCategory: SettingsCategory;
@@ -272,7 +280,17 @@ export function SettingsCenter(props: SettingsCenterProps) {
             />
           </Match>
           <Match when={props.activeCategory === "skills"}>
-            <SkillsSettingsPanel skills={props.skills} snapshots={props.snapshots} />
+            <SkillsSettingsPanel
+              skills={props.skills}
+              snapshots={props.snapshots}
+              runtimeDraft={props.runtimeDraft}
+              runtimeDirty={props.runtimeDirty}
+              saveRuntime={props.saveRuntime}
+              savingRuntime={props.savingRuntime}
+              updateRuntimeDraft={props.updateRuntimeDraft}
+              resetRuntimeDraft={props.resetRuntimeDraft}
+              dark={props.themeMode === "dark"}
+            />
           </Match>
           <Match when={props.activeCategory === "commands"}>
             <CommandSettingsPanel runtimeDraft={props.runtimeDraft} skills={props.skills} snapshots={props.snapshots} />
@@ -1886,10 +1904,76 @@ export function TeamSettingsPanel(props: {
 export function SkillsSettingsPanel(props: {
   skills: WorkbenchState["skillsIndex"];
   snapshots: WorkbenchState["mcpSnapshots"];
+  runtimeDraft: RuntimeSettings;
+  runtimeDirty: boolean;
+  saveRuntime: () => void;
+  savingRuntime: boolean;
+  updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
+  resetRuntimeDraft: () => void;
+  dark: boolean;
 }) {
   const builtin = createMemo(() => props.snapshots.find((snapshot) => snapshot.server === "builtin"));
+  const [expandedSkill, setExpandedSkill] = createSignal("");
+  const [detail, setDetail] = createSignal<SkillDetail>();
+  const [detailBusy, setDetailBusy] = createSignal("");
+  const [detailError, setDetailError] = createSignal("");
+  const [wrapDetail, setWrapDetail] = createSignal(false);
+  const [detailMode, setDetailMode] = createSignal<"document" | "source">("document");
+
+  const disabledSkills = createMemo(() => new Set(props.runtimeDraft.skills?.disabled ?? []));
+  const skillEnabled = (name: string) => !disabledSkills().has(name);
+
+  const updateSkillEnabled = (name: string, enabled: boolean) => {
+    const current = props.runtimeDraft.skills ?? { disabled: [] };
+    const disabled = new Set(current.disabled ?? []);
+    if (enabled) disabled.delete(name);
+    else disabled.add(name);
+    props.updateRuntimeDraft({ skills: { ...current, disabled: Array.from(disabled).sort() } });
+  };
+
+  const loadDetail = async (name: string) => {
+    setDetailBusy(name);
+    setDetailError("");
+    try {
+      setDetail(await readSkillDetail(name));
+    } catch (cause) {
+      setDetail(undefined);
+      setDetailError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDetailBusy("");
+    }
+  };
+
+  const openDetail = (name: string) => {
+    setExpandedSkill(name);
+    setDetailMode("document");
+    void loadDetail(name);
+  };
+
+  const closeDetail = () => setDetail(undefined);
+
+  onMount(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || !detail()) return;
+      event.preventDefault();
+      closeDetail();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    onCleanup(() => window.removeEventListener("keydown", handleKeyDown));
+  });
+
+  const runSkillFileAction = async (action: "open" | "reveal", name: string) => {
+    setDetailError("");
+    try {
+      if (action === "open") await openSkillFile(name);
+      else await revealSkillFile(name);
+    } catch (cause) {
+      setDetailError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
   return (
-    <div class="settings-page-body">
+    <div class="settings-page-body skills-settings-page">
       <PanelSection icon={<Wrench size={16} />} title={`内置 Agent 工具 · ${formatInteger(builtin()?.tools.length ?? 0)}`}>
         <div class="agent-tool-list">
           <For each={builtin()?.tools ?? []} fallback={<p class="empty-line">当前运行时未暴露内置工具</p>}>
@@ -1909,29 +1993,206 @@ export function SkillsSettingsPanel(props: {
           </For>
         </div>
       </PanelSection>
+
       <PanelSection icon={<Sparkles size={16} />} title="Skills">
-        <div class="item-list">
+        <div class="skills-list">
           <For each={props.skills} fallback={<p class="empty-line">未发现 Skill</p>}>
-            {(skill) => (
-              <div class="resource-row">
-                <strong>{skill.name}</strong>
-                <span>{skill.summary}</span>
-                <code>{shortHash(skill.sha256)}</code>
-              </div>
-            )}
+            {(skill) => {
+              const enabled = () => skillEnabled(skill.name);
+              const expanded = () => expandedSkill() === skill.name;
+              return (
+                <article class="skill-resource-row" classList={{ disabled: !enabled(), expanded: expanded() }}>
+                  <div class="skill-resource-head">
+                    <span class="agent-tool-icon" aria-hidden="true"><Sparkles size={15} /></span>
+                    <div class="skill-resource-copy">
+                      <strong>{skill.name}</strong>
+                      <span>{skill.summary}</span>
+                    </div>
+                    <code title={skill.sha256}>{shortHash(skill.sha256)}</code>
+                    <div class="skill-resource-actions">
+                      <button
+                        type="button"
+                        class="settings-square-button"
+                        title={expanded() ? "收起 Skill 详情" : "查看 Skill 详情"}
+                        aria-label={expanded() ? "收起 Skill 详情" : "查看 Skill 详情"}
+                        aria-expanded={expanded()}
+                        onClick={() => setExpandedSkill(expanded() ? "" : skill.name)}
+                      >
+                        {expanded() ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </button>
+                      <button
+                        type="button"
+                        class="settings-square-button"
+                        title="打开 SKILL.md 查看器"
+                        aria-label="打开 SKILL.md 查看器"
+                        disabled={detailBusy() === skill.name}
+                        onClick={() => openDetail(skill.name)}
+                      >
+                        <Show when={detailBusy() !== skill.name} fallback={<RefreshCw size={14} class="spinning" />}>
+                          <Eye size={14} />
+                        </Show>
+                      </button>
+                      <SwitchControl checked={enabled()} label={`启用 ${skill.name}`} onChange={(value) => updateSkillEnabled(skill.name, value)} />
+                    </div>
+                  </div>
+                  <Show when={expanded()}>
+                    <div class="skill-resource-details">
+                      <div class="skill-detail-grid">
+                        <span><b>来源</b>{skillSourceLabel(skill.source)}</span>
+                        <span><b>触发</b>{skill.trigger || "手动"}</span>
+                        <span><b>版本</b>v{skill.version}</span>
+                        <span><b>文件</b>{skill.path || "内置资源"}</span>
+                      </div>
+                      <p>{skill.description || "没有额外描述。"}</p>
+                      <div class="skill-detail-actions">
+                        <button type="button" class="settings-soft-button" disabled={detailBusy() === skill.name} onClick={() => openDetail(skill.name)}>
+                          <FileCode2 size={14} />查看正文
+                        </button>
+                        <Show when={skill.source !== "bundled" && skill.source !== "preview"}>
+                          <button type="button" class="settings-soft-button" onClick={() => void runSkillFileAction("open", skill.name)}>
+                            <ExternalLink size={14} />系统打开
+                          </button>
+                          <button type="button" class="settings-soft-button" onClick={() => void runSkillFileAction("reveal", skill.name)}>
+                            <FolderOpen size={14} />定位文件
+                          </button>
+                        </Show>
+                      </div>
+                    </div>
+                  </Show>
+                </article>
+              );
+            }}
           </For>
         </div>
+        <Show when={detailError()}>
+          <p class="settings-inline-error">{detailError()}</p>
+        </Show>
+        <RuntimeSaveActions
+          dirty={props.runtimeDirty}
+          reset={props.resetRuntimeDraft}
+          save={props.saveRuntime}
+          saving={props.savingRuntime}
+        />
       </PanelSection>
+
       <PanelSection icon={<FileText size={16} />} title="加载链路">
         <div class="route-stack">
-          <RouteStep icon={<Sparkles size={15} />} title="Skills index" detail={`${formatInteger(props.skills.length)} loaded`} />
+          <RouteStep icon={<Sparkles size={15} />} title="Skills index" detail={`${formatInteger(props.skills.filter((skill) => skillEnabled(skill.name)).length)} enabled / ${formatInteger(props.skills.length)} total`} />
           <RouteStep icon={<Wrench size={15} />} title="Built-in tools" detail={`${formatInteger(builtin()?.tools.length ?? 0)} callable`} />
           <RouteStep icon={<Network size={15} />} title="MCP schema" detail={`${formatInteger(props.snapshots.filter((snapshot) => snapshot.server !== "builtin").length)} external snapshot`} />
           <RouteStep icon={<FileText size={15} />} title="Summary-first results" detail="raw output stays local" />
         </div>
       </PanelSection>
+
+      <Show when={detail()}>
+        {(current) => (
+          <Portal>
+            <div class="skill-viewer-overlay" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) closeDetail(); }}>
+              <section class="skill-viewer-dialog" classList={{ "source-mode": detailMode() === "source" }} role="dialog" aria-modal="true" aria-labelledby="skill-viewer-title">
+                <header class="skill-viewer-head">
+                  <div class="skill-viewer-identity">
+                    <span class="skill-viewer-icon" aria-hidden="true"><Sparkles size={18} /></span>
+                    <div class="skill-viewer-copy">
+                      <div class="skill-viewer-title-line">
+                        <h2 id="skill-viewer-title">{skillDisplayTitle(current())}</h2>
+                        <span class="skill-viewer-kind">Skill</span>
+                      </div>
+                      <p>{current().summary || current().description}</p>
+                      <div class="skill-viewer-meta" aria-label="Skill 状态">
+                        <span>{skillSourceLabel(current().source)}</span>
+                        <span>v{current().version}</span>
+                        <span classList={{ enabled: skillEnabled(current().name), disabled: !skillEnabled(current().name) }}>
+                          {skillEnabled(current().name) ? "已启用" : "已停用"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="skill-viewer-actions">
+                    <SwitchControl checked={skillEnabled(current().name)} label={`启用 ${current().name}`} onChange={(value) => updateSkillEnabled(current().name, value)} />
+                    <Show when={current().canOpen}>
+                      <button type="button" class="skill-viewer-host-action" title="使用系统应用打开" aria-label="使用系统应用打开" onClick={() => void runSkillFileAction("open", current().name)}><ExternalLink size={15} /></button>
+                      <button type="button" class="skill-viewer-host-action" title="在文件夹中显示" aria-label="在文件夹中显示" onClick={() => void runSkillFileAction("reveal", current().name)}><FolderOpen size={15} /></button>
+                    </Show>
+                    <button type="button" title="关闭 Skill 详情" aria-label="关闭 Skill 详情" onClick={closeDetail}><X size={16} /></button>
+                  </div>
+                </header>
+
+                <nav class="skill-viewer-tabs" aria-label="Skill 查看方式">
+                  <button type="button" classList={{ active: detailMode() === "document" }} aria-pressed={detailMode() === "document"} onClick={() => setDetailMode("document")}>
+                    <FileText size={14} />文档
+                  </button>
+                  <button type="button" classList={{ active: detailMode() === "source" }} aria-pressed={detailMode() === "source"} onClick={() => setDetailMode("source")}>
+                    <FileCode2 size={14} />源码
+                  </button>
+                  <span class="skill-viewer-path" title={current().path || "SKILL.md"}>{current().path || "SKILL.md"}</span>
+                  <Show when={detailMode() === "source"}>
+                    <button type="button" class="skill-viewer-wrap" classList={{ active: wrapDetail() }} title="自动换行" aria-label="自动换行" aria-pressed={wrapDetail()} onClick={() => setWrapDetail((value) => !value)}><WrapText size={14} /></button>
+                  </Show>
+                </nav>
+
+                <div class="skill-viewer-body" classList={{ document: detailMode() === "document", source: detailMode() === "source" }}>
+                  <Show
+                    when={detailMode() === "document"}
+                    fallback={
+                      <Suspense fallback={<div class="skill-viewer-loading"><RefreshCw size={16} class="spinning" />正在加载查看器</div>}>
+                        <SkillCodeViewer content={current().content} path={current().path || `${current().name}.md`} wrap={wrapDetail()} dark={props.dark} />
+                      </Suspense>
+                    }
+                  >
+                    <div class="skill-document-scroll">
+                      <article
+                        class="skill-document md-body"
+                        onClick={handleCodeCopyClick}
+                        innerHTML={renderMarkdown(skillDocumentBody(current().content), { expandCodeBlocks: true })}
+                      />
+                    </div>
+                  </Show>
+                </div>
+
+                <footer class="skill-viewer-foot">
+                  <span><Hash size={12} />{shortHash(current().sha256)}</span>
+                  <span>{skillEnabled(current().name) ? "参与自动匹配与 Agent 上下文" : "不参与自动匹配"}</span>
+                </footer>
+              </section>
+            </div>
+          </Portal>
+        )}
+      </Show>
     </div>
   );
+}
+
+function skillSourceLabel(source?: string): string {
+  switch (source) {
+    case "bundled": return "内置";
+    case "project": return "当前项目";
+    case "local": return "本机 Skills";
+    case "preview": return "预览模式";
+    default: return source || "未知来源";
+  }
+}
+
+function skillDisplayTitle(skill: SkillDetail): string {
+  const heading = skillDocumentSource(skill.content).match(/^#\s+(.+)$/m)?.[1]?.trim();
+  if (heading && heading.replace(/[*_`]/g, "") !== skill.name) return heading.replace(/[*_`]/g, "");
+  return skill.name
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((part) => part.toLowerCase() === "mhcode" ? "MHcode" : part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function skillDocumentBody(content: string): string {
+  return skillDocumentSource(content).replace(/^\s*#\s+[^\n]+(?:\n+|$)/, "").trim();
+}
+
+function skillDocumentSource(content: string): string {
+  const source = (content ?? "").replace(/^\uFEFF/, "");
+  const lines = source.split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return source.trim();
+  const closingOffset = lines.slice(1).findIndex((line) => line.trim() === "---");
+  if (closingOffset < 0) return source.trim();
+  return lines.slice(closingOffset + 2).join("\n").trim();
 }
 
 function builtinToolDescription(name: string): string {
@@ -3799,10 +4060,10 @@ export function SettingsRow(props: {
   );
 }
 
-export function SwitchControl(props: { checked: boolean; onChange: (checked: boolean) => void }) {
+export function SwitchControl(props: { checked: boolean; label?: string; onChange: (checked: boolean) => void }) {
   return (
     <label class="settings-switch">
-      <input type="checkbox" checked={props.checked} onChange={(event) => props.onChange(event.currentTarget.checked)} />
+      <input aria-label={props.label} type="checkbox" checked={props.checked} onChange={(event) => props.onChange(event.currentTarget.checked)} />
       <span aria-hidden="true">
         <span />
       </span>

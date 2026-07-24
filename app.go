@@ -500,6 +500,23 @@ func (a *App) ReadWorkspaceFile(path string) (agent.WorkspaceFilePreview, error)
 	return a.service.ReadWorkspaceFile(path)
 }
 
+// ReadSkillDetail returns the selected Skill's bounded SKILL.md source for
+// the settings viewer. The agent service resolves the name against indexed
+// Skill roots before reading it.
+func (a *App) ReadSkillDetail(name string) (agent.SkillDetail, error) {
+	return a.service.ReadSkillDetail(name)
+}
+
+// OpenSkillFile opens a disk-backed Skill source through the host application.
+func (a *App) OpenSkillFile(name string) error {
+	return a.service.OpenSkillFile(name)
+}
+
+// RevealSkillFile selects a disk-backed Skill source in the host file manager.
+func (a *App) RevealSkillFile(name string) error {
+	return a.service.RevealSkillFile(name)
+}
+
 // ListWorkspaceDirectory returns one project-scoped directory level for the
 // right-side file explorer.
 func (a *App) ListWorkspaceDirectory(path string) (agent.WorkspaceDirectoryListing, error) {

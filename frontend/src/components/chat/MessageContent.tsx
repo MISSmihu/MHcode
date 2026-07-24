@@ -7,12 +7,14 @@ import {
   ChevronRight,
   Circle,
   Eye,
+	EyeOff,
   ExternalLink,
   FileCode2,
   FolderOpen,
   GitBranch,
   Globe2,
   Image as ImageIcon,
+	KeyRound,
   LoaderCircle,
   Monitor,
   Pencil,
@@ -30,6 +32,7 @@ import { parseWorkspaceFileRangeCandidate, parseWorkspacePathCandidate } from ".
 import { inlineDiffStats } from "../../lib/inline-diff";
 import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench";
 import { formatElapsedDuration } from "../../lib/duration";
+import { writeClipboardText } from "../../lib/clipboard";
 import { InlineCodePreview } from "./InlineCodePreview";
 import { InlineDiffPreview } from "./InlineDiffPreview";
 
@@ -45,6 +48,9 @@ export function MessageContent(props: {
   onPreviewFile?: (path: string) => void | Promise<void>;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
+	onRevealSecret?: (secretID: string) => Promise<string>;
+	isDisclosureOpen?: (key: string) => boolean;
+	onDisclosureChange?: (key: string, open: boolean) => void;
 }) {
   const renderedParts = createMemo(() => withInferredFileArtifacts(props.parts, props.inferFileArtifacts !== false));
   const blocks = createMemo(() => groupRenderBlocks(renderedParts()));
@@ -67,6 +73,8 @@ export function MessageContent(props: {
                 onPreviewFile={props.onPreviewFile}
                 onOpenWorkspaceFile={props.onOpenWorkspaceFile}
                 onOpenURL={props.onOpenURL}
+				isDisclosureOpen={props.isDisclosureOpen}
+				onDisclosureChange={props.onDisclosureChange}
               />
             </Match>
             <Match when={block.kind === "team"}>
@@ -74,9 +82,18 @@ export function MessageContent(props: {
                 <TeamRun parts={(block as TeamRenderBlock).parts} />
               </Show>
             </Match>
+            <Match when={block.kind === "subagents"}>
+              <SubagentRun parts={(block as SubagentRenderBlock).parts} />
+            </Match>
             <Match when={block.kind === "provider"}>
               <ProviderNotice part={(block as ProviderRenderBlock).part} />
             </Match>
+			<Match when={block.kind === "secret"}>
+			  <SecretResultCard
+				part={(block as SecretRenderBlock).part}
+				onReveal={props.onRevealSecret}
+			  />
+			</Match>
           </Switch>
         )}
       </For>
@@ -100,42 +117,56 @@ type FilePart = Extract<MessagePart, { kind: "file" }>;
 export type TaskProgressPart = Extract<MessagePart, { kind: "task_progress" }>;
 type WebSearchPart = Extract<MessagePart, { kind: "web_search_results" }>;
 export type TeamPart = Extract<MessagePart, { kind: "team_role" }>;
+export type SubagentPart = Extract<MessagePart, { kind: "subagent" }>;
 type ProviderNoticePart = Extract<MessagePart, { kind: "provider_notice" }>;
+type SecretResultPart = Extract<MessagePart, { kind: "secret_result" }>;
 type TextRenderBlock = { kind: "text"; part: TextPart };
 type ActivityRenderBlock = { kind: "activity"; parts: MessagePart[] };
 type TeamRenderBlock = { kind: "team"; parts: TeamPart[] };
+type SubagentRenderBlock = { kind: "subagents"; parts: SubagentPart[] };
 type ProviderRenderBlock = { kind: "provider"; part: ProviderNoticePart };
-type RenderBlock = TextRenderBlock | ActivityRenderBlock | TeamRenderBlock | ProviderRenderBlock;
+type SecretRenderBlock = { kind: "secret"; part: SecretResultPart };
+type RenderBlock = TextRenderBlock | ActivityRenderBlock | TeamRenderBlock | SubagentRenderBlock | ProviderRenderBlock | SecretRenderBlock;
 type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "browser" | "computer" | "open" | "file" | "tool";
 type ActivityItem = { category: ActivityCategory; parts: MessagePart[] };
+type DisclosureProps = {
+	isDisclosureOpen?: (key: string) => boolean;
+	onDisclosureChange?: (key: string, open: boolean) => void;
+};
 
 function ActivityGroup(props: {
   parts: MessagePart[];
   onPreviewFile?: (path: string) => void | Promise<void>;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
-}) {
+} & DisclosureProps) {
   const items = createMemo(() => buildActivityItems(props.parts));
   const artifacts = createMemo(() => activityArtifacts(props.parts));
   return (
     <>
       <div class="op-activity-feed">
         <For each={items()}>
-          {(item) => (
+          {(item, index) => (
             <ActivityRow
               item={item}
+			  disclosureKey={activityDisclosureKey(item, index())}
               onOpenURL={props.onOpenURL}
               onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+			  isDisclosureOpen={props.isDisclosureOpen}
+			  onDisclosureChange={props.onDisclosureChange}
             />
           )}
         </For>
       </div>
       <For each={artifacts()}>
-        {(part) => (
+        {(part, index) => (
           <FileCard
             part={part}
+			disclosureKey={`file:${index()}:${part.path}`}
             onPreviewFile={props.onPreviewFile}
             onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+			isDisclosureOpen={props.isDisclosureOpen}
+			onDisclosureChange={props.onDisclosureChange}
           />
         )}
       </For>
@@ -145,14 +176,17 @@ function ActivityGroup(props: {
 
 function ActivityRow(props: {
   item: ActivityItem;
+	disclosureKey: string;
   onOpenURL?: (url: string) => void | Promise<void>;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
-}) {
+} & DisclosureProps) {
   const status = () => activityStatus(props.item);
   return (
     <details
       class="op-activity-item"
       classList={{ [status()]: true }}
+	  open={props.isDisclosureOpen?.(props.disclosureKey)}
+	  onToggle={(event) => props.onDisclosureChange?.(props.disclosureKey, event.currentTarget.open)}
     >
       <summary title={activityTitle(props.item)}>
         <span class="op-activity-icon"><ActivityIcon category={props.item.category} /></span>
@@ -168,17 +202,26 @@ function ActivityRow(props: {
       <div class="op-activity-body">
         <Show when={props.item.category === "command"} fallback={
           <For each={props.item.parts}>
-            {(part) => (
+            {(part, index) => (
               <Switch>
                 <Match when={part.kind === "tool_call"}>
                   <ToolDetail
                     part={part as ToolPart}
+					disclosureKey={`tool:${index()}:${partDisclosureIdentity(part)}`}
                     hideOutput={props.item.parts.some((item) => item.kind === "web_search_results")}
                     onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+					isDisclosureOpen={props.isDisclosureOpen}
+					onDisclosureChange={props.onDisclosureChange}
                   />
                 </Match>
                 <Match when={part.kind === "diff"}>
-                  <DiffDetail part={part as DiffPart} onOpenWorkspaceFile={props.onOpenWorkspaceFile} />
+				  <DiffDetail
+					part={part as DiffPart}
+					disclosureKey={`diff:${index()}:${partDisclosureIdentity(part)}`}
+					onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+					isDisclosureOpen={props.isDisclosureOpen}
+					onDisclosureChange={props.onDisclosureChange}
+				  />
                 </Match>
                 <Match when={part.kind === "web_search_results"}>
                   <WebSearchResults part={part as WebSearchPart} onOpenURL={props.onOpenURL} />
@@ -187,20 +230,31 @@ function ActivityRow(props: {
             )}
           </For>
         }>
-          <CommandActivityList parts={props.item.parts} />
+		  <CommandActivityList
+			parts={props.item.parts}
+			isDisclosureOpen={props.isDisclosureOpen}
+			onDisclosureChange={props.onDisclosureChange}
+		  />
         </Show>
       </div>
     </details>
   );
 }
 
-function CommandActivityList(props: { parts: MessagePart[] }) {
+function CommandActivityList(props: { parts: MessagePart[] } & DisclosureProps) {
   const commands = createMemo(() => props.parts.filter((part): part is ToolPart => part.kind === "tool_call"));
   return (
     <div class="op-command-list">
       <For each={commands()}>
-        {(part) => (
-          <details class="op-command-entry" classList={{ [part.status ?? "ok"]: true }}>
+        {(part, index) => {
+		  const disclosureKey = () => `command:${index()}:${partDisclosureIdentity(part)}`;
+		  return (
+          <details
+			class="op-command-entry"
+			classList={{ [part.status ?? "ok"]: true }}
+			open={props.isDisclosureOpen?.(disclosureKey())}
+			onToggle={(event) => props.onDisclosureChange?.(disclosureKey(), event.currentTarget.open)}
+		  >
             <summary title={commandDisplayInput(part)}>
               <span class="op-command-state" aria-hidden="true">
                 <Show when={part.status === "running"} fallback={
@@ -217,7 +271,8 @@ function CommandActivityList(props: { parts: MessagePart[] }) {
             </summary>
             <ShellToolDetail part={part} />
           </details>
-        )}
+		  );
+		}}
       </For>
     </div>
   );
@@ -241,9 +296,10 @@ function ActivityIcon(props: { category: ActivityCategory }) {
 
 function ToolDetail(props: {
   part: ToolPart;
+	disclosureKey: string;
   hideOutput?: boolean;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
-}) {
+} & DisclosureProps) {
   if (props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh") {
     return <ShellToolDetail part={props.part} />;
   }
@@ -290,6 +346,8 @@ function ToolDetail(props: {
             path={readReference()?.path ?? ""}
             content={props.part.output ?? ""}
             startLine={readReference()?.startLine}
+			expanded={props.isDisclosureOpen?.(`${props.disclosureKey}:code`)}
+			onExpandedChange={(open) => props.onDisclosureChange?.(`${props.disclosureKey}:code`, open)}
             onOpen={props.onOpenWorkspaceFile ? () => {
               const reference = readReference();
               if (reference) void props.onOpenWorkspaceFile?.(reference.path, "file", reference.startLine);
@@ -395,14 +453,17 @@ function LivePartElapsed(props: { startedAt?: string }) {
 
 function DiffDetail(props: {
   part: DiffPart;
+	disclosureKey: string;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
-}) {
+} & DisclosureProps) {
   return (
     <InlineDiffPreview
       path={props.part.path}
       patch={props.part.patch}
       additions={props.part.additions}
       deletions={props.part.deletions}
+	  expanded={props.isDisclosureOpen?.(props.disclosureKey)}
+	  onExpandedChange={(open) => props.onDisclosureChange?.(props.disclosureKey, open)}
       onOpen={props.onOpenWorkspaceFile
         ? () => void props.onOpenWorkspaceFile?.(props.part.path, "changes")
         : undefined}
@@ -509,7 +570,9 @@ function isChangedFilePart(part: FilePart): boolean {
 function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
   const blocks: RenderBlock[] = [];
   const teamParts = parts.filter((part): part is TeamPart => part.kind === "team_role");
+  const subagentParts = parts.filter((part): part is SubagentPart => part.kind === "subagent");
   let teamAdded = false;
+  let subagentsAdded = false;
   for (const part of parts) {
     if (part.kind === "text") {
       blocks.push({ kind: "text", part });
@@ -526,10 +589,24 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       }
       continue;
     }
+    if (part.kind === "subagent") {
+      if (!subagentsAdded) {
+        blocks.push({ kind: "subagents", parts: subagentParts });
+        subagentsAdded = true;
+      }
+      continue;
+    }
+    if (part.kind === "tool_call" && part.name === "delegate_task" && subagentParts.length > 0) {
+      continue;
+    }
     if (part.kind === "provider_notice") {
       blocks.push({ kind: "provider", part });
       continue;
     }
+	if (part.kind === "secret_result") {
+	  blocks.push({ kind: "secret", part });
+	  continue;
+	}
     const previous = blocks.at(-1);
     if (previous?.kind === "activity") {
       previous.parts.push(part);
@@ -579,7 +656,9 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
   if (part.kind === "web_search_results") return "web";
   if (part.kind === "task_progress") return "tool";
   if (part.kind === "team_role") return "tool";
+  if (part.kind === "subagent") return "tool";
   if (part.kind === "provider_notice") return "tool";
+	if (part.kind === "secret_result") return "tool";
   switch (part.name) {
     case "run_command":
     case "terminal":
@@ -600,6 +679,36 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
     case "delete_file": return "edit";
     default: return "tool";
   }
+}
+
+function activityDisclosureKey(item: ActivityItem, index: number): string {
+	return `activity:${index}:${item.category}:${partDisclosureIdentity(item.parts[0])}`;
+}
+
+function partDisclosureIdentity(part: MessagePart | undefined): string {
+	if (!part) return "empty";
+	switch (part.kind) {
+		case "tool_call":
+			return part.toolCallId || `${part.name}:${part.input ?? ""}`;
+		case "diff":
+			return `diff:${part.path}`;
+		case "file":
+			return `file:${part.path}`;
+		case "web_search_results":
+			return `web:${part.query}`;
+		case "team_role":
+			return `team:${part.role}:${part.attempt ?? 1}`;
+		case "subagent":
+			return `subagent:${part.taskId}`;
+		case "provider_notice":
+			return `provider:${part.noticeKind}:${part.requestId ?? ""}`;
+		case "secret_result":
+			return `secret:${part.secretId}`;
+		case "task_progress":
+			return "progress";
+		case "text":
+			return "text";
+	}
 }
 
 function ProviderNotice(props: { part: ProviderNoticePart }) {
@@ -662,6 +771,85 @@ function ProviderNotice(props: { part: ProviderNoticePart }) {
       </span>
     </section>
   );
+}
+
+export function SubagentRun(props: { parts: SubagentPart[] }) {
+  const completed = createMemo(() => props.parts.filter((part) => part.status === "completed").length);
+  const running = createMemo(() => props.parts.filter((part) => part.status === "running").length);
+  return (
+    <section class="op-subagent-run" aria-label="动态子代理执行记录">
+      <header class="op-subagent-head">
+        <span class="op-subagent-mark" aria-hidden="true"><Route size={14} /></span>
+        <span class="op-subagent-title">
+          <strong>子代理</strong>
+          <small>{running() > 0 ? `${running()} 个正在工作` : `${completed()}/${props.parts.length} 已完成`}</small>
+        </span>
+      </header>
+      <div class="op-subagent-list">
+        <For each={props.parts}>
+          {(part) => (
+            <article class="op-subagent-item" classList={{ [part.status || "pending"]: true }}>
+              <span class="op-subagent-status" aria-hidden="true"><SubagentStatus status={part.status} /></span>
+              <span class="op-subagent-main">
+                <span class="op-subagent-name">
+                  <strong>{part.label || "子任务"}</strong>
+                  <small>{subagentTypeLabel(part.agentType)}</small>
+                </span>
+                <small class="op-subagent-meta">
+                  {part.model || "跟随当前模型"}
+                  {part.durationMs !== undefined ? ` · ${formatElapsedDuration(part.durationMs)}` : ""}
+                  {part.changedFiles ? ` · ${part.changedFiles} 个文件` : ""}
+                </small>
+                <Show when={part.currentAction && part.status !== "completed"}>
+                  <span class="op-subagent-action">{part.currentAction}</span>
+                </Show>
+              </span>
+              <Show when={(part.steps?.length ?? 0) > 0 || part.summary}>
+                <details class="op-subagent-details">
+                  <summary>查看工作记录 <ChevronRight size={12} /></summary>
+                  <Show when={(part.steps?.length ?? 0) > 0}>
+                    <ol class="op-subagent-steps">
+                      <For each={part.steps ?? []}>
+                        {(step) => <li classList={{ [step.status]: true }}>{step.title}</li>}
+                      </For>
+                    </ol>
+                  </Show>
+                  <Show when={part.summary}>
+                    <p>{part.summary}</p>
+                  </Show>
+                </details>
+              </Show>
+            </article>
+          )}
+        </For>
+      </div>
+    </section>
+  );
+}
+
+function SubagentStatus(props: { status?: string }) {
+  return (
+    <Show when={props.status === "completed"} fallback={
+      <Show when={props.status === "error" || props.status === "cancelled"} fallback={
+        <Show when={props.status === "running"} fallback={<Circle size={11} />}>
+          <span class="op-subagent-spinner" />
+        </Show>
+      }>
+        <AlertCircle size={12} />
+      </Show>
+    }>
+      <Check size={12} />
+    </Show>
+  );
+}
+
+function subagentTypeLabel(agentType: string): string {
+  switch (agentType) {
+    case "explore": return "探索";
+    case "review": return "审阅";
+    case "implement": return "实现";
+    default: return agentType || "任务";
+  }
 }
 
 export function TeamRun(props: { parts: TeamPart[]; docked?: boolean }) {
@@ -933,6 +1121,108 @@ function WebSearchResults(props: {
   );
 }
 
+function SecretResultCard(props: {
+  part: SecretResultPart;
+  onReveal?: (secretID: string) => Promise<string>;
+}) {
+  const [value, setValue] = createSignal("");
+  const [revealed, setRevealed] = createSignal(false);
+  const [busy, setBusy] = createSignal<"reveal" | "copy" | "">("");
+  const [copied, setCopied] = createSignal(false);
+  const [error, setError] = createSignal("");
+  let hideTimer: number | undefined;
+
+  const clearHideTimer = () => {
+    if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+    hideTimer = undefined;
+  };
+  const hide = () => {
+    clearHideTimer();
+    setRevealed(false);
+    setValue("");
+  };
+  const loadValue = async () => {
+    if (!props.onReveal) throw new Error("当前视图无法读取该敏感结果。");
+    return props.onReveal(props.part.secretId);
+  };
+  const toggleReveal = async () => {
+    if (revealed()) {
+      hide();
+      return;
+    }
+    setBusy("reveal");
+    setError("");
+    try {
+      const nextValue = await loadValue();
+      setValue(nextValue);
+      setRevealed(true);
+      clearHideTimer();
+      hideTimer = window.setTimeout(hide, 60_000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+  const copyValue = async () => {
+    setBusy("copy");
+    setError("");
+    try {
+      const nextValue = value() || await loadValue();
+      await writeClipboardText(nextValue);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_400);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  onCleanup(clearHideTimer);
+
+  return (
+    <section class="op-secret-result" classList={{ error: props.part.status === "error" }} aria-label="敏感结果">
+      <div class="op-secret-result-icon" aria-hidden="true"><KeyRound size={16} /></div>
+      <div class="op-secret-result-main">
+        <strong>{props.part.secretLabel || "远程敏感结果"}</strong>
+        <Show when={props.part.secretSource}><small>{props.part.secretSource}</small></Show>
+        <Show
+          when={revealed()}
+          fallback={<span class="op-secret-result-mask">内容已安全保存，查看时才从本机凭据库读取</span>}
+        >
+          <code class="op-secret-result-value">{value()}</code>
+        </Show>
+        <Show when={error()}><span class="op-secret-result-error">{error()}</span></Show>
+      </div>
+      <div class="op-secret-result-actions">
+        <button
+          type="button"
+          disabled={Boolean(busy()) || !props.onReveal}
+          title={revealed() ? "隐藏敏感结果" : "查看敏感结果"}
+          onClick={() => void toggleReveal()}
+        >
+          <Show when={busy() === "reveal"} fallback={revealed() ? <EyeOff size={14} /> : <Eye size={14} />}>
+            <LoaderCircle class="spinning" size={14} />
+          </Show>
+          {revealed() ? "隐藏" : "查看"}
+        </button>
+        <button
+          type="button"
+          disabled={Boolean(busy()) || !props.onReveal}
+          title="复制敏感结果"
+          onClick={() => void copyValue()}
+        >
+          <Show when={busy() === "copy"} fallback={copied() ? <Check size={14} /> : <Copy size={14} />}>
+            <LoaderCircle class="spinning" size={14} />
+          </Show>
+          {copied() ? "已复制" : "复制"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function activityArtifacts(parts: MessagePart[]): FilePart[] {
   const byPath = new Map<string, FilePart>();
   for (const part of parts) {
@@ -969,9 +1259,10 @@ function isImagePath(path: string): boolean {
 
 function FileCard(props: {
   part: Extract<MessagePart, { kind: "file" }>;
+	disclosureKey: string;
   onPreviewFile?: (path: string) => void | Promise<void>;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
-}) {
+} & DisclosureProps) {
   const [busyAction, setBusyAction] = createSignal<"view" | "preview" | "open" | "reveal" | "">("");
   const [error, setError] = createSignal("");
   const fileName = () => baseName(props.part.path);
@@ -1010,7 +1301,11 @@ function FileCard(props: {
   };
 
   return (
-    <details class="op-file-artifact" open={error() ? true : undefined}>
+	<details
+	  class="op-file-artifact"
+	  open={error() ? true : props.isDisclosureOpen?.(props.disclosureKey)}
+	  onToggle={(event) => props.onDisclosureChange?.(props.disclosureKey, event.currentTarget.open)}
+	>
       <summary class="op-file" title={props.part.path}>
         <span class="op-file-icon" aria-hidden="true">
           <Show when={isHTML()} fallback={<FileCode2 size={18} />}>

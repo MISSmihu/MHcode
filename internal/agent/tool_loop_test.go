@@ -828,6 +828,97 @@ func TestToolLoopPersistsSnapshotBeforeFinalCompletion(t *testing.T) {
 	}
 }
 
+func TestAdaptiveToolCallBudgetOnlyLimitsCredentialLookup(t *testing.T) {
+	lookup := []protocol.Message{{
+		Role:    "user",
+		Content: "使用 mhcode-credential://ssh-test 读取服务器里的管理员密码",
+	}}
+	if got := adaptiveToolCallBudget(lookup, 32); got != 8 {
+		t.Fatalf("lookup budget = %d, want 8", got)
+	}
+	deployment := []protocol.Message{{
+		Role:    "user",
+		Content: "使用 mhcode-credential://ssh-test 部署网站并排障",
+	}}
+	if got := adaptiveToolCallBudget(deployment, 32); got != 32 {
+		t.Fatalf("deployment budget = %d, want 32", got)
+	}
+}
+
+func TestToolLoopGuardStopsRepeatedSSHLookup(t *testing.T) {
+	call := protocol.ToolCall{
+		ID: "ssh-lookup",
+		Function: protocol.ToolCallFunction{
+			Name:      "ssh",
+			Arguments: json.RawMessage("{\"action\":\"run\",\"credential_id\":\"mhcode-credential://ssh-test\",\"command\":\"cat /tmp/account\"}"),
+		},
+	}
+	guard := toolLoopGuard{remoteLookup: true, completedSSHCalls: map[string]bool{}}
+	if _, _, guarded, _ := guard.before(call); guarded {
+		t.Fatal("first SSH lookup was unexpectedly guarded")
+	}
+	guard.after(call, tools.Result{Summary: "ok"}, &protocol.Message{})
+	result, _, guarded, hidden := guard.before(call)
+	if !guarded || !hidden || !guard.forceFinalResponse {
+		t.Fatalf("repeat guard = guarded:%v hidden:%v forceFinal:%v result:%#v", guarded, hidden, guard.forceFinalResponse, result)
+	}
+}
+
+func TestToolLoopGuardStopsAfterSecretCapture(t *testing.T) {
+	guard := toolLoopGuard{}
+	call := protocol.ToolCall{
+		ID: "ssh-secret",
+		Function: protocol.ToolCallFunction{
+			Name:      "ssh",
+			Arguments: json.RawMessage("{\"action\":\"capture_secret\",\"credential_id\":\"ssh-test\",\"command\":\"cat /tmp/password\"}"),
+		},
+	}
+	guard.after(call, tools.Result{Parts: []tools.ResultPart{{
+		Kind:     tools.PartSecretResult,
+		SecretID: "secret-result",
+	}}}, &protocol.Message{})
+	if !guard.objectiveSatisfied || !guard.forceFinalResponse {
+		t.Fatalf("secret capture did not close discovery: %#v", guard)
+	}
+}
+
+func TestRepeatedPlanUpdateDoesNotConsumeOrdinaryBudget(t *testing.T) {
+	svc, _ := newNativeToolLoopService(t)
+	registry := svc.buildToolRegistry()
+	planArgs := json.RawMessage("{\"steps\":[{\"title\":\"检查\",\"status\":\"in_progress\"}]}")
+	completionCalls := 0
+	outcome, err := svc.runToolLoopWithCompletion(
+		context.Background(),
+		registry,
+		protocol.ChatRequest{Messages: []protocol.Message{{Role: "user", Content: "检查项目"}}},
+		1,
+		func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
+			completionCalls++
+			switch completionCalls {
+			case 1:
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID:       "plan-1",
+					Function: protocol.ToolCallFunction{Name: "update_plan", Arguments: planArgs},
+				}}}, nil
+			case 2:
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID:       "plan-2",
+					Function: protocol.ToolCallFunction{Name: "update_plan", Arguments: planArgs},
+				}}}, nil
+			default:
+				return protocol.CompletionResult{Content: "已完成检查"}, nil
+			}
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Content != "已完成检查" || completionCalls != 3 {
+		t.Fatalf("outcome = %#v, completion calls = %d", outcome, completionCalls)
+	}
+}
+
 func TestExecuteToolCallRendersValidationFailureAsToolCard(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
 	svc.runtimeSettings.WorkspaceRoot = t.TempDir()

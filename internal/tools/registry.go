@@ -16,7 +16,9 @@ const (
 	PartProgress       PartKind = "task_progress"
 	PartWebSearch      PartKind = "web_search_results"
 	PartTeamRole       PartKind = "team_role"
+	PartSubagent       PartKind = "subagent"
 	PartProviderNotice PartKind = "provider_notice"
+	PartSecretResult   PartKind = "secret_result"
 )
 
 type ProgressStep struct {
@@ -49,12 +51,13 @@ type ResultPart struct {
 	FileAction string `json:"fileAction,omitempty"`
 
 	// tool_call
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status,omitempty"` // running | ok | error
-	Input  string `json:"input,omitempty"`
-	Output string `json:"output,omitempty"`
-	Stdout string `json:"stdout,omitempty"`
-	Stderr string `json:"stderr,omitempty"`
+	Name       string `json:"name,omitempty"`
+	Status     string `json:"status,omitempty"` // running | ok | error
+	Input      string `json:"input,omitempty"`
+	Output     string `json:"output,omitempty"`
+	ToolCallID string `json:"toolCallId,omitempty"`
+	Stdout     string `json:"stdout,omitempty"`
+	Stderr     string `json:"stderr,omitempty"`
 	// Execution metadata is kept on the structured part so the UI can show
 	// durable, per-tool diagnostics after a session switch or app restart.
 	WorkingDirectory string `json:"workingDirectory,omitempty"`
@@ -81,6 +84,12 @@ type ResultPart struct {
 	Verdict    string `json:"verdict,omitempty"`
 	Attempt    int    `json:"attempt,omitempty"`
 
+	// subagent
+	TaskID        string `json:"taskId,omitempty"`
+	AgentType     string `json:"agentType,omitempty"`
+	Label         string `json:"label,omitempty"`
+	CurrentAction string `json:"currentAction,omitempty"`
+
 	// provider_notice
 	NoticeKind     string   `json:"noticeKind,omitempty"`
 	Severity       string   `json:"severity,omitempty"`
@@ -96,6 +105,11 @@ type ResultPart struct {
 	ErrorCode      string   `json:"errorCode,omitempty"`
 	HTTPStatus     int      `json:"httpStatus,omitempty"`
 	Retryable      *bool    `json:"retryable,omitempty"`
+
+	// secret_result. The value itself is never serialized into ResultPart.
+	SecretID     string `json:"secretId,omitempty"`
+	SecretLabel  string `json:"secretLabel,omitempty"`
+	SecretSource string `json:"secretSource,omitempty"`
 }
 
 // Result 是一次工具执行的产出。

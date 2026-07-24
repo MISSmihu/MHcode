@@ -2,6 +2,31 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.3 - 2026-07-24
+
+### Dynamic subagents and Agent execution
+
+- Add true dynamic subagents through `delegate_task`, with independent context, model routing, cancellation, persistence, and bounded summaries returned to the primary Agent.
+- Run read-only exploration and review workers concurrently while serializing implementation workers to avoid workspace write conflicts.
+- Render live subagent status, current actions, steps, model information, duration, and changed-file statistics independently from the fixed AI team workflow.
+- Preserve expanded command and artifact disclosures while new streamed activity remains collapsed by default.
+
+### Authorized remote deployment
+
+- Prefer direct managed SSH operations for authorized deployment tasks instead of wasting turns on unrelated local discovery.
+- Add host-managed sensitive-result capture so requested remote account values can be revealed or copied by the user without exposing plaintext to the model, prompts, or event logs.
+- Improve SSH command classification, progress reporting, cancellation, deployment guidance, and regression coverage.
+
+### Skills and interface
+
+- Add a full Skill detail viewer with document and source modes, safe file actions, and persistent sliding enable controls.
+- Improve code and diff disclosure behavior, structured execution cards, and conversation timeline readability.
+
+### Verification
+
+- All Go package tests and `go vet` pass.
+- Frontend type checking, regression tests, and the production Vite build pass.
+
 ## v0.3.2 - 2026-07-24
 
 ### Secure password-based SSH

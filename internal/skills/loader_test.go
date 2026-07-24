@@ -45,6 +45,31 @@ func TestFSLoaderLoadsFullSkillBody(t *testing.T) {
 	}
 }
 
+func TestDiskLoaderExposesOnlyContainedSkillPath(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "disk-skill", "disk-skill", "disk trigger")
+	loader := NewLoader(root).WithOrigin("project")
+
+	index, err := loader.Index()
+	if err != nil || len(index) != 1 {
+		t.Fatalf("index = %#v, err = %v", index, err)
+	}
+	if index[0].Source != "project" || index[0].Path != "disk-skill/SKILL.md" {
+		t.Fatalf("unexpected source metadata: %#v", index[0])
+	}
+	loaded, err := loader.Load("disk-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := filepath.Join(root, "disk-skill", "SKILL.md")
+	if loaded.FilePath != expected {
+		t.Fatalf("file path = %q, want %q", loaded.FilePath, expected)
+	}
+	if loaded.Source != "project" || loaded.Path != "disk-skill/SKILL.md" {
+		t.Fatalf("loaded source metadata = %#v", loaded)
+	}
+}
+
 func writeSkill(t *testing.T, root, dir, name, description string) {
 	t.Helper()
 	path := filepath.Join(root, dir)

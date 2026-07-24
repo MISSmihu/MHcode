@@ -59,6 +59,17 @@ func TestSSHCredentialToolUsesPasswordReferenceWithoutExposingSecret(t *testing.
 			}
 			return credential, nil
 		},
+		CaptureSecret: func(label, source, value string) (tools.ResultPart, error) {
+			if label != "应用管理员密码" || value != "application-secret" {
+				return tools.ResultPart{}, fmt.Errorf("unexpected captured value: label=%q value=%q", label, value)
+			}
+			return tools.ResultPart{
+				Kind:         tools.PartSecretResult,
+				SecretID:     "secret-test-result",
+				SecretLabel:  label,
+				SecretSource: source,
+			}, nil
+		},
 		KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
 	}
 
@@ -74,11 +85,38 @@ func TestSSHCredentialToolUsesPasswordReferenceWithoutExposingSecret(t *testing.
 	if runResult.IsError || !strings.Contains(runResult.Parts[0].Stdout, "hello") {
 		t.Fatalf("run result = %#v", runResult)
 	}
+	if strings.Contains(runResult.Summary, "hello") {
+		t.Fatalf("SSH summary duplicated stdout: %q", runResult.Summary)
+	}
+
+	captureResult := executeSSHTestTool(t, tool, sshToolArguments{
+		Action:       "capture_secret",
+		CredentialID: credential.ID,
+		Command:      "read-app-secret",
+		SecretLabel:  "应用管理员密码",
+	})
+	encodedCaptureResult, _ := json.Marshal(captureResult)
+	if captureResult.IsError || !strings.Contains(string(encodedCaptureResult), "secret-test-result") {
+		t.Fatalf("capture result = %s", encodedCaptureResult)
+	}
+	if strings.Contains(string(encodedCaptureResult), "application-secret") {
+		t.Fatalf("capture result leaked target secret: %s", encodedCaptureResult)
+	}
 
 	secretResult := executeSSHTestTool(t, tool, sshToolArguments{Action: "run", CredentialID: credential.ID, Command: "echo-secret"})
 	encodedSecretResult, _ := json.Marshal(secretResult)
 	if strings.Contains(string(encodedSecretResult), password) || !strings.Contains(string(encodedSecretResult), "已隐藏") {
 		t.Fatalf("SSH result leaked the password: %s", encodedSecretResult)
+	}
+	loginPasswordCapture := executeSSHTestTool(t, tool, sshToolArguments{
+		Action:       "capture_secret",
+		CredentialID: credential.ID,
+		Command:      "echo-secret",
+		SecretLabel:  "SSH 登录密码",
+	})
+	encodedLoginPasswordCapture, _ := json.Marshal(loginPasswordCapture)
+	if !loginPasswordCapture.IsError || strings.Contains(string(encodedLoginPasswordCapture), password) {
+		t.Fatalf("SSH login password capture was not rejected safely: %s", encodedLoginPasswordCapture)
 	}
 
 	localFile := filepath.Join(workspace, "index.html")
@@ -305,6 +343,8 @@ func (server *sshTestServer) handleSession(channel ssh.Channel, requests <-chan 
 			_, _ = io.WriteString(channel, "hello")
 		case payload.Command == "echo-secret":
 			_, _ = io.WriteString(channel, server.password)
+		case payload.Command == "read-app-secret":
+			_, _ = io.WriteString(channel, "application-secret")
 		case strings.Contains(payload.Command, "cat >") || strings.Contains(payload.Command, "tar -xzf"):
 			data, _ := io.ReadAll(channel)
 			server.uploads <- data

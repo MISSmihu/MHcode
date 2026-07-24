@@ -38,8 +38,12 @@ function isMeaningfulPart(part: MessagePart): boolean {
       return part.sources.length > 0;
     case "team_role":
       return Boolean(part.role?.trim() || part.summary?.trim());
+    case "subagent":
+      return Boolean(part.taskId.trim() || part.summary?.trim());
     case "provider_notice":
       return false;
+    case "secret_result":
+      return Boolean(part.secretId.trim());
   }
 }
 

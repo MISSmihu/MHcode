@@ -21,6 +21,14 @@ export type SkillIndexEntry = {
   summary: string;
   sha256: string;
   description: string;
+  disabled?: boolean;
+  source?: string;
+  path?: string;
+};
+
+export type SkillDetail = SkillIndexEntry & {
+  content: string;
+  canOpen: boolean;
 };
 
 export type ToolDescriptor = {
@@ -159,9 +167,14 @@ export type RuntimeSettings = {
   mcp: MCPSettings;
   model: ModelSettings;
   team: TeamSettings;
+  skills: SkillsSettings;
   update: UpdateSettings;
   workspace: WorkspaceSettings;
   memory: MemorySettings;
+};
+
+export type SkillsSettings = {
+  disabled: string[];
 };
 
 export type UpdateSettings = {
@@ -812,6 +825,24 @@ export type MessagePart =
       attempt?: number;
     }
   | {
+      kind: "subagent";
+      taskId: string;
+      agentType: "explore" | "review" | "implement" | string;
+      label: string;
+      status?: "pending" | "running" | "completed" | "error" | "cancelled" | string;
+      providerId?: string;
+      model?: string;
+      summary?: string;
+      currentAction?: string;
+      steps?: Array<{ title: string; status: "pending" | "in_progress" | "completed" | "error" | "cancelled" | string }>;
+      changedFiles?: number;
+      additions?: number;
+      deletions?: number;
+      startedAt?: string;
+      completedAt?: string;
+      durationMs?: number;
+    }
+  | {
       kind: "provider_notice";
       noticeKind: "model_reroute" | "safety_buffering" | "model_verification" | "moderation" | "policy_error" | string;
       severity?: "info" | "warning" | "error" | string;
@@ -827,7 +858,22 @@ export type MessagePart =
       errorCode?: string;
       httpStatus?: number;
       retryable?: boolean;
+	}
+  | {
+      kind: "secret_result";
+      status?: "ok" | "error" | string;
+      secretId: string;
+      secretLabel: string;
+      secretSource?: string;
     };
+
+export type SecretResultReveal = {
+  id: string;
+  label: string;
+  source?: string;
+  value: string;
+  createdAt: string;
+};
 
 // 事件日志的可回退检查点（对应后端 agent.CheckpointInfo）。
 export type CheckpointInfo = {

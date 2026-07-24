@@ -118,6 +118,9 @@ func (s *Service) setPlanState(steps []tools.ProgressStep, rejectCompletedRegres
 }
 
 func (s *Service) persistPlanState(steps []tools.ProgressStep, status string) error {
+	if s.planState.Status == status && progressStepsEqual(s.planState.Steps, steps) {
+		return nil
+	}
 	nextState := PlanState{
 		Revision:  s.planState.Revision + 1,
 		Status:    status,
@@ -135,6 +138,18 @@ func (s *Service) persistPlanState(steps []tools.ProgressStep, status string) er
 	}
 	s.planState = nextState
 	return nil
+}
+
+func progressStepsEqual(left, right []tools.ProgressStep) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].Title != right[index].Title || left[index].Status != right[index].Status {
+			return false
+		}
+	}
+	return true
 }
 
 // Plan 两段式：high/ultra 档（Planner=true）时，先只读探索产出计划 → 用户批准 → 再执行。

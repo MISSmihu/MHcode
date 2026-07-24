@@ -238,6 +238,9 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
       ],
     },
     team: defaultTeamSettings(),
+    skills: {
+      disabled: [],
+    },
     update: {
       autoCheck: true,
       autoDownload: false,

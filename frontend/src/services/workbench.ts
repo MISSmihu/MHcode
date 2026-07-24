@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
+import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -21,6 +21,7 @@ type WailsAppBinding = {
   StopChatMessage?: (taskID: string) => Promise<boolean>;
   GetActiveChatTask?: () => Promise<ChatTaskState | null>;
   GetActiveChatTasks?: () => Promise<ChatTaskState[]>;
+	RevealSecretResult?: (projectID: string, sessionID: string, secretID: string) => Promise<SecretResultReveal>;
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
   GetAppInfo?: () => Promise<AppInfo>;
@@ -78,6 +79,9 @@ type WailsAppBinding = {
   SelectWorktreeParentDirectory?: () => Promise<string>;
   OpenWorkspaceFile?: (path: string) => Promise<void>;
   ReadWorkspaceFile?: (path: string) => Promise<WorkspaceFilePreview>;
+  ReadSkillDetail?: (name: string) => Promise<SkillDetail>;
+  OpenSkillFile?: (name: string) => Promise<void>;
+  RevealSkillFile?: (name: string) => Promise<void>;
   ListWorkspaceDirectory?: (path: string) => Promise<WorkspaceDirectoryListing>;
   PreviewWorkspaceFile?: (path: string) => Promise<BrowserPreview>;
   RevealWorkspaceFile?: (path: string) => Promise<void>;
@@ -144,6 +148,8 @@ const fallbackSkillsIndex: SkillIndexEntry[] = [
     summary: "统一管理推理强度、Skills、MCP、工具调用、缓存命中和成本控制",
     sha256: "sha256:local-preview",
     description: "普通浏览器预览模式下的本地工作台状态。",
+    source: "preview",
+    path: "skills/mhcode-agent-core/SKILL.md",
   },
 ];
 
@@ -469,6 +475,14 @@ export async function getActiveChatTasks(): Promise<ChatTaskState[]> {
   return task ? [task] : [];
 }
 
+export async function revealSecretResult(projectID: string, sessionID: string, secretID: string): Promise<SecretResultReveal> {
+  const binding = wailsBinding();
+  if (!binding?.RevealSecretResult) {
+    throw new Error("当前桌面后端版本不支持查看敏感结果，请重启 MHcode。");
+  }
+  return binding.RevealSecretResult(projectID, sessionID, secretID);
+}
+
 export function onChatTaskEvent(handler: (event: ChatTaskEvent) => void): () => void {
   const runtime = (window as WailsWindow).runtime;
   if (runtime?.EventsOn) {
@@ -488,7 +502,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.2",
+  version: "0.3.3",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",
@@ -1120,6 +1134,38 @@ export async function readWorkspaceFile(path: string): Promise<WorkspaceFilePrev
   throw new Error("文件预览仅在 MHcode 桌面应用中可用。");
 }
 
+export async function readSkillDetail(name: string): Promise<SkillDetail> {
+  const binding = wailsBinding();
+  if (binding?.ReadSkillDetail) {
+    return binding.ReadSkillDetail(name);
+  }
+  const skill = fallbackSkillsIndex.find((entry) => entry.name === name);
+  if (!skill) throw new Error(`未找到 Skill：${name}`);
+  return {
+    ...skill,
+    content: `# ${skill.name}\n\n${skill.description || skill.summary}\n`,
+    canOpen: false,
+  };
+}
+
+export async function openSkillFile(name: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.OpenSkillFile) {
+    await binding.OpenSkillFile(name);
+    return;
+  }
+  throw new Error("Skill 文件打开功能仅在 MHcode 桌面应用中可用。");
+}
+
+export async function revealSkillFile(name: string): Promise<void> {
+  const binding = wailsBinding();
+  if (binding?.RevealSkillFile) {
+    await binding.RevealSkillFile(name);
+    return;
+  }
+  throw new Error("Skill 文件定位功能仅在 MHcode 桌面应用中可用。");
+}
+
 export async function listWorkspaceDirectory(path = ""): Promise<WorkspaceDirectoryListing> {
   const binding = wailsBinding();
   if (binding?.ListWorkspaceDirectory) {
@@ -1724,6 +1770,9 @@ function defaultRuntimeSettings(): RuntimeSettings {
       ],
     },
     team: defaultTeamSettings(),
+    skills: {
+      disabled: [],
+    },
     update: {
       autoCheck: true,
       autoDownload: false,
@@ -1774,6 +1823,7 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
     },
     workspace: { ...defaults.workspace, ...settings.workspace },
     memory: { ...defaults.memory, ...settings.memory },
+    skills: { ...defaults.skills, ...settings.skills },
   };
   return {
     ...merged,
@@ -1785,6 +1835,12 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
     maxCommandCpuPercent: clampNumber(Number(merged.maxCommandCpuPercent), 10, 100),
     maxCommandProcesses: clampNumber(Number(merged.maxCommandProcesses), 4, 1024),
     cacheTargetPercent: clampNumber(Number(merged.cacheTargetPercent), 0, 100),
+    skills: {
+      ...merged.skills,
+      disabled: Array.isArray(merged.skills.disabled)
+        ? merged.skills.disabled.map((item) => String(item).trim()).filter(Boolean).filter((item, index, values) => values.indexOf(item) === index).sort()
+        : [],
+    },
     git: {
       ...merged.git,
       worktreeCleanupLimit: clampNumber(Number(merged.git.worktreeCleanupLimit), 1, 99),

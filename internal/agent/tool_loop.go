@@ -62,24 +62,33 @@ func (s *Service) runToolLoopTurn(
 ) (ChatResult, error) {
 	execRequest := baseRequest
 	planStarted := false
+	reg := s.buildToolRegistry()
+	preflight := s.runDeploymentSSHPreflight(ctx, reg, baseRequest.Messages, sink)
+	if preflight.Attempted {
+		execRequest.Messages = appendDeploymentSSHPreflight(baseRequest.Messages, preflight)
+	}
 
 	// Plan 两段式：需用户显式开启 Plan 模式，且当前档位 Planner=true 时启用。
 	// 默认关闭，避免每轮翻倍调用、破坏缓存经济性（符合真实工具的显式规划做法）。
 	profile, _ := ReasoningProfileFor(s.reasoning)
 	if s.planMode && !isGuidanceChatTurn(ctx) && profile.Budget.Planner && strings.TrimSpace(s.runtimeSettings.WorkspaceRoot) != "" {
 		emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "正在生成执行计划", Model: route.ModelID})
-		plan, _, planErr := s.runPlanPhase(ctx, caller, baseRequest, maxToolCalls)
+		planRequest := baseRequest
+		if preflight.Attempted {
+			planRequest.Messages = appendDeploymentSSHPreflightSummary(baseRequest.Messages, preflight)
+		}
+		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest, maxToolCalls)
 		if planErr != nil {
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
 			s.markChatProviderStatus(route.Provider.ID, "error", planErr.Error())
-			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planErr
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planErr
 		}
 		if plan != "" {
 			planSteps := planStepsFromText(plan)
 			if len(planSteps) > 0 {
 				if planStateErr := s.startPlanState(planSteps); planStateErr != nil {
 					s.sessionMessages = s.sessionMessages[:baseMessageCount]
-					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planStateErr
 				}
 				planStarted = true
 			}
@@ -87,7 +96,7 @@ func (s *Service) runToolLoopTurn(
 			if apprErr != nil {
 				s.sessionMessages = s.sessionMessages[:baseMessageCount]
 				apprErr = s.failStartedPlan(planStarted, apprErr)
-				return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, apprErr
+				return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, apprErr
 			}
 			if !approved {
 				if planStarted {
@@ -97,36 +106,40 @@ func (s *Service) runToolLoopTurn(
 				}
 				// 用户否决计划：不执行，直接把计划作为回复返回。
 				answer := "已生成执行计划，但你选择不执行。\n\n" + plan
+				parts := mergeOutcomeParts(append([]tools.ResultPart{}, preflight.Result.Parts...), []tools.ResultPart{{Kind: tools.PartText, Text: plan}})
 				s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
 				s.sessionState.MessageCount = len(s.sessionMessages)
-				s.recordAssistantAndCheckpoint(answer, route.ModelID, []tools.ResultPart{{Kind: tools.PartText, Text: plan}}, chatTurnDurationMs(ctx))
+				s.recordAssistantAndCheckpoint(answer, route.ModelID, parts, chatTurnDurationMs(ctx))
 				s.markChatProviderStatus(route.Provider.ID, "ok", "计划已生成，等待下一步。")
 				return ChatResult{
 					Content: answer,
 					Model:   route.ModelID,
 					Usage:   s.metrics,
 					State:   s.workbenchStateLocked(),
-					Parts:   []tools.ResultPart{{Kind: tools.PartText, Text: plan}},
+					Parts:   parts,
 				}, nil
 			}
 			if len(planSteps) > 0 {
 				planSteps[0].Status = "in_progress"
 				if planStateErr := s.updatePlanState(planSteps); planStateErr != nil {
 					planStateErr = s.failStartedPlan(planStarted, planStateErr)
-					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planStateErr
 				}
 			}
 			// 批准：把计划注入执行阶段的消息尾部，让模型据此执行。
-			execRequest.Messages = append(append([]protocol.Message{}, baseRequest.Messages...),
+			execRequest.Messages = append(append([]protocol.Message{}, execRequest.Messages...),
 				protocol.Message{Role: "assistant", Content: "执行计划：\n" + plan},
 				protocol.Message{Role: "user", Content: "计划已批准，请按计划执行。"})
 		}
 	}
 
-	reg := s.buildToolRegistry()
-
 	emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "正在分析任务", Model: route.ModelID})
-	outcome, err := s.runStreamingToolLoop(ctx, streamProvider, reg, execRequest, maxToolCalls, sink)
+	executionCtx := withSubagentExecutionScope(ctx, subagentExecutionScope{
+		BaseRequest:  execRequest,
+		PrimaryRoute: route,
+		MaxToolCalls: maxToolCalls,
+	})
+	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, maxToolCalls, sink, preflight)
 	resolvedRoute := resolvedProviderRoute(streamProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
 		route = resolvedRoute
@@ -522,6 +535,17 @@ func appendTextPartIfMissing(parts []tools.ResultPart, content string) []tools.R
 // buildToolRegistry 依据当前 runtime settings 构造工具注册表。
 // 沙盒策略从 RuntimeSettings 映射到 tools.SandboxPolicy，实现权限边界。
 func (s *Service) buildToolRegistry() *tools.Registry {
+	return s.buildMutableToolRegistry(true, true)
+}
+
+// buildWorkerToolRegistry is used by delegated and fixed-team workers. It
+// excludes coordinator tools so a worker cannot mutate the main plan or spawn
+// another layer of agents.
+func (s *Service) buildWorkerToolRegistry() *tools.Registry {
+	return s.buildMutableToolRegistry(false, false)
+}
+
+func (s *Service) buildMutableToolRegistry(includePlan, includeDelegation bool) *tools.Registry {
 	policy := tools.SandboxPolicy{
 		SandboxMode:          s.runtimeSettings.SandboxMode,
 		WorkspaceRoot:        s.runtimeSettings.WorkspaceRoot,
@@ -535,13 +559,14 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 		MaxCommandCPUPercent: s.runtimeSettings.MaxCommandCPUPercent,
 		MaxCommandProcesses:  s.runtimeSettings.MaxCommandProcesses,
 	}
-	reg := tools.NewRegistry(
-		tools.UpdatePlanTool{OnUpdate: s.updatePlanState},
-		tools.ReadFileTool{Policy: policy},
-		tools.FileInfoTool{Policy: policy},
-		tools.ListDirTool{Policy: policy},
-		tools.SearchTool{Policy: policy},
-	)
+	reg := tools.NewRegistry()
+	if includePlan {
+		reg.Add(tools.UpdatePlanTool{OnUpdate: s.updatePlanState})
+	}
+	reg.Add(tools.ReadFileTool{Policy: policy})
+	reg.Add(tools.FileInfoTool{Policy: policy})
+	reg.Add(tools.ListDirTool{Policy: policy})
+	reg.Add(tools.SearchTool{Policy: policy})
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
@@ -557,6 +582,9 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 	if s.config.Computer != nil && (computerSettings.AnyAppEnabled || computerSettings.ChromeEnabled || len(computerSettings.AlwaysAllowedApps) > 0) {
 		reg.Add(tools.ComputerTool{Policy: policy, Controller: s.config.Computer})
 	}
+	if includeDelegation {
+		reg.Add(DelegateTaskTool{Service: s})
+	}
 	reg.Add(tools.WriteFileTool{Policy: policy})
 	reg.Add(tools.ApplyPatchTool{Policy: policy})
 	reg.Add(tools.CopyFileTool{Policy: policy})
@@ -569,6 +597,7 @@ func (s *Service) buildToolRegistry() *tools.Registry {
 		reg.Add(SSHCredentialTool{
 			Policy:         policy,
 			Resolve:        s.resolveScopedSSHCredential,
+			CaptureSecret:  s.storeSecretResult,
 			KnownHostsPath: s.scopedSSHKnownHostsPath(),
 		})
 	}
@@ -673,10 +702,22 @@ func (s *Service) runStreamingToolLoop(
 	maxToolCalls int,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
+	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, maxToolCalls, sink, deploymentSSHPreflight{})
+}
+
+func (s *Service) runStreamingToolLoopWithState(
+	ctx context.Context,
+	provider protocol.Provider,
+	reg *tools.Registry,
+	req protocol.ChatRequest,
+	maxToolCalls int,
+	sink ChatEventSink,
+	preflight deploymentSSHPreflight,
+) (toolLoopOutcome, error) {
 	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
 		return collectProviderStream(ctx, provider, request, sink)
 	}
-	return s.runToolLoopWithCompletion(ctx, reg, req, maxToolCalls, complete, sink)
+	return s.runToolLoopWithCompletionState(ctx, reg, req, maxToolCalls, complete, sink, preflight)
 }
 
 type completionFunc func(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error)
@@ -693,11 +734,49 @@ type toolLoopGuard struct {
 	browserUnavailable         bool
 	browserExplicitlyRequested bool
 	externalBrowserSuppressed  bool
+	remoteLookup               bool
+	completedSSHCalls          map[string]bool
+	lastPlanSignature          string
+	planUpdates                int
+	objectiveSatisfied         bool
+	forceFinalResponse         bool
+	maxPlanUpdates             int
 }
+
+const (
+	maxPlanUpdatesPerTurn = 12
+	maxLookupPlanUpdates  = 4
+)
 
 func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.Message, bool, bool) {
 	name := call.Function.Name
 	input := toolInputForDisplay(name, call.Function.Arguments)
+	if name == "update_plan" {
+		signature := normalizedToolArguments(call.Function.Arguments)
+		if signature != "" && signature == g.lastPlanSignature {
+			summary := "计划内容与状态没有变化，已跳过重复更新。"
+			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
+		}
+		limit := g.maxPlanUpdates
+		if limit <= 0 {
+			limit = maxPlanUpdatesPerTurn
+		}
+		if g.planUpdates >= limit {
+			summary := "计划更新过于频繁，已保留最近一次有效状态；请继续执行或直接总结。"
+			g.forceFinalResponse = true
+			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
+		}
+	}
+	if name == "ssh" {
+		signature := sshToolCallSignature(call.Function.Arguments)
+		if signature != "" && g.completedSSHCalls[signature] && (g.remoteLookup || strings.HasPrefix(signature, "test\x00")) {
+			summary := "相同的 SSH 操作本轮已经成功执行，已跳过重复调用；请复用先前结果继续任务。"
+			if g.remoteLookup {
+				g.forceFinalResponse = true
+			}
+			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
+		}
+	}
 	if name == "browser" && !g.browserExplicitlyRequested {
 		rawArgs := normalizeToolArgs(call.Function.Arguments)
 		if g.externalBrowserSuppressed || browserNavigationNeedsApproval(rawArgs) {
@@ -751,6 +830,29 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 
 func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, message *protocol.Message) {
 	switch call.Function.Name {
+	case "update_plan":
+		if result.IsError {
+			return
+		}
+		g.lastPlanSignature = normalizedToolArguments(call.Function.Arguments)
+		g.planUpdates++
+	case "ssh":
+		if result.IsError {
+			return
+		}
+		if g.completedSSHCalls == nil {
+			g.completedSSHCalls = make(map[string]bool)
+		}
+		if signature := sshToolCallSignature(call.Function.Arguments); signature != "" {
+			g.completedSSHCalls[signature] = true
+		}
+		for _, part := range result.Parts {
+			if part.Kind == tools.PartSecretResult && part.SecretID != "" {
+				g.objectiveSatisfied = true
+				g.forceFinalResponse = true
+				break
+			}
+		}
 	case "web_search":
 		if result.IsError {
 			return
@@ -769,6 +871,39 @@ func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, messa
 		}
 		g.browserUnavailable = true
 		message.Content = strings.TrimSpace(message.Content + "\n本轮不要再次调用 browser；如已有搜索来源，请直接基于来源完成回答。")
+	}
+}
+
+func normalizedToolArguments(raw json.RawMessage) string {
+	var value any
+	if err := json.Unmarshal(normalizeToolArgs(raw), &value); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	return string(encoded)
+}
+
+func sshToolCallSignature(raw json.RawMessage) string {
+	var args sshToolArguments
+	if err := json.Unmarshal(normalizeToolArgs(raw), &args); err != nil {
+		return ""
+	}
+	action := strings.ToLower(strings.TrimSpace(args.Action))
+	credentialID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(args.CredentialID), scopedCredentialScheme))
+	switch action {
+	case "test":
+		return action + "\x00" + credentialID
+	case "run", "capture_secret":
+		command := strings.ToLower(strings.Join(strings.Fields(args.Command), " "))
+		if command == "" {
+			return ""
+		}
+		return action + "\x00" + credentialID + "\x00" + command
+	default:
+		return ""
 	}
 }
 
@@ -915,11 +1050,34 @@ func (s *Service) runToolLoopWithCompletion(
 	complete completionFunc,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	outcome := toolLoopOutcome{}
+	return s.runToolLoopWithCompletionState(ctx, reg, req, maxToolCalls, complete, sink, deploymentSSHPreflight{})
+}
+
+func (s *Service) runToolLoopWithCompletionState(
+	ctx context.Context,
+	reg *tools.Registry,
+	req protocol.ChatRequest,
+	maxToolCalls int,
+	complete completionFunc,
+	sink ChatEventSink,
+	preflight deploymentSSHPreflight,
+) (toolLoopOutcome, error) {
+	outcome := toolLoopOutcome{Parts: append([]tools.ResultPart{}, preflight.Result.Parts...)}
 	messages := append([]protocol.Message{}, req.Messages...)
 	toolDefs := toolDefinitions(reg)
 	toolsDisabled := false // 自定义模型不支持 function-calling 时降级为纯对话
-	guard := toolLoopGuard{browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages)}
+	maxToolCalls = adaptiveToolCallBudget(req.Messages, maxToolCalls)
+	guard := toolLoopGuard{
+		browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages),
+		remoteLookup:               remoteLookupTask(req.Messages),
+		completedSSHCalls:          make(map[string]bool),
+	}
+	if guard.remoteLookup {
+		guard.maxPlanUpdates = maxLookupPlanUpdates
+	}
+	if preflight.Succeeded && preflight.CredentialID != "" {
+		guard.completedSSHCalls["test\x00"+preflight.CredentialID] = true
+	}
 
 	executed := 0
 	for {
@@ -932,6 +1090,9 @@ func (s *Service) runToolLoopWithCompletion(
 		stepReq.Messages = fitToolLoopMessages(messages, req.TargetInputTokens)
 		if !toolsDisabled {
 			stepReq.Tools = toolDefs
+		} else {
+			stepReq.Tools = nil
+			stepReq.ToolChoice = "none"
 		}
 
 		completion, err := complete(ctx, stepReq)
@@ -1010,7 +1171,10 @@ func (s *Service) runToolLoopWithCompletion(
 				emitOutcomeProgress(sink, outcome.Parts)
 				return outcome, err
 			}
-			if executed >= maxToolCalls {
+			isProgressUpdate := call.Function.Name == "update_plan"
+			toolInput := toolInputForDisplay(call.Function.Name, call.Function.Arguments)
+			result, toolMsg, guarded, hidden := guard.before(call)
+			if !isProgressUpdate && !hidden && executed >= maxToolCalls {
 				// 达到上限：告知模型并结束。
 				note := fmt.Sprintf("已达到本轮工具调用上限（%d 次），停止继续调用。", maxToolCalls)
 				outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: note})
@@ -1019,10 +1183,9 @@ func (s *Service) runToolLoopWithCompletion(
 				emitOutcomeProgress(sink, outcome.Parts)
 				return outcome, nil
 			}
-			executed++
-			toolInput := toolInputForDisplay(call.Function.Name, call.Function.Arguments)
-			isProgressUpdate := call.Function.Name == "update_plan"
-			result, toolMsg, guarded, hidden := guard.before(call)
+			if !isProgressUpdate && !hidden {
+				executed++
+			}
 			if !isProgressUpdate && !hidden {
 				emitChatEvent(sink, ChatStreamEvent{
 					Type:       "tool",
@@ -1042,7 +1205,9 @@ func (s *Service) runToolLoopWithCompletion(
 					if part.Input == "" {
 						part.Input = toolInput
 					}
-					part.Status = "running"
+					if part.Status == "" {
+						part.Status = "running"
+					}
 					emitChatEvent(sink, ChatStreamEvent{
 						Type:       "tool",
 						Message:    fmt.Sprintf("正在运行 %s", call.Function.Name),
@@ -1089,8 +1254,56 @@ func (s *Service) runToolLoopWithCompletion(
 			}
 			// 把工具结果回喂给模型。
 			messages = append(messages, toolMsg)
+			if guard.forceFinalResponse {
+				toolsDisabled = true
+				break
+			}
 		}
 	}
+}
+
+func adaptiveToolCallBudget(messages []protocol.Message, configured int) int {
+	if configured <= 0 || !remoteLookupTask(messages) {
+		return configured
+	}
+	if configured > 8 {
+		return 8
+	}
+	return configured
+}
+
+func remoteLookupTask(messages []protocol.Message) bool {
+	request := latestUserRequest(messages)
+	if request == "" || !strings.Contains(request, scopedCredentialScheme) {
+		return false
+	}
+	lower := strings.ToLower(request)
+	for _, marker := range []string{
+		"部署", "安装", "升级", "迁移", "修复", "排障", "调试", "配置服务", "发布",
+		"deploy", "install", "upgrade", "migrate", "repair", "debug", "troubleshoot", "configure", "release",
+	} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	for _, marker := range []string{
+		"读取", "查找", "找出", "获取", "查看", "确认", "账号", "账户", "密码", "口令", "密钥", "令牌",
+		"read", "find", "locate", "get", "inspect", "account", "credential", "password", "secret", "token",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func latestUserRequest(messages []protocol.Message) string {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Role == "user" {
+			return strings.TrimSpace(messages[index].Content)
+		}
+	}
+	return ""
 }
 
 func isRetryablePostToolCompletionError(ctx context.Context, err error) bool {
@@ -1282,7 +1495,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	normalizedArgs := normalizeToolArgs(call.Function.Arguments)
 	startedAt := time.Now()
 	defer func() {
-		result = ensureToolExecutionMetadata(result, name, normalizedArgs, startedAt, time.Now())
+		result = ensureToolExecutionMetadata(result, name, call.ID, normalizedArgs, startedAt, time.Now())
 	}()
 	tool, ok := reg.Get(name)
 	if !ok {
@@ -1354,7 +1567,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	}
 }
 
-func ensureToolExecutionMetadata(result tools.Result, name string, rawArgs json.RawMessage, startedAt, completedAt time.Time) tools.Result {
+func ensureToolExecutionMetadata(result tools.Result, name, toolCallID string, rawArgs json.RawMessage, startedAt, completedAt time.Time) tools.Result {
 	status := "ok"
 	if result.IsError {
 		status = "error"
@@ -1373,6 +1586,9 @@ func ensureToolExecutionMetadata(result tools.Result, name string, rawArgs json.
 		found = true
 		if part.Name == "" {
 			part.Name = name
+		}
+		if part.ToolCallID == "" {
+			part.ToolCallID = toolCallID
 		}
 		if part.Status == "" {
 			part.Status = status
@@ -1396,6 +1612,7 @@ func ensureToolExecutionMetadata(result tools.Result, name string, rawArgs json.
 	result.Parts = append([]tools.ResultPart{{
 		Kind:        tools.PartToolCall,
 		Name:        name,
+		ToolCallID:  toolCallID,
 		Status:      status,
 		Input:       input,
 		Output:      result.Summary,
@@ -1429,6 +1646,8 @@ func applyToolResultPolicy(result tools.Result, policy string) tools.Result {
 		part.Output = clipContextText(part.Output, detailLimit)
 		part.Stdout = clipContextText(part.Stdout, detailLimit)
 		part.Stderr = clipContextText(part.Stderr, detailLimit)
+		part.Summary = clipContextText(part.Summary, detailLimit)
+		part.CurrentAction = clipContextText(part.CurrentAction, detailLimit/2)
 		if part.Kind == tools.PartText {
 			part.Text = clipContextText(part.Text, detailLimit)
 		}

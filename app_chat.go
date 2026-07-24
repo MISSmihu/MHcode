@@ -83,6 +83,13 @@ type ChatTaskEvent struct {
 	Forced      bool                           `json:"forced,omitempty"`
 }
 
+func (a *App) RevealSecretResult(projectID, sessionID, secretID string) (agent.SecretResultReveal, error) {
+	if a.service == nil {
+		return agent.SecretResultReveal{}, errors.New("Agent 服务尚未初始化")
+	}
+	return a.service.RevealSecretResult(projectID, sessionID, secretID)
+}
+
 func (a *App) StartChatMessage(prompt string) (string, error) {
 	return a.startChatMessageForProjectSession("", "", prompt, nil)
 }

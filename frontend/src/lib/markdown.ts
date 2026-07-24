@@ -11,13 +11,18 @@ const md: MarkdownIt = new MarkdownIt({
   breaks: false,
 });
 
-md.renderer.rules.fence = (tokens, idx) => {
-  const token = tokens[idx];
-  const languageHint = token.info.trim().split(/\s+/)[0] ?? "";
-  return renderCodeBlock(token.content, languageHint);
+export type MarkdownRenderOptions = {
+  expandCodeBlocks?: boolean;
 };
 
-md.renderer.rules.code_block = (tokens, idx) => renderCodeBlock(tokens[idx].content, "");
+md.renderer.rules.fence = (tokens, idx, _options, env) => {
+  const token = tokens[idx];
+  const languageHint = token.info.trim().split(/\s+/)[0] ?? "";
+  return renderCodeBlock(token.content, languageHint, Boolean((env as MarkdownRenderOptions | undefined)?.expandCodeBlocks));
+};
+
+md.renderer.rules.code_block = (tokens, idx, _options, env) =>
+  renderCodeBlock(tokens[idx].content, "", Boolean((env as MarkdownRenderOptions | undefined)?.expandCodeBlocks));
 
 md.renderer.rules.code_inline = (tokens, idx) => {
   const content = tokens[idx].content;
@@ -41,8 +46,8 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
 
-export function renderMarkdown(source: string): string {
-  return md.render(source ?? "");
+export function renderMarkdown(source: string, options: MarkdownRenderOptions = {}): string {
+  return md.render(source ?? "", options);
 }
 
 // 复制按钮的事件委托：挂在消息容器上，点到 data-role="copy" 就读同级 figure 的原始代码。
@@ -66,12 +71,12 @@ export function handleCodeCopyClick(event: MouseEvent): void {
   );
 }
 
-function renderCodeBlock(code: string, languageHint: string): string {
+function renderCodeBlock(code: string, languageHint: string, expanded: boolean): string {
   const highlighted = highlightCodeBlock(code, languageHint);
   const label = highlighted.language || "text";
   const raw = encodeCodePayload(code);
   return (
-    `<details class="code-block" data-lang="${escapeAttr(label)}" data-code="${raw}">` +
+    `<details class="code-block"${expanded ? " open" : ""} data-lang="${escapeAttr(label)}" data-code="${raw}">` +
     `<summary><span class="code-lang">${escapeHtml(label)}</span>` +
     `<button type="button" class="code-copy" data-role="copy">复制</button></summary>` +
     `<pre class="hljs"><code>${highlighted.html}</code></pre>` +

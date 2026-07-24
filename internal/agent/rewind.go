@@ -767,6 +767,7 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 			Status:           p.Status,
 			Input:            p.Input,
 			Output:           p.Output,
+			ToolCallID:       p.ToolCallID,
 			Stdout:           p.Stdout,
 			Stderr:           p.Stderr,
 			WorkingDirectory: p.WorkingDirectory,
@@ -786,6 +787,10 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 			Summary:          p.Summary,
 			Verdict:          p.Verdict,
 			Attempt:          p.Attempt,
+			TaskID:           p.TaskID,
+			AgentType:        p.AgentType,
+			Label:            p.Label,
+			CurrentAction:    p.CurrentAction,
 			NoticeKind:       p.NoticeKind,
 			Severity:         p.Severity,
 			Message:          p.Message,
@@ -800,6 +805,9 @@ func fromEventParts(parts []eventlog.MessagePart) []tools.ResultPart {
 			ErrorCode:        p.ErrorCode,
 			HTTPStatus:       p.HTTPStatus,
 			Retryable:        p.Retryable,
+			SecretID:         p.SecretID,
+			SecretLabel:      p.SecretLabel,
+			SecretSource:     p.SecretSource,
 		})
 	}
 	return out
@@ -999,6 +1007,7 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 			Status:           p.Status,
 			Input:            p.Input,
 			Output:           p.Output,
+			ToolCallID:       p.ToolCallID,
 			Stdout:           p.Stdout,
 			Stderr:           p.Stderr,
 			WorkingDirectory: p.WorkingDirectory,
@@ -1018,6 +1027,10 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 			Summary:          p.Summary,
 			Verdict:          p.Verdict,
 			Attempt:          p.Attempt,
+			TaskID:           p.TaskID,
+			AgentType:        p.AgentType,
+			Label:            p.Label,
+			CurrentAction:    p.CurrentAction,
 			NoticeKind:       p.NoticeKind,
 			Severity:         p.Severity,
 			Message:          p.Message,
@@ -1032,6 +1045,9 @@ func toEventParts(parts []tools.ResultPart) []eventlog.MessagePart {
 			ErrorCode:        p.ErrorCode,
 			HTTPStatus:       p.HTTPStatus,
 			Retryable:        p.Retryable,
+			SecretID:         p.SecretID,
+			SecretLabel:      p.SecretLabel,
+			SecretSource:     p.SecretSource,
 		})
 	}
 	return out

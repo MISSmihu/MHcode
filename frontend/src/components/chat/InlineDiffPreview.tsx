@@ -10,6 +10,8 @@ type InlineDiffPreviewProps = {
   additions?: number;
   deletions?: number;
   onOpen?: () => void;
+	expanded?: boolean;
+	onExpandedChange?: (expanded: boolean) => void;
 };
 
 export function InlineDiffPreview(props: InlineDiffPreviewProps) {
@@ -18,6 +20,12 @@ export function InlineDiffPreview(props: InlineDiffPreviewProps) {
   const rows = createMemo(() => parseInlineDiff(props.patch));
   const language = createMemo(() => codeLanguageForPath(props.path));
   const calculatedStats = createMemo(() => inlineDiffStats(props.patch));
+	const isExpanded = () => props.expanded ?? expanded();
+	const toggleExpanded = () => {
+		const next = !isExpanded();
+		if (props.onExpandedChange) props.onExpandedChange(next);
+		else setExpanded(next);
+	};
   const additions = () => props.additions ?? calculatedStats().additions;
   const deletions = () => props.deletions ?? calculatedStats().deletions;
 
@@ -32,7 +40,7 @@ export function InlineDiffPreview(props: InlineDiffPreviewProps) {
   };
 
   return (
-    <section class="op-inline-diff" classList={{ collapsed: !expanded() }} aria-label={`${props.path} 修改预览`}>
+    <section class="op-inline-diff" classList={{ collapsed: !isExpanded() }} aria-label={`${props.path} 修改预览`}>
       <header class="op-inline-diff-toolbar">
         <button
           type="button"
@@ -59,17 +67,17 @@ export function InlineDiffPreview(props: InlineDiffPreviewProps) {
           </Show>
           <button
             type="button"
-            title={expanded() ? "收起修改" : "展开修改"}
-            aria-label={expanded() ? "收起修改" : "展开修改"}
-            aria-expanded={expanded()}
-            onClick={() => setExpanded((value) => !value)}
+            title={isExpanded() ? "收起修改" : "展开修改"}
+            aria-label={isExpanded() ? "收起修改" : "展开修改"}
+            aria-expanded={isExpanded()}
+			onClick={toggleExpanded}
           >
             <ChevronDown class="op-inline-code-toggle" size={14} />
           </button>
         </div>
       </header>
 
-      <Show when={expanded()}>
+	  <Show when={isExpanded()}>
         <div class="op-inline-diff-scroll" role="region" aria-label="文件修改" tabIndex={0}>
           <For each={rows()}>
             {(row) => (

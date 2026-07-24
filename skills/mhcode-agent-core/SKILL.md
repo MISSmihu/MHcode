@@ -37,20 +37,20 @@ description: 统一管理 MHcode Agent 的推理强度、权限审批、结构�
 
 使用稳定枚举：
 
-``ts
+```ts
 type ReasoningLevel = "low" | "medium" | "high" | "ultra"
-``
+```
 
 中文展示为：`低 / 中 / 高 / 超高`。四档同时影响工具调用上限、上下文策略、缓存策略和规划器：
 
-``json
+```json
 {
   "low": { "maxToolCalls": 3, "contextPolicy": "minimal", "cachePolicy": "reuse-prefix", "planner": false },
   "medium": { "maxToolCalls": 8, "contextPolicy": "task-summary", "cachePolicy": "reuse-prefix", "planner": false },
   "high": { "maxToolCalls": 16, "contextPolicy": "expanded", "cachePolicy": "stable-prefix", "planner": true },
   "ultra": { "maxToolCalls": 32, "contextPolicy": "full-relevant", "cachePolicy": "strict-stable-prefix", "planner": true }
 }
-``
+```
 
 运行中切换只影响下一轮请求，并显示“下一轮生效”。不要让菜单成为没有执行效果的装饰。
 
@@ -66,10 +66,10 @@ type ReasoningLevel = "low" | "medium" | "high" | "ultra"
 
 文件读取、搜索、写入、补丁、复制和删除必须使用：
 
-``text
+```text
 read_file, file_info, list_dir, search,
 write_file, apply_patch, copy_file, delete_file
-``
+```
 
 `run_command` 只用于构建、测试、编译器和确实需要执行的程序。不要通过 Shell 读取、枚举、搜索、写入、复制、移动或删除工作区文本文件。这样会绕过编码检测、路径策略、文件快照和 rewind。
 
@@ -84,18 +84,18 @@ Windows 文本规则：
 
 常规上下文只放 Skill 索引：
 
-``text
+```text
 skill: name
 version: version
 trigger: 触发条件
 summary: 能力摘要
-``
+```
 
 触发后才加载完整 `SKILL.md`，并记录 `name + version + sha256`。同会话复用摘要，不重复注入长正文。
 
 MCP 只生成稳定 schema 快照：
 
-``json
+```json
 {
   "server": "filesystem",
   "tools_hash": "sha256:...",
@@ -107,7 +107,7 @@ MCP 只生成稳定 schema 快照：
     }
   ]
 }
-``
+```
 
 工具列表或 schema 改变时才刷新快照。工具结果先给结论、影响范围和下一步；保留文件路径/行号/对象 ID 等引用，长原文放本地引用。
 
@@ -129,9 +129,9 @@ Plan 是显式能力，不默认给每轮请求增加一次规划调用。
 
 团队模式按角色协作，不把多个角色的长原文全部塞进主上下文：
 
-``text
+```text
 planner → implementer → tester / reviewer → synthesizer
-``
+```
 
 - Planner 只读探索和拆分任务。
 - Implementer 执行批准后的修改。
@@ -208,12 +208,12 @@ Agent 工具循环应返回结构化 `Summary`、`Parts`、变更快照和必要
 
 至少运行：
 
-``powershell
+```powershell
 cd frontend
 bun.cmd run check
 cd ..
 go test ./... -count=1
 go vet ./...
-``
+```
 
 涉及 Wails API、浏览器原生表面、Windows 进程控制或打包时追加 `wails build -clean`。

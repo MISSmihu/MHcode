@@ -335,6 +335,7 @@ func (s *Service) SaveRuntimeSettings(settings RuntimeSettings) (WorkbenchState,
 	previousDeepSeekBaseURL := s.deepSeekBaseURL()
 	previousProviderID := s.runtimeSettings.Model.SelectedProviderID
 	previousModelID := s.runtimeSettings.Model.SelectedModelID
+	previousDisabledSkills := append([]string(nil), s.runtimeSettings.Skills.Disabled...)
 	settings = settings.Normalized()
 	if err := settings.Validate(); err != nil {
 		return s.workbenchStateLocked(), err
@@ -352,11 +353,25 @@ func (s *Service) SaveRuntimeSettings(settings RuntimeSettings) (WorkbenchState,
 		s.invalidateProviderSession("DeepSeek Base URL 已更新；下一轮会保留历史并重建请求前缀。")
 	} else if previousProviderID != settings.Model.SelectedProviderID || previousModelID != settings.Model.SelectedModelID {
 		s.invalidateProviderSession("模型路由已切换；下一轮会保留对话历史。")
+	} else if !sameStringList(previousDisabledSkills, settings.Skills.Disabled) {
+		s.invalidateProviderSession("Skills 启用状态已更新；下一轮会重建上下文前缀。")
 	}
 	if err := saveRuntimeSettings(s.settingsPath, settings); err != nil {
 		return s.workbenchStateLocked(), err
 	}
 	return s.workbenchStateLocked(), nil
+}
+
+func sameStringList(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) SetReasoningLevel(level ReasoningLevel) (WorkbenchState, error) {
@@ -701,6 +716,10 @@ func hasMeaningfulResultParts(parts []tools.ResultPart) bool {
 			if strings.TrimSpace(part.Role) != "" || strings.TrimSpace(part.Summary) != "" {
 				return true
 			}
+		case tools.PartSubagent:
+			if strings.TrimSpace(part.TaskID) != "" || strings.TrimSpace(part.Summary) != "" {
+				return true
+			}
 		}
 	}
 	return false
@@ -758,6 +777,14 @@ func terminalTurnParts(parts []tools.ResultPart, status string, plan PlanState) 
 				} else {
 					part.Output = "工具执行未完成。"
 				}
+			}
+		}
+		if part.Kind == tools.PartSubagent && (part.Status == "pending" || part.Status == "running") {
+			part.Status = status
+			if status == "cancelled" {
+				part.CurrentAction = "已停止"
+			} else {
+				part.CurrentAction = "执行未完成"
 			}
 		}
 	}
@@ -1190,7 +1217,9 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 			"保持稳定前缀文本、顺序和 schema 哈希可复现。",
 			"Skills 正文只在触发时加载，默认只注入稳定索引。",
 			"工具结果先摘要，再用 raw_result_id 引用原文。",
+			"遇到 1-3 个彼此独立且能明显并行推进的探索、审阅或实现子任务时，可使用 delegate_task；不要为简单任务委派，子代理不得递归委派。",
 			"密码 SSH 通过主机托管的不透明凭据引用直接认证，不需要 SSH Key、ssh-agent 或外部授权条目。",
+			"用户明确要求读取已授权目标系统中的账号、密码或令牌时，使用 ssh.capture_secret 将目标值交给本机凭据库；模型和事件日志不得接收明文。SSH 登录密码永远不可返回。",
 		},
 		RuntimePolicy:  s.runtimePolicyContext(),
 		Reasoning:      profile,
@@ -1817,6 +1846,7 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- A token beginning with mhcode-credential:// is an opaque host-managed password reference, not an SSH key or an external authorization entry. Use its ID with the ssh tool; never claim that the referenced password is unavailable or ask the user to paste it into a shell command.",
 		"- Password-based SSH authentication does not use ssh-add or ssh-agent. Never run ssh-add unless the user explicitly asks to inspect or manage local SSH keys.",
 		"- For an authorized remote deployment, use ssh test first when needed, then ssh run, upload_file, or upload_directory. Never place passwords in command text, environment variables, files, plans, tool summaries, or replies.",
+		"- When the user explicitly asks to retrieve an account password, token, or other sensitive value from an authorized target system, use ssh action=capture_secret with a command that prints only the requested value. The host will store it and show the user reveal/copy controls; never use ordinary ssh run for that value, never echo it in model-visible text, and stop further discovery once capture_secret succeeds.",
 		"- For a substantive multi-step task, call update_plan before implementation and after each step changes state. Send the full checklist each time, keep at most one step in_progress, and skip it for simple questions.",
 		"- Workspace tools are already rooted at the active project. Start exploration with list_dir path '.' and use relative paths; never invent /home or other machine-specific absolute paths.",
 		"- Read, inspect, search, write, patch, copy, and delete workspace text files only through read_file, file_info, list_dir, search, write_file, apply_patch, copy_file, and delete_file. Never use run_command, PowerShell, cmd, shell redirection, cat, rg, grep, or filesystem aliases for these operations.",
@@ -1937,12 +1967,17 @@ func sanitizeModelContent(content string) string {
 func (s *Service) loadSkillsIndex() []skills.IndexEntry {
 	seen := map[string]int{} // name → index in merged
 	merged := make([]skills.IndexEntry, 0, 8)
+	disabled := make(map[string]bool, len(s.runtimeSettings.Skills.Disabled))
+	for _, name := range s.runtimeSettings.Skills.Disabled {
+		disabled[name] = true
+	}
 	for _, loader := range s.skillLoaders() {
 		index, err := loader.Index()
 		if err != nil {
 			continue
 		}
 		for _, entry := range index {
+			entry.Disabled = disabled[entry.Name]
 			if pos, ok := seen[entry.Name]; ok {
 				merged[pos] = entry // 后加（项目内）覆盖同名
 				continue
@@ -1960,13 +1995,13 @@ func (s *Service) loadSkillsIndex() []skills.IndexEntry {
 func (s *Service) skillLoaders() []skills.Loader {
 	loaders := make([]skills.Loader, 0, 3)
 	if s.config.SkillsFS != nil {
-		loaders = append(loaders, skills.NewFSLoader(s.config.SkillsFS, "skills"))
+		loaders = append(loaders, skills.NewFSLoader(s.config.SkillsFS, "skills").WithOrigin("bundled"))
 	}
 	if dir := strings.TrimSpace(s.config.SkillsDir); dir != "" {
-		loaders = append(loaders, skills.NewLoader(dir))
+		loaders = append(loaders, skills.NewLoader(dir).WithOrigin("local"))
 	}
 	if root := strings.TrimSpace(s.runtimeSettings.WorkspaceRoot); root != "" {
-		loaders = append(loaders, skills.NewLoader(filepath.Join(root, "skills")))
+		loaders = append(loaders, skills.NewLoader(filepath.Join(root, "skills")).WithOrigin("project"))
 	}
 	return loaders
 }
@@ -1978,6 +2013,9 @@ func (s *Service) loadTriggeredSkills(prompt string, index []skills.IndexEntry) 
 	loaders := s.skillLoaders()
 	loaded := make([]string, 0, 2)
 	for _, entry := range index {
+		if entry.Disabled {
+			continue
+		}
 		if !skillMatchesPrompt(entry, prompt) {
 			continue
 		}

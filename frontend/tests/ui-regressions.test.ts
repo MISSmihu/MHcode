@@ -3,6 +3,32 @@ import { describe, expect, test } from "bun:test";
 import { hasMeaningfulTurnOutput, hasUsablePartialResult } from "../src/lib/chat-results";
 
 describe("chat UI regressions", () => {
+  test("shows Skill details, safe file actions, and sliding enable controls", async () => {
+    const [settings, workbench, types, css] = await Promise.all([
+      Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+      Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    expect(settings).toContain("readSkillDetail(name)");
+    expect(settings).toContain("<SkillCodeViewer");
+    expect(settings).toContain('detailMode() === "document"');
+    expect(settings).toContain("skillDocumentBody(current().content)");
+    expect(settings).toContain("expandCodeBlocks: true");
+    expect(settings).toContain("<Portal>");
+    expect(settings).toContain('title="打开 SKILL.md 查看器"');
+    expect(settings).toContain("updateSkillEnabled(skill.name, value)");
+    expect(settings).toContain('label={`启用 ${skill.name}`}');
+    expect(workbench).toContain("ReadSkillDetail?:");
+    expect(workbench).toContain("OpenSkillFile?:");
+    expect(workbench).toContain("RevealSkillFile?:");
+    expect(types).toContain("export type SkillDetail");
+    expect(types).toContain("skills: SkillsSettings;");
+    expect(css).toContain(".skill-viewer-overlay {");
+    expect(css).toContain(".skill-document {");
+    expect(css).toContain(".settings-switch input:focus-visible + span");
+  });
+
   test("streams, deduplicates, and renders provider safety notices", async () => {
     const [app, messageContent, css, types] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
@@ -17,6 +43,23 @@ describe("chat UI regressions", () => {
     expect(css).toContain(".op-provider-notice {");
     expect(css).toContain("color-mix(in srgb, var(--accent)");
     expect(types).toContain('kind: "provider_notice"');
+  });
+
+  test("merges and renders dynamic subagents independently from the fixed AI team", async () => {
+    const [app, messageContent, css, types] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
+      Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+    ]);
+    expect(types).toContain('kind: "subagent"');
+    expect(types).toContain('agentType: "explore" | "review" | "implement"');
+    expect(app).toContain('item.kind === "subagent" && item.taskId === part.taskId');
+    expect(messageContent).toContain("<SubagentRun");
+    expect(messageContent).toContain('aria-label="动态子代理执行记录"');
+    expect(messageContent).toContain('part.name === "delegate_task"');
+    expect(css).toContain(".op-subagent-run {");
+    expect(css).toContain(".op-subagent-item.running .op-subagent-status");
   });
 
   test("keeps a one-line user message compact", async () => {
@@ -70,7 +113,7 @@ describe("chat UI regressions", () => {
 
   test("renders generated files as collapsed artifacts with HTML open actions", async () => {
     const messageContent = await Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text();
-    expect(messageContent).toContain('<details class="op-file-artifact"');
+    expect(messageContent).toMatch(/<details[\s\S]{0,120}class="op-file-artifact"/);
     expect(messageContent).toContain('runFromSummary(event, "view")');
     expect(messageContent).toContain("在右侧查看文件");
     expect(messageContent).toContain("在内置浏览器中预览");
@@ -411,7 +454,7 @@ describe("chat UI regressions", () => {
       Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
     ]);
-    expect(messageContent).toContain('<CommandActivityList parts={props.item.parts} />');
+    expect(messageContent).toMatch(/<CommandActivityList[\s\S]{0,180}parts={props\.item\.parts}/);
     expect(messageContent).toContain('class="op-command-entry"');
     expect(messageContent).toContain('case "ssh": return "command";');
     expect(messageContent).toContain('props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh"');

@@ -26,6 +26,11 @@ describe("frontend fallback state", () => {
     expect(html).toContain("hljs-keyword");
   });
 
+  test("can expand code blocks for document-style views without changing chat defaults", () => {
+    const html = renderMarkdown("```ts\nconst x = 1;\n```", { expandCodeBlocks: true });
+    expect(html).toContain('<details class="code-block" open');
+  });
+
   test("does not expose an expected running-task race as a global error", () => {
     expect(errorMessage(new Error("chat task is running; stop it before saving runtime settings"))).toBe("");
     expect(errorMessage(new Error("network failed"))).toBe("network failed");

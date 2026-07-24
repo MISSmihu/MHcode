@@ -13,22 +13,35 @@ import (
 )
 
 type Loader struct {
-	root   string
-	source fs.FS
+	root     string
+	source   fs.FS
+	diskRoot string
+	origin   string
 }
 
 func NewLoader(root string) Loader {
 	if strings.TrimSpace(root) == "" {
 		root = "."
 	}
-	return Loader{root: ".", source: os.DirFS(root)}
+	return Loader{root: ".", source: os.DirFS(root), diskRoot: root, origin: "local"}
 }
 
 func NewFSLoader(source fs.FS, root string) Loader {
 	if strings.TrimSpace(root) == "" {
 		root = "."
 	}
-	return Loader{root: filepath.ToSlash(root), source: source}
+	return Loader{root: filepath.ToSlash(root), source: source, origin: "bundled"}
+}
+
+// WithOrigin labels a loader for the UI without changing its filesystem
+// behavior. The label is also useful when a project skill overrides a global
+// skill with the same name.
+func (l Loader) WithOrigin(origin string) Loader {
+	l.origin = strings.TrimSpace(origin)
+	if l.origin == "" {
+		l.origin = "local"
+	}
+	return l
 }
 
 func (l Loader) Index() ([]IndexEntry, error) {
@@ -48,6 +61,8 @@ func (l Loader) Index() ([]IndexEntry, error) {
 			return err
 		}
 		entry := parseSkillData(path, data)
+		entry.Source = l.origin
+		entry.Path = filepath.ToSlash(path)
 		entries = append(entries, entry)
 		return nil
 	})
@@ -64,9 +79,16 @@ func (l Loader) Index() ([]IndexEntry, error) {
 }
 
 type LoadedSkill struct {
-	Name    string
-	SHA256  string
-	Content string
+	Name        string
+	Version     int
+	Trigger     string
+	Summary     string
+	SHA256      string
+	Description string
+	Source      string
+	Path        string
+	FilePath    string
+	Content     string
 }
 
 func (l Loader) Load(name string) (LoadedSkill, error) {
@@ -87,13 +109,26 @@ func (l Loader) Load(name string) (LoadedSkill, error) {
 			return err
 		}
 		entry := parseSkillData(path, data)
+		entry.Source = l.origin
+		entry.Path = filepath.ToSlash(path)
 		if entry.Name != name {
 			return nil
 		}
 		if len(data) > 256*1024 {
 			return errors.New("skill file exceeds 256 KiB")
 		}
-		loaded = LoadedSkill{Name: entry.Name, SHA256: entry.SHA256, Content: string(data)}
+		loaded = LoadedSkill{
+			Name:        entry.Name,
+			Version:     entry.Version,
+			Trigger:     entry.Trigger,
+			Summary:     entry.Summary,
+			SHA256:      entry.SHA256,
+			Description: entry.Description,
+			Source:      entry.Source,
+			Path:        entry.Path,
+			FilePath:    l.safeDiskPath(path),
+			Content:     string(data),
+		}
 		return fs.SkipAll
 	})
 	if err != nil && !errors.Is(err, fs.SkipAll) {
@@ -103,6 +138,33 @@ func (l Loader) Load(name string) (LoadedSkill, error) {
 		return LoadedSkill{}, fs.ErrNotExist
 	}
 	return loaded, nil
+}
+
+// safeDiskPath returns a physical path only for a loader rooted on disk and
+// only when symlink resolution keeps the file inside that root. Embedded
+// skills intentionally return an empty path.
+func (l Loader) safeDiskPath(path string) string {
+	if strings.TrimSpace(l.diskRoot) == "" {
+		return ""
+	}
+	root, err := filepath.Abs(l.diskRoot)
+	if err != nil {
+		return ""
+	}
+	target := filepath.Join(root, filepath.FromSlash(path))
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return ""
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return ""
+	}
+	relative, err := filepath.Rel(resolvedRoot, resolvedTarget)
+	if err != nil || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return resolvedTarget
 }
 
 func parseSkillData(path string, data []byte) IndexEntry {

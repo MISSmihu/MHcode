@@ -88,6 +88,7 @@ type MessagePart struct {
 	Status           string                `json:"status,omitempty"`
 	Input            string                `json:"input,omitempty"`
 	Output           string                `json:"output,omitempty"`
+	ToolCallID       string                `json:"toolCallId,omitempty"`
 	Stdout           string                `json:"stdout,omitempty"`
 	Stderr           string                `json:"stderr,omitempty"`
 	WorkingDirectory string                `json:"workingDirectory,omitempty"`
@@ -107,6 +108,10 @@ type MessagePart struct {
 	Summary          string                `json:"summary,omitempty"`
 	Verdict          string                `json:"verdict,omitempty"`
 	Attempt          int                   `json:"attempt,omitempty"`
+	TaskID           string                `json:"taskId,omitempty"`
+	AgentType        string                `json:"agentType,omitempty"`
+	Label            string                `json:"label,omitempty"`
+	CurrentAction    string                `json:"currentAction,omitempty"`
 	NoticeKind       string                `json:"noticeKind,omitempty"`
 	Severity         string                `json:"severity,omitempty"`
 	Message          string                `json:"message,omitempty"`
@@ -121,6 +126,9 @@ type MessagePart struct {
 	ErrorCode        string                `json:"errorCode,omitempty"`
 	HTTPStatus       int                   `json:"httpStatus,omitempty"`
 	Retryable        *bool                 `json:"retryable,omitempty"`
+	SecretID         string                `json:"secretId,omitempty"`
+	SecretLabel      string                `json:"secretLabel,omitempty"`
+	SecretSource     string                `json:"secretSource,omitempty"`
 }
 
 type MessageProgressStep struct {

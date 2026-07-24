@@ -12,6 +12,11 @@ type IndexEntry struct {
 	Summary     string `json:"summary"`
 	SHA256      string `json:"sha256"`
 	Description string `json:"description"`
+	// Disabled is a host-side setting. Disabled skills remain visible in the
+	// workbench, but are omitted from the model context and trigger matching.
+	Disabled bool   `json:"disabled"`
+	Source   string `json:"source,omitempty"`
+	Path     string `json:"path,omitempty"`
 }
 
 func FormatStableIndex(entries []IndexEntry) string {
@@ -20,6 +25,9 @@ func FormatStableIndex(entries []IndexEntry) string {
 	}
 	lines := make([]string, 0, len(entries))
 	for _, entry := range entries {
+		if entry.Disabled {
+			continue
+		}
 		lines = append(lines, fmt.Sprintf(
 			"skill: %s\nversion: %d\ntrigger: %s\nsummary: %s\nsha256: %s",
 			entry.Name,

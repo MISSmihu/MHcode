@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -33,12 +34,17 @@ type RuntimeSettings struct {
 	MCP                  MCPSettings             `json:"mcp"`
 	Model                ModelSettings           `json:"model"`
 	Team                 TeamSettings            `json:"team"`
+	Skills               SkillsSettings          `json:"skills"`
 	Update               UpdateSettings          `json:"update"`
 	Workspace            WorkspaceSettings       `json:"workspace"`
 	Memory               MemorySettings          `json:"memory"`
 }
 
-const runtimeSettingsSchemaVersion = 7
+const runtimeSettingsSchemaVersion = 8
+
+type SkillsSettings struct {
+	Disabled []string `json:"disabled"`
+}
 
 type GitSettings struct {
 	BranchPrefix            string `json:"branchPrefix"`
@@ -312,6 +318,9 @@ func DefaultRuntimeSettings() RuntimeSettings {
 				{Role: TeamRoleSynthesizer, Enabled: true},
 			},
 		},
+		Skills: SkillsSettings{
+			Disabled: []string{},
+		},
 		Update: UpdateSettings{
 			AutoCheck:    true,
 			AutoDownload: false,
@@ -457,8 +466,18 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	settings.MCP = normalizeMCPSettings(settings.MCP, defaults.MCP)
 	settings.Model = normalizeModelSettings(settings.Model, defaults.Model)
 	settings.Team = normalizeTeamSettings(settings.Team, defaults.Team, settings.Model)
+	settings.Skills = normalizeSkillsSettings(settings.Skills, defaults.Skills)
 	settings.Update = normalizeUpdateSettings(settings.Update, defaults.Update)
 	settings.Workspace = normalizeWorkspaceSettings(settings.Workspace, defaults.Workspace)
+	return settings
+}
+
+func normalizeSkillsSettings(settings, defaults SkillsSettings) SkillsSettings {
+	settings.Disabled = cleanStringList(settings.Disabled)
+	if settings.Disabled == nil {
+		settings.Disabled = cleanStringList(defaults.Disabled)
+	}
+	sort.Strings(settings.Disabled)
 	return settings
 }
 
@@ -499,6 +518,9 @@ func loadRuntimeSettings(path string) (RuntimeSettings, bool) {
 }
 
 func migrateRuntimeSettings(stored RuntimeSettings) RuntimeSettings {
+	if stored.SchemaVersion < 8 {
+		stored.Skills = DefaultRuntimeSettings().Skills
+	}
 	if stored.SchemaVersion < 7 {
 		stored.Update = DefaultRuntimeSettings().Update
 	}

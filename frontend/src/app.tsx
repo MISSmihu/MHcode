@@ -132,6 +132,7 @@ import {
   previewWorkspaceFile,
   openBrowserURL,
   openURLInSystemBrowser,
+  revealSecretResult,
 } from "./services/workbench";
 import { defaultReasoningLevel, reasoningOptions as fallbackReasoningOptions } from "./state/reasoning";
 import type {
@@ -248,6 +249,7 @@ type SessionTaskRuntime = {
 
 type SessionViewState = {
   messages: ChatMessage[];
+  disclosures?: Record<string, boolean>;
   composerDraft?: string;
   composerTail?: string;
   composerAttachments?: ChatAttachment[];
@@ -321,6 +323,7 @@ function App() {
   const [previewAttachment, setPreviewAttachment] = createSignal<ChatAttachment>();
   const [copiedMessageID, setCopiedMessageID] = createSignal("");
   const [messages, setMessages] = createSignal<ChatMessage[]>([]);
+  const [messageDisclosures, setMessageDisclosures] = createSignal<Record<string, boolean>>({});
   const [chatNearBottom, setChatNearBottom] = createSignal(true);
   const [runtimeDraft, setRuntimeDraft] = createSignal<RuntimeSettings>();
   const [drawerOpen, setDrawerOpen] = createSignal(false);
@@ -480,6 +483,7 @@ function App() {
       ...current,
       [key]: {
         messages: [...messages()],
+        disclosures: { ...messageDisclosures() },
         composerDraft: promptDraft(),
         composerTail: composerTailDraft(),
         composerAttachments: composerAttachments().map((attachment) => ({ ...attachment })),
@@ -497,6 +501,7 @@ function App() {
     const view = sessionViewStates()[sessionIdentityKey(projectID, sessionID)];
     if (!view) {
       setMessages([]);
+      setMessageDisclosures({});
       setComposerDraft("");
       setComposerTail("");
       setComposerAttachments([]);
@@ -509,6 +514,7 @@ function App() {
       return false;
     }
     setMessages([...view.messages]);
+    setMessageDisclosures({ ...(view.disclosures ?? {}) });
     setComposerDraft(view.composerDraft ?? "");
     setComposerTail(view.composerTail ?? "");
     setComposerAttachments(view.composerAttachments?.map((attachment) => ({ ...attachment })) ?? []);
@@ -519,6 +525,29 @@ function App() {
     setSidePanelView(view.sidePanelView);
     setWorkspaceFileRequest(view.workspaceFileRequest);
     return true;
+  };
+
+  const messageDisclosureKey = (messageID: string, disclosureKey: string) => `${messageID}\u0000${disclosureKey}`;
+  const isMessageDisclosureOpen = (messageID: string, disclosureKey: string) => (
+    messageDisclosures()[messageDisclosureKey(messageID, disclosureKey)] ?? false
+  );
+  const setMessageDisclosureOpen = (messageID: string, disclosureKey: string, open: boolean) => {
+    const key = messageDisclosureKey(messageID, disclosureKey);
+    setMessageDisclosures((current) => {
+      if ((current[key] ?? false) === open) return current;
+      if (!open) {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      }
+      return { ...current, [key]: true };
+    });
+  };
+  const revealMessageSecret = async (secretID: string) => {
+    const projectID = activeProjectID();
+    const sessionID = activeSessionID();
+    if (!projectID || !sessionID) throw new Error("当前没有可用会话。");
+    return (await revealSecretResult(projectID, sessionID, secretID)).value;
   };
   const planMode = createMemo(() => state()?.planMode ?? false);
   const teamMode = createMemo(() => runtimeSettings().team.enabled);
@@ -3853,6 +3882,9 @@ function App() {
                       onPreviewFile={handlePreviewFile}
                       onOpenWorkspaceFile={handleOpenWorkspaceFile}
                       onOpenURL={requestOpenURL}
+                      onRevealSecret={revealMessageSecret}
+                      isDisclosureOpen={(key) => isMessageDisclosureOpen(message.id, key)}
+                      onDisclosureChange={(key, open) => setMessageDisclosureOpen(message.id, key, open)}
                     />
 					<Show when={message.streaming || message.cancelled}>
                       <div class="op-stream-state" classList={{ cancelled: message.cancelled }}>
@@ -4809,6 +4841,15 @@ function mergeLiveToolResultParts(
     if (part.kind === "provider_notice") {
       const identity = providerNoticeIdentity(part);
       const index = next.findIndex((item) => item.kind === "provider_notice" && providerNoticeIdentity(item) === identity);
+      if (index >= 0) {
+        next[index] = { ...next[index], ...part } as MessagePart;
+      } else {
+        next.push(part);
+      }
+      continue;
+    }
+    if (part.kind === "subagent") {
+      const index = next.findIndex((item) => item.kind === "subagent" && item.taskId === part.taskId);
       if (index >= 0) {
         next[index] = { ...next[index], ...part } as MessagePart;
       } else {

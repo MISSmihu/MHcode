@@ -35,6 +35,7 @@ var remoteModePattern = regexp.MustCompile(`^[0-7]{3,4}$`)
 type SSHCredentialTool struct {
 	Policy         tools.SandboxPolicy
 	Resolve        func(string) (scopedSSHCredential, error)
+	CaptureSecret  func(label, source, value string) (tools.ResultPart, error)
 	KnownHostsPath string
 }
 
@@ -45,13 +46,14 @@ type sshToolArguments struct {
 	LocalPath    string `json:"local_path"`
 	RemotePath   string `json:"remote_path"`
 	Mode         string `json:"mode"`
+	SecretLabel  string `json:"secret_label"`
 	Timeout      int    `json:"timeout_seconds"`
 }
 
 func (t SSHCredentialTool) Name() string { return "ssh" }
 
 func (t SSHCredentialTool) Description() string {
-	return "Connect directly to a user-authorized SSH target with host, username, and password authentication through an opaque mhcode-credential reference. No SSH key, ssh-agent, or external provider authorization entry is required. Use test to verify login, run to execute a remote command, upload_file for one workspace file, or upload_directory to deploy a workspace directory. Never ask the model to place a password in command text or tool arguments."
+	return "Connect directly to a user-authorized SSH target with host, username, and password authentication through an opaque mhcode-credential reference. No SSH key, ssh-agent, or external provider authorization entry is required. Use test to verify login, run to execute a remote command, upload_file or upload_directory to deploy workspace content, and capture_secret only when the user explicitly asks to retrieve a target-system credential or other sensitive value. capture_secret stores stdout in the host vault and returns only an opaque result ID; make its command print only the requested value. Never place a password in command text or tool arguments."
 }
 
 func (t SSHCredentialTool) InputSchema() map[string]any {
@@ -60,7 +62,7 @@ func (t SSHCredentialTool) InputSchema() map[string]any {
 		"properties": map[string]any{
 			"action": map[string]any{
 				"type": "string",
-				"enum": []string{"test", "run", "upload_file", "upload_directory"},
+				"enum": []string{"test", "run", "upload_file", "upload_directory", "capture_secret"},
 			},
 			"credential_id": map[string]any{
 				"type":        "string",
@@ -81,6 +83,10 @@ func (t SSHCredentialTool) InputSchema() map[string]any {
 			"mode": map[string]any{
 				"type":        "string",
 				"description": "Optional POSIX mode for upload_file, such as 0644 or 0755.",
+			},
+			"secret_label": map[string]any{
+				"type":        "string",
+				"description": "Short user-facing label for capture_secret, such as sub2api administrator password.",
 			},
 			"timeout_seconds": map[string]any{
 				"type":        "integer",
@@ -162,6 +168,41 @@ func (t SSHCredentialTool) Execute(ctx context.Context, rawArgs json.RawMessage)
 			exitCode,
 			runErr,
 		), nil
+	case "capture_secret":
+		command := strings.TrimSpace(args.Command)
+		if command == "" {
+			return sshExecutionResult(credential, displayInput, startedAt, "", "command cannot be empty", -1, errors.New("command cannot be empty")), nil
+		}
+		if t.CaptureSecret == nil {
+			message := "host secret-result storage is unavailable"
+			return sshExecutionResult(credential, displayInput, startedAt, "", message, -1, errors.New(message)), nil
+		}
+		if !t.Policy.AllowDestructiveOps && remoteCommandLooksDestructive(command) {
+			message := "destructive remote command is disabled by the current runtime policy"
+			return sshExecutionResult(credential, displayInput, startedAt, "", message, -1, errors.New(message)), nil
+		}
+		stdout, stderr, exitCode, runErr := runSSHCommand(runCtx, client, command, nil)
+		if runErr != nil || exitCode != 0 {
+			return sshExecutionResult(
+				credential,
+				displayInput,
+				startedAt,
+				redactSSHText(stdout, credential.Password),
+				redactSSHText(stderr, credential.Password),
+				exitCode,
+				runErr,
+			), nil
+		}
+		secretValue := strings.TrimSpace(redactSSHText(stdout, credential.Password))
+		if secretValue == "" || strings.Contains(secretValue, "[已隐藏]") {
+			message := "captured output was empty or matched the SSH login password; the connection password cannot be returned"
+			return sshExecutionResult(credential, displayInput, startedAt, "", message, -1, errors.New(message)), nil
+		}
+		secretPart, captureErr := t.CaptureSecret(args.SecretLabel, "ssh://"+credential.displayTarget(), secretValue)
+		if captureErr != nil {
+			return sshExecutionResult(credential, displayInput, startedAt, "", captureErr.Error(), -1, captureErr), nil
+		}
+		return sshSecretCaptureResult(credential, displayInput, startedAt, secretPart), nil
 	case "upload_file":
 		return t.uploadFile(runCtx, client, credential, args, displayInput, startedAt), nil
 	case "upload_directory":
@@ -577,10 +618,32 @@ func sshExecutionResult(
 		DurationMs:       sshElapsedMilliseconds(startedAt, completedAt),
 	}
 	summary := fmt.Sprintf("SSH %s finished with exit code %d", credential.displayTarget(), exitCode)
-	if output != "" {
-		summary += "\n" + output
-	}
 	return tools.Result{Summary: summary, Parts: []tools.ResultPart{part}, IsError: status == "error"}
+}
+
+func sshSecretCaptureResult(
+	credential scopedSSHCredential,
+	input string,
+	startedAt time.Time,
+	secretPart tools.ResultPart,
+) tools.Result {
+	completedAt := time.Now()
+	toolPart := tools.ResultPart{
+		Kind:             tools.PartToolCall,
+		Name:             "ssh",
+		Status:           "ok",
+		Input:            input,
+		Output:           "敏感结果已保存到本机凭据库，内容未发送给模型。",
+		WorkingDirectory: "ssh://" + credential.displayTarget(),
+		ExitCode:         sshIntPointer(0),
+		StartedAt:        startedAt.Format(time.RFC3339Nano),
+		CompletedAt:      completedAt.Format(time.RFC3339Nano),
+		DurationMs:       sshElapsedMilliseconds(startedAt, completedAt),
+	}
+	return tools.Result{
+		Summary: fmt.Sprintf("Requested sensitive value was captured as host-managed result %s. The user can reveal or copy it in MHcode. The requested objective is satisfied; stop discovery and summarize now.", secretPart.SecretID),
+		Parts:   []tools.ResultPart{toolPart, secretPart},
+	}
 }
 
 func sshDisplayInput(args sshToolArguments, credential scopedSSHCredential) string {
@@ -590,6 +653,8 @@ func sshDisplayInput(args sshToolArguments, credential scopedSSHCredential) stri
 		return "ssh test " + target
 	case "run":
 		return strings.TrimSpace(args.Command)
+	case "capture_secret":
+		return strings.TrimSpace("capture secret: " + args.Command)
 	case "upload_file", "upload_directory":
 		return strings.TrimSpace(args.Action + " " + args.LocalPath + " -> " + target + ":" + args.RemotePath)
 	default:
@@ -607,6 +672,10 @@ func sshToolInputForDisplay(rawArgs json.RawMessage) string {
 	case "run":
 		if command := strings.TrimSpace(args.Command); command != "" {
 			return command
+		}
+	case "capture_secret":
+		if command := strings.TrimSpace(args.Command); command != "" {
+			return "capture secret: " + command
 		}
 	case "upload_file", "upload_directory":
 		return strings.TrimSpace(action + " " + args.LocalPath + " -> " + args.RemotePath)

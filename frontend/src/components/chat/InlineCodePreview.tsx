@@ -9,6 +9,8 @@ type InlineCodePreviewProps = {
   content: string;
   startLine?: number;
   onOpen?: () => void;
+	expanded?: boolean;
+	onExpandedChange?: (expanded: boolean) => void;
 };
 
 export function InlineCodePreview(props: InlineCodePreviewProps) {
@@ -17,6 +19,12 @@ export function InlineCodePreview(props: InlineCodePreviewProps) {
   const parsed = createMemo(() => parseInlineCode(props.content, props.startLine));
   const code = createMemo(() => parsed().rows.map((row) => row.content).join("\n"));
   const highlighted = createMemo(() => highlightCodeBlock(code(), codeLanguageForPath(props.path)));
+	const isExpanded = () => props.expanded ?? expanded();
+	const toggleExpanded = () => {
+		const next = !isExpanded();
+		if (props.onExpandedChange) props.onExpandedChange(next);
+		else setExpanded(next);
+	};
   const rangeLabel = createMemo(() => {
     const rows = parsed().rows;
     if (rows.length === 0) return "空文件";
@@ -36,7 +44,7 @@ export function InlineCodePreview(props: InlineCodePreviewProps) {
   };
 
   return (
-    <section class="op-inline-code" classList={{ collapsed: !expanded() }} aria-label={`${props.path} 代码预览`}>
+    <section class="op-inline-code" classList={{ collapsed: !isExpanded() }} aria-label={`${props.path} 代码预览`}>
       <header class="op-inline-code-toolbar">
         <div class="op-inline-code-identity" title={props.path}>
           <FileCode2 size={14} aria-hidden="true" />
@@ -55,17 +63,17 @@ export function InlineCodePreview(props: InlineCodePreviewProps) {
           </Show>
           <button
             type="button"
-            title={expanded() ? "收起代码" : "展开代码"}
-            aria-label={expanded() ? "收起代码" : "展开代码"}
-            aria-expanded={expanded()}
-            onClick={() => setExpanded((value) => !value)}
+            title={isExpanded() ? "收起代码" : "展开代码"}
+            aria-label={isExpanded() ? "收起代码" : "展开代码"}
+            aria-expanded={isExpanded()}
+			onClick={toggleExpanded}
           >
             <ChevronDown class="op-inline-code-toggle" size={14} />
           </button>
         </div>
       </header>
 
-      <Show when={expanded()}>
+	  <Show when={isExpanded()}>
         <div class="op-inline-code-scroll" role="region" aria-label="代码内容" tabIndex={0}>
           <div class="op-inline-code-grid">
             <div class="op-inline-code-gutter" aria-hidden="true">
