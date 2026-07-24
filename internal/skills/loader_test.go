@@ -62,7 +62,15 @@ func TestDiskLoaderExposesOnlyContainedSkillPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := filepath.Join(root, "disk-skill", "SKILL.md")
-	if loaded.FilePath != expected {
+	expectedInfo, err := os.Stat(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedInfo, err := os.Stat(loaded.FilePath)
+	if err != nil {
+		t.Fatalf("loaded file path is invalid: %v", err)
+	}
+	if !os.SameFile(loadedInfo, expectedInfo) {
 		t.Fatalf("file path = %q, want %q", loaded.FilePath, expected)
 	}
 	if loaded.Source != "project" || loaded.Path != "disk-skill/SKILL.md" {

@@ -87,14 +87,23 @@ func TestSkillFileActionsUseValidatedDiskPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := filepath.Join(root, "open-me", "SKILL.md")
-	if opened != expected || revealed != expected {
+	expectedInfo, err := os.Stat(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedInfo, err := os.Stat(opened)
+	if err != nil {
+		t.Fatalf("validated opened skill file missing: %v", err)
+	}
+	revealedInfo, err := os.Stat(revealed)
+	if err != nil {
+		t.Fatalf("validated revealed skill file missing: %v", err)
+	}
+	if !os.SameFile(openedInfo, expectedInfo) || !os.SameFile(revealedInfo, expectedInfo) {
 		t.Fatalf("opened = %q, revealed = %q, want %q", opened, revealed, expected)
 	}
 	if _, err := service.ReadSkillDetail("..\\outside"); err == nil {
 		t.Fatal("unknown path-like skill name should be rejected")
-	}
-	if _, err := os.Stat(opened); err != nil {
-		t.Fatalf("validated skill file missing: %v", err)
 	}
 }
 
