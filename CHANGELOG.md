@@ -2,6 +2,21 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.5 - 2026-07-24
+
+### Progress-aware loop safety
+
+- Keep the fixed cumulative tool-call limit removed for the main Agent, Plan mode, AI team, and dynamic subagents.
+- Detect repeated no-progress tool rounds using normalized call arguments and stable result fingerprints rather than a task-length budget.
+- Stop identical rounds and repeating two- or three-round cycles after three repetitions, while allowing long polling tasks whose results continue to change.
+- Disable tools and request a final summary when a cycle is detected; preserve all partial output, file changes, and task activity.
+- Stop safely if an upstream provider ignores `tool_choice: none` instead of executing another tool call.
+
+### Verification
+
+- Add regressions for identical loops, alternating loops, changing polling results, and providers that ignore disabled tools.
+- Retain the 40-call long-task and 20-update plan regressions; all Go package tests and `go vet` pass.
+
 ## v0.3.4 - 2026-07-24
 
 ### Parallel subagents

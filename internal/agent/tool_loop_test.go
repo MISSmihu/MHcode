@@ -35,6 +35,11 @@ type staticRepositoryTool struct{}
 
 type longTaskStepTool struct{ calls *int }
 
+type cycleProbeTool struct {
+	calls    *int
+	changing bool
+}
+
 func (t longTaskStepTool) Name() string        { return "long_task_step" }
 func (t longTaskStepTool) Description() string { return "records one step in a long-running test task" }
 func (t longTaskStepTool) InputSchema() map[string]any {
@@ -43,6 +48,20 @@ func (t longTaskStepTool) InputSchema() map[string]any {
 func (t longTaskStepTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
 	(*t.calls)++
 	return tools.Result{Summary: "step completed"}, nil
+}
+
+func (t cycleProbeTool) Name() string        { return "cycle_probe" }
+func (t cycleProbeTool) Description() string { return "returns a stable or changing probe result" }
+func (t cycleProbeTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (t cycleProbeTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	(*t.calls)++
+	summary := "unchanged"
+	if t.changing {
+		summary = fmt.Sprintf("progress-%d", *t.calls)
+	}
+	return tools.Result{Summary: summary}, nil
 }
 
 func (staticRepositoryTool) Name() string        { return "read_repository" }
@@ -865,6 +884,125 @@ func TestToolLoopContinuesBeyondFormerFixedCallLimit(t *testing.T) {
 	}
 	if toolCalls != 40 || completionCalls != 41 || outcome.Content != "long task completed" {
 		t.Fatalf("toolCalls=%d completionCalls=%d content=%q", toolCalls, completionCalls, outcome.Content)
+	}
+}
+
+func TestToolLoopStopsRepeatedCallWithUnchangedResult(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls})
+	var finalRequest protocol.ChatRequest
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "probe until done"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if request.ToolChoice == "none" {
+			finalRequest = request
+			return protocol.CompletionResult{Content: "stopped safely"}, nil
+		}
+		return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+			ID:       fmt.Sprintf("probe-%d", completionCalls),
+			Function: protocol.ToolCallFunction{Name: "cycle_probe", Arguments: json.RawMessage(`{"target":"same"}`)},
+		}}}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCalls != 3 || completionCalls != 4 || outcome.Content != "stopped safely" {
+		t.Fatalf("toolCalls=%d completionCalls=%d outcome=%#v", toolCalls, completionCalls, outcome)
+	}
+	if finalRequest.ToolChoice != "none" || len(finalRequest.Tools) != 0 {
+		t.Fatalf("final request still exposed tools: %#v", finalRequest)
+	}
+	if len(finalRequest.Messages) == 0 || !strings.Contains(finalRequest.Messages[len(finalRequest.Messages)-1].Content, "安全熔断") {
+		t.Fatalf("final feedback does not explain the circuit breaker: %#v", finalRequest.Messages)
+	}
+}
+
+func TestToolLoopStopsAlternatingNoProgressCycle(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls})
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "alternate probes"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if request.ToolChoice == "none" {
+			return protocol.CompletionResult{Content: "cycle summarized"}, nil
+		}
+		variant := "a"
+		if completionCalls%2 == 0 {
+			variant = "b"
+		}
+		return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+			ID:       fmt.Sprintf("probe-%d", completionCalls),
+			Function: protocol.ToolCallFunction{Name: "cycle_probe", Arguments: json.RawMessage(fmt.Sprintf(`{"variant":%q}`, variant))},
+		}}}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCalls != 6 || completionCalls != 7 || outcome.Content != "cycle summarized" {
+		t.Fatalf("toolCalls=%d completionCalls=%d outcome=%#v", toolCalls, completionCalls, outcome)
+	}
+}
+
+func TestToolLoopAllowsRepeatedCallWhenResultChanges(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls, changing: true})
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "poll changing progress"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if request.ToolChoice == "none" {
+			t.Fatal("changing results must not trigger the no-progress circuit breaker")
+		}
+		if completionCalls <= 12 {
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID:       fmt.Sprintf("probe-%d", completionCalls),
+				Function: protocol.ToolCallFunction{Name: "cycle_probe", Arguments: json.RawMessage(`{"target":"same"}`)},
+			}}}, nil
+		}
+		return protocol.CompletionResult{Content: "polling completed"}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCalls != 12 || completionCalls != 13 || outcome.Content != "polling completed" {
+		t.Fatalf("toolCalls=%d completionCalls=%d outcome=%#v", toolCalls, completionCalls, outcome)
+	}
+}
+
+func TestToolLoopStopsProviderThatIgnoresDisabledTools(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls})
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "ignore disabled tools"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		content := ""
+		if request.ToolChoice == "none" {
+			content = "provider ignored the request"
+		}
+		return protocol.CompletionResult{Content: content, ToolCalls: []protocol.ToolCall{{
+			ID:       fmt.Sprintf("probe-%d", completionCalls),
+			Function: protocol.ToolCallFunction{Name: "cycle_probe", Arguments: json.RawMessage(`{"target":"same"}`)},
+		}}}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCalls != 3 || completionCalls != 4 {
+		t.Fatalf("provider loop was not stopped: toolCalls=%d completionCalls=%d", toolCalls, completionCalls)
+	}
+	if !strings.Contains(outcome.Content, "工具已禁用后仍请求调用工具") || !strings.Contains(outcome.Content, "provider ignored") {
+		t.Fatalf("unexpected safe-stop content: %q", outcome.Content)
 	}
 }
 

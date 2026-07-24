@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -719,6 +720,11 @@ type completionFunc func(context.Context, protocol.ChatRequest) (protocol.Comple
 
 const postToolCompletionRetries = 2
 
+const (
+	toolLoopCycleRepetitions = 3
+	toolLoopMaxCyclePeriod   = 3
+)
+
 type completedWebSearch struct {
 	query   string
 	sources []tools.SearchSource
@@ -736,6 +742,47 @@ type toolLoopGuard struct {
 	objectiveSatisfied         bool
 	forceFinalResponse         bool
 	maxPlanUpdates             int
+	cycles                     toolLoopCycleGuard
+}
+
+type toolLoopCycleGuard struct {
+	history []string
+}
+
+type toolLoopRoundRecord struct {
+	Name      string
+	Arguments json.RawMessage
+	Result    tools.Result
+}
+
+type stableToolLoopRecord struct {
+	Name        string                     `json:"name"`
+	Arguments   string                     `json:"arguments"`
+	Summary     string                     `json:"summary"`
+	IsError     bool                       `json:"isError"`
+	Parts       []tools.ResultPart         `json:"parts,omitempty"`
+	Changes     []stableToolLoopChange     `json:"changes,omitempty"`
+	Attachments []stableToolLoopAttachment `json:"attachments,omitempty"`
+}
+
+type stableToolLoopChange struct {
+	Path            string `json:"path"`
+	BeforeHash      string `json:"beforeHash"`
+	AfterHash       string `json:"afterHash"`
+	Existed         bool   `json:"existed"`
+	Deleted         bool   `json:"deleted"`
+	LineEnding      string `json:"lineEnding"`
+	Encoding        string `json:"encoding"`
+	HadBOM          bool   `json:"hadBom"`
+	AfterLineEnding string `json:"afterLineEnding"`
+	AfterEncoding   string `json:"afterEncoding"`
+	AfterHadBOM     bool   `json:"afterHadBom"`
+}
+
+type stableToolLoopAttachment struct {
+	Name     string `json:"name"`
+	MIMEType string `json:"mimeType"`
+	DataHash string `json:"dataHash"`
 }
 
 const (
@@ -874,6 +921,122 @@ func normalizedToolArguments(raw json.RawMessage) string {
 		return strings.TrimSpace(string(raw))
 	}
 	return string(encoded)
+}
+
+func (g *toolLoopCycleGuard) observe(records []toolLoopRoundRecord) (int, bool) {
+	fingerprint := toolLoopRoundFingerprint(records)
+	if fingerprint == "" {
+		return 0, false
+	}
+	g.history = append(g.history, fingerprint)
+	maxHistory := toolLoopCycleRepetitions * toolLoopMaxCyclePeriod
+	if len(g.history) > maxHistory {
+		g.history = append([]string(nil), g.history[len(g.history)-maxHistory:]...)
+	}
+	for period := 1; period <= toolLoopMaxCyclePeriod; period++ {
+		needed := period * toolLoopCycleRepetitions
+		if len(g.history) < needed {
+			continue
+		}
+		window := g.history[len(g.history)-needed:]
+		repeated := true
+		for index := period; index < len(window); index++ {
+			if window[index] != window[index%period] {
+				repeated = false
+				break
+			}
+		}
+		if repeated {
+			return period, true
+		}
+	}
+	return 0, false
+}
+
+func toolLoopRoundFingerprint(records []toolLoopRoundRecord) string {
+	if len(records) == 0 {
+		return ""
+	}
+	stable := make([]stableToolLoopRecord, 0, len(records))
+	for _, record := range records {
+		parts := append([]tools.ResultPart(nil), record.Result.Parts...)
+		for index := range parts {
+			parts[index].ToolCallID = ""
+			parts[index].StartedAt = ""
+			parts[index].CompletedAt = ""
+			parts[index].DurationMs = 0
+			parts[index].RequestID = ""
+			parts[index].TaskID = ""
+			parts[index].SecretID = ""
+			parts[index].Activities = append([]tools.SubagentActivity(nil), parts[index].Activities...)
+			for activityIndex := range parts[index].Activities {
+				parts[index].Activities[activityIndex].ID = ""
+				parts[index].Activities[activityIndex].StartedAt = ""
+				parts[index].Activities[activityIndex].CompletedAt = ""
+				parts[index].Activities[activityIndex].DurationMs = 0
+			}
+		}
+		changes := make([]stableToolLoopChange, 0, len(record.Result.Changes))
+		for _, change := range record.Result.Changes {
+			changes = append(changes, stableToolLoopChange{
+				Path:            change.Path,
+				BeforeHash:      toolLoopContentHash(change.Before),
+				AfterHash:       toolLoopContentHash(change.After),
+				Existed:         change.Existed,
+				Deleted:         change.Deleted,
+				LineEnding:      change.LineEnding,
+				Encoding:        change.Encoding,
+				HadBOM:          change.HadBOM,
+				AfterLineEnding: change.AfterLineEnding,
+				AfterEncoding:   change.AfterEncoding,
+				AfterHadBOM:     change.AfterHadBOM,
+			})
+		}
+		attachments := make([]stableToolLoopAttachment, 0, len(record.Result.Attachments))
+		for _, attachment := range record.Result.Attachments {
+			attachments = append(attachments, stableToolLoopAttachment{
+				Name:     attachment.Name,
+				MIMEType: attachment.MIMEType,
+				DataHash: toolLoopContentHash(attachment.Data),
+			})
+		}
+		stable = append(stable, stableToolLoopRecord{
+			Name:        record.Name,
+			Arguments:   normalizedToolArguments(record.Arguments),
+			Summary:     strings.TrimSpace(record.Result.Summary),
+			IsError:     record.Result.IsError,
+			Parts:       parts,
+			Changes:     changes,
+			Attachments: attachments,
+		})
+	}
+	encoded, err := json.Marshal(stable)
+	if err != nil {
+		return ""
+	}
+	return toolLoopContentHash(string(encoded))
+}
+
+func toolLoopContentHash(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func toolLoopCycleFeedback(period int) string {
+	if period <= 1 {
+		return "安全熔断：相同的工具调用和结果已经连续重复，任务没有产生新进展。请停止调用工具，基于已有结果说明当前状态、已完成内容和建议的下一步。"
+	}
+	return fmt.Sprintf("安全熔断：检测到重复的 %d 步工具调用周期，结果没有产生新进展。请停止调用工具，基于已有结果说明当前状态、已完成内容和建议的下一步。", period)
+}
+
+func appendToolLoopFeedback(messages []protocol.Message, feedback string) {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Role != "tool" {
+			continue
+		}
+		messages[index].Content = strings.TrimSpace(messages[index].Content + "\n\n" + feedback)
+		return
+	}
 }
 
 func sshToolCallSignature(raw json.RawMessage) string {
@@ -1122,6 +1285,21 @@ func (s *Service) runToolLoopWithCompletionState(
 		}
 
 		// 无工具调用 → 最终答案。
+		if toolsDisabled && len(completion.ToolCalls) > 0 {
+			summary := "上游模型在工具已禁用后仍请求调用工具，MHcode 已停止本轮工具循环并保留全部已完成结果。"
+			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: summary, Status: "completed"})
+			outcome.Content = strings.TrimSpace(completion.Content)
+			if outcome.Content == "" {
+				outcome.Content = summary
+			} else {
+				outcome.Content += "\n\n" + summary
+			}
+			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
+			setOutcomeProgressStatus(&outcome, "completed")
+			emitOutcomeProgress(sink, outcome.Parts)
+			return outcome, nil
+		}
+
 		if len(completion.ToolCalls) == 0 {
 			outcome.Content = completion.Content
 			if strings.TrimSpace(outcome.Content) == "" {
@@ -1152,6 +1330,7 @@ func (s *Service) runToolLoopWithCompletionState(
 		}
 
 		// 逐个执行工具调用。
+		roundRecords := make([]toolLoopRoundRecord, 0, len(completion.ToolCalls))
 		for _, call := range completion.ToolCalls {
 			if err := ctx.Err(); err != nil {
 				setOutcomeProgressStatus(&outcome, "cancelled")
@@ -1232,10 +1411,25 @@ func (s *Service) runToolLoopWithCompletionState(
 			}
 			// 把工具结果回喂给模型。
 			messages = append(messages, toolMsg)
+			roundRecords = append(roundRecords, toolLoopRoundRecord{
+				Name:      call.Function.Name,
+				Arguments: append(json.RawMessage(nil), call.Function.Arguments...),
+				Result:    result,
+			})
 			if guard.forceFinalResponse {
 				toolsDisabled = true
 				break
 			}
+		}
+		if period, stalled := guard.cycles.observe(roundRecords); stalled {
+			feedback := toolLoopCycleFeedback(period)
+			appendToolLoopFeedback(messages, feedback)
+			toolsDisabled = true
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "status",
+				Message: feedback,
+				Status:  "running",
+			})
 		}
 	}
 }
