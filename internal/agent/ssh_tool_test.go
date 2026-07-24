@@ -175,12 +175,18 @@ func TestSSHToolRegistrationAndStablePromptGuidance(t *testing.T) {
 	prompt := formatStablePrompt(RequestContext{})
 	for _, expected := range []string{
 		"mhcode-credential://",
+		"No SSH key, ssh-agent, or external provider authorization entry is required.",
+		"not an SSH key or an external authorization entry",
 		"Password-based SSH authentication does not use ssh-add or ssh-agent.",
 		"use ssh test first",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("stable prompt is missing %q", expected)
 		}
+	}
+	preview := service.contextPreviewForInput("")
+	if !strings.Contains(stableSection(preview, "system_rules", ""), "不需要 SSH Key") {
+		t.Fatal("password SSH policy is not part of the stable context hash")
 	}
 }
 

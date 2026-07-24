@@ -7,7 +7,7 @@ describe("sensitive chat text", () => {
     const input = "IP: 192.0.2.10 用户名: root 密码: deploy-secret 帮我部署网站";
     const output = redactSensitiveTextForDisplay(input);
     expect(output).not.toContain("deploy-secret");
-    expect(output).toContain("密码: [已安全保存]");
+    expect(output).toContain("密码: [已隐藏，发送后托管]");
     expect(output).toContain("192.0.2.10");
     expect(output).toContain("root");
   });

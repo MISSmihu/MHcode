@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/vault"
 )
 
@@ -64,6 +65,54 @@ func TestPrepareScopedUserPromptStoresSSHSecretAsOpaqueReference(t *testing.T) {
 	}
 	if _, err := reloaded.resolveScopedSSHCredential(credentialID); err != nil {
 		t.Fatalf("credential reference did not survive session reload: %v", err)
+	}
+}
+
+func TestPrepareScopedUserPromptAcceptsBareIPv4AndRestoresCredentialContext(t *testing.T) {
+	secrets := vault.NewMemoryVault()
+	service := NewService(ServiceConfig{
+		SkillsDir: t.TempDir(),
+		Vault:     secrets,
+	})
+	defer service.Close()
+
+	const password = "temporary-password-for-p"
+	prepared, err := service.prepareScopedUserPrompt("P:154.219.110.33用户名：root\n密码：" + password + "\n帮我部署网站")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prepared, password) {
+		t.Fatalf("password survived bare-host replacement: %q", prepared)
+	}
+	referenceIndex := strings.Index(prepared, scopedCredentialScheme+"ssh-")
+	if referenceIndex < 0 {
+		t.Fatalf("bare IPv4 input did not produce a scoped reference: %q", prepared)
+	}
+	reference := strings.Fields(prepared[referenceIndex:])[0]
+	credential, err := service.resolveScopedSSHCredential(reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.Host != "154.219.110.33" || credential.Port != 22 || credential.Username != "root" || credential.Password != password {
+		t.Fatalf("stored credential = %#v", credential)
+	}
+
+	currentContext := service.scopedSSHContext(prepared)
+	if !strings.Contains(currentContext, reference) || !strings.Contains(currentContext, "root@154.219.110.33:22") {
+		t.Fatalf("current credential context = %q", currentContext)
+	}
+	if strings.Contains(currentContext, password) {
+		t.Fatalf("credential context leaked password: %q", currentContext)
+	}
+
+	service.sessionMessages = []protocol.Message{{Role: "user", Content: prepared}}
+	continuedContext := service.scopedSSHContext("继续")
+	if !strings.Contains(continuedContext, reference) {
+		t.Fatalf("historical credential reference was not restored: %q", continuedContext)
+	}
+	preview := service.contextPreviewForInput("继续")
+	if len(preview.VolatileTail) == 0 || !strings.Contains(preview.VolatileTail[len(preview.VolatileTail)-1].Content, reference) {
+		t.Fatalf("context preview did not expose the valid credential reference: %#v", preview.VolatileTail)
 	}
 }
 

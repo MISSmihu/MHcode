@@ -9,7 +9,7 @@ export function redactSensitiveTextForDisplay(value: string): string {
   return value
     .replace(privateKeyPattern, "[已隐藏私钥]")
     .replace(secretAssignmentPattern, (match, prefix: string, secret: string) => (
-      secret.startsWith("mhcode-credential://") ? match : `${prefix}[已安全保存]`
+      secret.startsWith("mhcode-credential://") ? match : `${prefix}[已隐藏，发送后托管]`
     ))
     .replace(bearerTokenPattern, "$1[已隐藏]")
     .replace(apiKeyPattern, "[已隐藏密钥]")

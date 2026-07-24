@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,8 +21,12 @@ const (
 
 var (
 	sshHostAssignmentPattern = regexp.MustCompile(`(?im)(?:\b(?:ip|host|hostname|server)\b|服务器(?:\s*ip)?|主机)\s*[:=：]\s*(\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?`)
-	sshUserAssignmentPattern = regexp.MustCompile(`(?im)(?:\b(?:username|user|login)\b|用户名|用户)\s*[:=：]\s*([^\s,，;；]+)`)
-	sshPassAssignmentPattern = regexp.MustCompile(`(?im)(密码|口令|passwd|password|pwd)(\s*[:=：]\s*)([^\s,，;；]+)`)
+	// Accept a bare IPv4 followed by a username label as a recovery path for
+	// composer input where the leading "IP" label was accidentally omitted.
+	sshBareIPv4Pattern               = regexp.MustCompile(`(?im)(?:^|[^a-z0-9_.-])((?:\d{1,3}\.){3}\d{1,3})(?::(\d{1,5}))?\s*(?:\b(?:username|user|login)\b|用户名|用户)\s*[:=：]`)
+	sshUserAssignmentPattern         = regexp.MustCompile(`(?im)(?:\b(?:username|user|login)\b|用户名|用户)\s*[:=：]\s*([^\s,，;；]+)`)
+	sshPassAssignmentPattern         = regexp.MustCompile(`(?im)(密码|口令|passwd|password|pwd)(\s*[:=：]\s*)([^\s,，;；]+)`)
+	scopedCredentialReferencePattern = regexp.MustCompile(`mhcode-credential://ssh-[a-f0-9]{16}`)
 )
 
 type scopedSSHCredential struct {
@@ -70,14 +75,13 @@ func (s *Service) prepareScopedUserPrompt(prompt string) (string, error) {
 }
 
 func parseScopedSSHCredential(prompt string) (scopedSSHCredential, int, int, bool) {
-	hostMatch := sshHostAssignmentPattern.FindStringSubmatch(prompt)
 	userMatch := sshUserAssignmentPattern.FindStringSubmatch(prompt)
 	passwordMatch := sshPassAssignmentPattern.FindStringSubmatchIndex(prompt)
-	if len(hostMatch) < 2 || len(userMatch) < 2 || len(passwordMatch) < 8 {
+	host, port, hostOK := parseSSHHost(prompt)
+	if !hostOK || len(userMatch) < 2 || len(passwordMatch) < 8 {
 		return scopedSSHCredential{}, 0, 0, false
 	}
 
-	host := strings.Trim(strings.TrimSpace(hostMatch[1]), "[]")
 	username := strings.TrimSpace(userMatch[1])
 	passwordStart, passwordEnd := passwordMatch[6], passwordMatch[7]
 	password := strings.TrimSpace(prompt[passwordStart:passwordEnd])
@@ -85,14 +89,6 @@ func parseScopedSSHCredential(prompt string) (scopedSSHCredential, int, int, boo
 		return scopedSSHCredential{}, 0, 0, false
 	}
 
-	port := 22
-	if len(hostMatch) > 2 && strings.TrimSpace(hostMatch[2]) != "" {
-		parsed, err := strconv.Atoi(strings.TrimSpace(hostMatch[2]))
-		if err != nil || parsed < 1 || parsed > 65535 {
-			return scopedSSHCredential{}, 0, 0, false
-		}
-		port = parsed
-	}
 	return scopedSSHCredential{
 		Kind:     "ssh_password",
 		Host:     host,
@@ -100,6 +96,26 @@ func parseScopedSSHCredential(prompt string) (scopedSSHCredential, int, int, boo
 		Username: username,
 		Password: password,
 	}, passwordStart, passwordEnd, true
+}
+
+func parseSSHHost(prompt string) (string, int, bool) {
+	match := sshHostAssignmentPattern.FindStringSubmatch(prompt)
+	if len(match) < 2 {
+		match = sshBareIPv4Pattern.FindStringSubmatch(prompt)
+	}
+	if len(match) < 2 {
+		return "", 0, false
+	}
+	host := strings.Trim(strings.TrimSpace(match[1]), "[]")
+	port := 22
+	if len(match) > 2 && strings.TrimSpace(match[2]) != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(match[2]))
+		if err != nil || parsed < 1 || parsed > 65535 {
+			return "", 0, false
+		}
+		port = parsed
+	}
+	return host, port, validSSHHost(host)
 }
 
 func validSSHHost(host string) bool {
@@ -160,6 +176,37 @@ func (s *Service) resolveScopedSSHCredential(credentialID string) (scopedSSHCred
 		return scopedSSHCredential{}, fmt.Errorf("SSH credential belongs to another conversation")
 	}
 	return credential, nil
+}
+
+// scopedSSHContext keeps a valid host-managed password reference discoverable
+// after a compressed history or a short follow-up such as "继续". It exposes
+// only opaque IDs and the non-secret target; the password stays in the vault.
+func (s *Service) scopedSSHContext(userInput string) string {
+	seen := map[string]bool{}
+	ids := make([]string, 0, 2)
+	collect := func(value string) {
+		for _, reference := range scopedCredentialReferencePattern.FindAllString(value, -1) {
+			id := strings.TrimPrefix(reference, scopedCredentialScheme)
+			if seen[id] {
+				continue
+			}
+			credential, err := s.resolveScopedSSHCredential(id)
+			if err != nil {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, scopedCredentialScheme+id+" target="+credential.displayTarget())
+		}
+	}
+	collect(userInput)
+	for _, message := range s.sessionMessages {
+		collect(message.Content)
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	sort.Strings(ids)
+	return "Password-based SSH credentials currently available to the ssh tool (no SSH key or external authorization entry is required):\n- " + strings.Join(ids, "\n- ") + "\nUse the credential_id value with ssh; do not use shell for password login."
 }
 
 func (s *Service) scopedSSHKnownHostsPath() string {

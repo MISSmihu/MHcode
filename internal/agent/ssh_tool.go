@@ -51,7 +51,7 @@ type sshToolArguments struct {
 func (t SSHCredentialTool) Name() string { return "ssh" }
 
 func (t SSHCredentialTool) Description() string {
-	return "Connect to a user-authorized SSH target through an opaque mhcode-credential reference. Use test to verify login, run to execute a remote command, upload_file for one workspace file, or upload_directory to deploy a workspace directory. Password authentication does not use ssh-add or ssh-agent. Never ask the model to place a password in command text or tool arguments."
+	return "Connect directly to a user-authorized SSH target with host, username, and password authentication through an opaque mhcode-credential reference. No SSH key, ssh-agent, or external provider authorization entry is required. Use test to verify login, run to execute a remote command, upload_file for one workspace file, or upload_directory to deploy a workspace directory. Never ask the model to place a password in command text or tool arguments."
 }
 
 func (t SSHCredentialTool) InputSchema() map[string]any {
@@ -64,7 +64,7 @@ func (t SSHCredentialTool) InputSchema() map[string]any {
 			},
 			"credential_id": map[string]any{
 				"type":        "string",
-				"description": "Opaque ID from a mhcode-credential:// reference in the user message.",
+				"description": "Opaque password reference ID from a mhcode-credential:// value in the user message; this is not an SSH key or external authorization entry.",
 			},
 			"command": map[string]any{
 				"type":        "string",

@@ -2,6 +2,19 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.2 - 2026-07-24
+
+### Secure password-based SSH
+
+- Support direct password-based SSH login from host, username, and password input without requiring an SSH key, `ssh-agent`, or an external provider authorization entry.
+- Store the password in Windows Credential Manager and pass only an opaque host-managed reference to the Agent and SSH tool.
+- Restore valid credential references across compressed history and short follow-up messages while keeping the password out of prompts, logs, plans, and conversation history.
+- Accept compact input such as `P:host username:user password:secret` and redact the secret in the composer preview.
+
+### Verification
+
+- Go tests and vet, frontend type checking and tests, production frontend build, and Wails Windows build pass.
+
 ## v0.3.1 - 2026-07-24
 
 ### Agent execution and remote operations

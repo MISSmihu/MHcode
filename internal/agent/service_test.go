@@ -325,7 +325,7 @@ func TestServiceReplacesSSHPasswordBeforeProviderRequestAndPersistence(t *testin
 	if _, err := service.SaveDeepSeekAPIKey("sk-test"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := service.SendDeepSeekMessage(context.Background(), "IP: 192.0.2.10用户名：root\n密码："+password+"\n请部署网站")
+	_, err := service.SendDeepSeekMessage(context.Background(), "P:192.0.2.10用户名：root\n密码："+password+"\n请部署网站")
 	if err != nil {
 		t.Fatal(err)
 	}

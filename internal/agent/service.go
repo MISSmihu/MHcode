@@ -1177,12 +1177,20 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 	if volatileInput == "" {
 		volatileInput = "用户本轮输入会进入易变尾部。"
 	}
+	outputRequirements := []string{
+		"输出结构化摘要。",
+		"保留文件路径、行号和对象 ID。",
+	}
+	if sshContext := s.scopedSSHContext(userInput); sshContext != "" {
+		outputRequirements = append(outputRequirements, sshContext)
+	}
 	return s.builder.Build(StableContext{
 		ProductIdentity: "MHcode 是面向开发者的 AI 协议交换台，首发打透 DeepSeek 官方接入。",
 		SystemRules: []string{
 			"保持稳定前缀文本、顺序和 schema 哈希可复现。",
 			"Skills 正文只在触发时加载，默认只注入稳定索引。",
 			"工具结果先摘要，再用 raw_result_id 引用原文。",
+			"密码 SSH 通过主机托管的不透明凭据引用直接认证，不需要 SSH Key、ssh-agent 或外部授权条目。",
 		},
 		RuntimePolicy:  s.runtimePolicyContext(),
 		Reasoning:      profile,
@@ -1191,13 +1199,10 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 		ProjectSummary: stableProject,
 		RoutingPolicy:  "Use the selected provider and protocol; preserve history across compatible route changes.",
 	}, VolatileContext{
-		UserInput:       volatileInput,
-		TriggeredSkills: s.loadTriggeredSkills(userInput, index),
-		ProjectContext:  volatileProject,
-		OutputRequirements: []string{
-			"输出结构化摘要。",
-			"保留文件路径、行号和对象 ID。",
-		},
+		UserInput:          volatileInput,
+		TriggeredSkills:    s.loadTriggeredSkills(userInput, index),
+		ProjectContext:     volatileProject,
+		OutputRequirements: outputRequirements,
 	})
 }
 
@@ -1808,7 +1813,8 @@ func formatStablePrompt(ctx RequestContext) string {
 		stableSection(ctx, "runtime_policy", "Use the configured workspace sandbox and approval policy. Do not assume access that the runtime does not grant."),
 		"- Treat the profile above as the actual runtime boundary. Tool policy and approval checks remain authoritative when OS-level filesystem or network isolation is unavailable.",
 		"- Scoped credentials supplied by the user may be used only for the exact named target and requested operation, and must never be echoed or persisted.",
-		"- A token beginning with mhcode-credential:// is an opaque credential reference whose secret is held by the host. Use its ID with the ssh tool; never claim that the referenced password is unavailable or ask the user to paste it into a shell command.",
+		"- MHcode supports direct password-based SSH when the user supplies a host, username, and password. No SSH key, ssh-agent, or external provider authorization entry is required.",
+		"- A token beginning with mhcode-credential:// is an opaque host-managed password reference, not an SSH key or an external authorization entry. Use its ID with the ssh tool; never claim that the referenced password is unavailable or ask the user to paste it into a shell command.",
 		"- Password-based SSH authentication does not use ssh-add or ssh-agent. Never run ssh-add unless the user explicitly asks to inspect or manage local SSH keys.",
 		"- For an authorized remote deployment, use ssh test first when needed, then ssh run, upload_file, or upload_directory. Never place passwords in command text, environment variables, files, plans, tool summaries, or replies.",
 		"- For a substantive multi-step task, call update_plan before implementation and after each step changes state. Send the full checklist each time, keep at most one step in_progress, and skip it for simple questions.",
