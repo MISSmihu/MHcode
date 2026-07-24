@@ -60,6 +60,7 @@ func (s *Service) runToolLoopTurn(
 	baseMessageCount int,
 	sink ChatEventSink,
 ) (ChatResult, error) {
+	sink = serializedChatEventSink(sink)
 	execRequest := baseRequest
 	planStarted := false
 	reg := s.buildToolRegistry()
@@ -583,6 +584,7 @@ func (s *Service) buildMutableToolRegistry(includePlan, includeDelegation bool) 
 	}
 	if includeDelegation {
 		reg.Add(DelegateTaskTool{Service: s})
+		reg.Add(AwaitSubagentsTool{Service: s})
 	}
 	reg.Add(tools.WriteFileTool{Policy: policy})
 	reg.Add(tools.ApplyPatchTool{Policy: policy})
@@ -783,6 +785,17 @@ type stableToolLoopAttachment struct {
 	Name     string `json:"name"`
 	MIMEType string `json:"mimeType"`
 	DataHash string `json:"dataHash"`
+}
+
+func newAwaitSubagentsToolCall() protocol.ToolCall {
+	return protocol.ToolCall{
+		ID:   fmt.Sprintf("await-subagents-%d", time.Now().UnixNano()),
+		Type: "function",
+		Function: protocol.ToolCallFunction{
+			Name:      "await_subagents",
+			Arguments: json.RawMessage(`{}`),
+		},
+	}
 }
 
 const (
@@ -1287,6 +1300,19 @@ func (s *Service) runToolLoopWithCompletionState(
 		// 无工具调用 → 最终答案。
 		if toolsDisabled && len(completion.ToolCalls) > 0 {
 			summary := "上游模型在工具已禁用后仍请求调用工具，MHcode 已停止本轮工具循环并保留全部已完成结果。"
+			if _, canCollectSubagents := reg.Get("await_subagents"); canCollectSubagents && s.hasUncollectedSubagents() {
+				call := newAwaitSubagentsToolCall()
+				result, _ := s.executeToolCall(ctx, reg, call)
+				outcome.Parts = mergeOutcomeParts(outcome.Parts, result.Parts)
+				if strings.TrimSpace(result.Summary) != "" {
+					summary += "\n\n" + result.Summary
+				}
+				if err := ctx.Err(); err != nil {
+					setOutcomeProgressStatus(&outcome, "cancelled")
+					emitOutcomeProgress(sink, outcome.Parts)
+					return outcome, err
+				}
+			}
 			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: summary, Status: "completed"})
 			outcome.Content = strings.TrimSpace(completion.Content)
 			if outcome.Content == "" {
@@ -1301,6 +1327,45 @@ func (s *Service) runToolLoopWithCompletionState(
 		}
 
 		if len(completion.ToolCalls) == 0 {
+			_, canCollectSubagents := reg.Get("await_subagents")
+			if canCollectSubagents && s.hasUncollectedSubagents() {
+				call := newAwaitSubagentsToolCall()
+				messages = append(messages, protocol.Message{
+					Role:             "assistant",
+					Content:          completion.Content,
+					ReasoningContent: completion.Reasoning,
+					ToolCalls:        []protocol.ToolCall{call},
+				})
+				executed++
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:       "tool",
+					Message:    "正在等待后台子代理完成",
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					Status:     "running",
+				})
+				result, toolMessage := s.executeToolCall(ctx, reg, call)
+				toolStatus := "completed"
+				if result.IsError {
+					toolStatus = "error"
+				}
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:       "tool",
+					Message:    result.Summary,
+					ToolName:   call.Function.Name,
+					ToolCallID: call.ID,
+					Status:     toolStatus,
+					Parts:      result.Parts,
+				})
+				outcome.Parts = mergeOutcomeParts(outcome.Parts, result.Parts)
+				messages = append(messages, toolMessage)
+				if err := ctx.Err(); err != nil {
+					setOutcomeProgressStatus(&outcome, "cancelled")
+					emitOutcomeProgress(sink, outcome.Parts)
+					return outcome, err
+				}
+				continue
+			}
 			outcome.Content = completion.Content
 			if strings.TrimSpace(outcome.Content) == "" {
 				outcome.Content = emptyToolCompletionContent(outcome.Parts)
@@ -1356,6 +1421,22 @@ func (s *Service) runToolLoopWithCompletionState(
 
 			if !guarded {
 				toolCtx := tools.WithProgressSink(ctx, func(part tools.ResultPart) {
+					if part.Kind == tools.PartSubagent {
+						message := strings.TrimSpace(part.CurrentAction)
+						if message == "" {
+							message = strings.TrimSpace(part.Summary)
+						}
+						if message == "" {
+							message = "子代理正在工作"
+						}
+						emitChatEvent(sink, ChatStreamEvent{
+							Type:    "subagent",
+							Message: message,
+							Status:  part.Status,
+							Parts:   []tools.ResultPart{part},
+						})
+						return
+					}
 					if part.Name == "" {
 						part.Name = call.Function.Name
 					}
@@ -1537,6 +1618,21 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 			}
 			continue
 		}
+		if part.Kind == tools.PartSubagent && strings.TrimSpace(part.TaskID) != "" {
+			replaced := false
+			for index := range existing {
+				if existing[index].Kind != tools.PartSubagent || existing[index].TaskID != part.TaskID {
+					continue
+				}
+				existing[index] = mergeSubagentParts(existing[index], part)
+				replaced = true
+				break
+			}
+			if !replaced {
+				existing = append(existing, part)
+			}
+			continue
+		}
 		if part.Kind != tools.PartProgress {
 			existing = append(existing, part)
 			continue
@@ -1554,6 +1650,22 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 		}
 	}
 	return existing
+}
+
+func mergeSubagentParts(existing, incoming tools.ResultPart) tools.ResultPart {
+	if subagentStatusIsTerminal(existing.Status) && !subagentStatusIsTerminal(incoming.Status) {
+		return existing
+	}
+	return incoming
+}
+
+func subagentStatusIsTerminal(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "completed", "error", "cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 func providerResultPartIdentity(part tools.ResultPart) string {
@@ -1673,6 +1785,10 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 				Content:    summary,
 			}
 	}
+	if toolNeedsExclusiveWorkspaceAccess(name, tool) {
+		s.toolMutationMu.Lock()
+		defer s.toolMutationMu.Unlock()
+	}
 
 	result, err := s.runToolWithApproval(ctx, tool, name, normalizedArgs)
 	if err != nil {
@@ -1727,6 +1843,17 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 		Content:     feedback,
 		Attachments: protocolToolAttachments(result.Attachments),
 	}
+}
+
+func toolNeedsExclusiveWorkspaceAccess(name string, tool tools.Tool) bool {
+	if _, ok := tool.(tools.MutatingTool); ok {
+		return true
+	}
+	switch name {
+	case "run_command", "git", "terminal":
+		return true
+	}
+	return strings.HasPrefix(name, "mcp__")
 }
 
 func ensureToolExecutionMetadata(result tools.Result, name, toolCallID string, rawArgs json.RawMessage, startedAt, completedAt time.Time) tools.Result {
@@ -1829,13 +1956,20 @@ func ensureToolErrorPart(result tools.Result, name string, rawArgs json.RawMessa
 			return result
 		}
 	}
-	result.Parts = []tools.ResultPart{{
+	preserved := make([]tools.ResultPart, 0, len(result.Parts)+1)
+	preserved = append(preserved, tools.ResultPart{
 		Kind:   tools.PartToolCall,
 		Name:   name,
 		Status: "error",
 		Input:  toolInputForDisplay(name, rawArgs),
 		Output: result.Summary,
-	}}
+	})
+	for _, part := range result.Parts {
+		if part.Kind == tools.PartSubagent {
+			preserved = append(preserved, part)
+		}
+	}
+	result.Parts = preserved
 	return result
 }
 

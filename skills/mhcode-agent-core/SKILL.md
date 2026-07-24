@@ -146,9 +146,11 @@ planner → implementer → tester / reviewer → synthesizer
 
 ## 动态子代理
 
-- 同一次 `delegate_task` 中的 explore、review 和 implement 全部并发启动。
-- 多个 implement 必须由主 Agent 划分互不重叠的文件范围。
+- `delegate_task` 只负责后台启动并立即返回任务 ID；主 Agent 继续自己的独立工作，在最终综合前通过 `await_subagents` 查询或等待结果。
+- 同一次 `delegate_task` 中的 explore、review 和 implement 全部并发启动，主 Agent 与子代理也必须并行推进。
+- 多个 implement 必须由主 Agent 划分互不重叠的文件范围，主 Agent 同时避开这些已委派文件。
 - 每个子代理拥有独立取消句柄；停止一个子代理不影响兄弟任务和父任务，停止父任务会取消全部子代理。
+- 父任务结束或回滚前必须 join 全部子代理；模型忘记调用 `await_subagents` 时，工具循环在最终回答前自动收集并要求主 Agent 综合。
 - 实时正文、推理、工具活动、状态和最终摘要写入结构化 `subagent` 片段，并随会话事件持久化。
 - 子代理输出窗口只读；用户可以查看和停止，不能向子代理直接发送消息。
 - 子代理工具循环同样没有固定调用次数上限，但继续受防重复、超时、上下文、审批和沙箱约束。

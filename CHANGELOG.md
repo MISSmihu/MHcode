@@ -2,6 +2,27 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.6 - 2026-07-24
+
+### True parent-child parallelism
+
+- Make `delegate_task` start dynamic subagents in the background and return task IDs immediately instead of blocking the primary Agent.
+- Add `await_subagents` for explicit status queries and final collection, with automatic collection before synthesis when the model omits it.
+- Let the primary Agent continue independent reads, analysis, and tool work while up to three subagents run concurrently.
+- Keep fixed cumulative tool-call limits removed; the three-worker cap only bounds concurrent model fan-out.
+
+### Lifecycle and live status safety
+
+- Join every child before parent commit or rollback, cancel children with the parent, and preserve independent per-child cancellation.
+- Serialize workspace-mutating tools while leaving read-only work and model inference concurrent.
+- Stream subagent progress as dedicated events so a completed `delegate_task` cannot regress to a long-running tool card.
+- Preserve terminal subagent and tool states against late progress events, while returning child artifacts and usage exactly once.
+
+### Verification
+
+- Add regressions for immediate delegation, simultaneous workers, parent work during a blocked child, fan-out limits, released slots, cancellation, automatic collection, event ordering, and artifact deduplication.
+- All Go package tests, `go vet`, frontend type checking, 72 frontend tests, and the production Vite build pass.
+
 ## v0.3.5 - 2026-07-24
 
 ### Progress-aware loop safety

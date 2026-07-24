@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +32,26 @@ type subagentEndToEndProvider struct {
 	childCalls         int
 	childTools         []protocol.ToolDefinition
 	sawDelegatedResult bool
+}
+
+type parentChildParallelProvider struct {
+	mu             sync.Mutex
+	mainCalls      int
+	childCalls     int
+	sawChildResult bool
+	childStarted   chan struct{}
+	mainProgressed chan struct{}
+	releaseChild   chan struct{}
+	childOnce      sync.Once
+	mainOnce       sync.Once
+}
+
+type cancellingImplementProvider struct {
+	mu               sync.Mutex
+	mainCalls        int
+	childCalls       int
+	childWriteDone   chan struct{}
+	childWriteSignal sync.Once
 }
 
 type selectiveSubagentProvider struct {
@@ -152,6 +174,118 @@ func (p *subagentEndToEndProvider) Stream(_ context.Context, request protocol.Ch
 	return events, nil
 }
 
+func (p *parentChildParallelProvider) Name() string { return "parent-child-parallel" }
+
+func (p *parentChildParallelProvider) ListModels(context.Context) ([]protocol.Model, error) {
+	return []protocol.Model{{ID: "subagent-model"}}, nil
+}
+
+func (p *parentChildParallelProvider) Complete(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error) {
+	return protocol.CompletionResult{}, errors.New("unexpected non-streaming completion")
+}
+
+func (p *parentChildParallelProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+	events := make(chan protocol.StreamEvent, 2)
+	if request.Metadata["request_kind"] == "subagent" {
+		p.mu.Lock()
+		p.childCalls++
+		p.mu.Unlock()
+		p.childOnce.Do(func() { close(p.childStarted) })
+		go func() {
+			defer close(events)
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.releaseChild:
+				events <- protocol.StreamEvent{Type: "delta", Delta: "后台审阅完成。"}
+			}
+		}()
+		return events, nil
+	}
+
+	p.mu.Lock()
+	p.mainCalls++
+	mainCall := p.mainCalls
+	if len(request.Messages) > 0 && request.Messages[len(request.Messages)-1].Role == "tool" {
+		p.sawChildResult = p.sawChildResult || strings.Contains(request.Messages[len(request.Messages)-1].Content, "后台审阅完成")
+	}
+	p.mu.Unlock()
+	switch mainCall {
+	case 1:
+		events <- protocol.StreamEvent{Type: "tool_calls", ToolCalls: []protocol.ToolCall{{
+			ID: "delegate-parallel", Type: "function", Function: protocol.ToolCallFunction{
+				Name:      "delegate_task",
+				Arguments: json.RawMessage(`{"tasks":[{"label":"后台审阅","task":"等待主 Agent 完成独立检查后再返回","agentType":"review"}]}`),
+			},
+		}}}
+	case 2:
+		events <- protocol.StreamEvent{Type: "tool_calls", ToolCalls: []protocol.ToolCall{{
+			ID: "main-list", Type: "function", Function: protocol.ToolCallFunction{
+				Name: "list_dir", Arguments: json.RawMessage(`{"path":"."}`),
+			},
+		}}}
+	case 3:
+		p.mainOnce.Do(func() { close(p.mainProgressed) })
+		events <- protocol.StreamEvent{Type: "delta", Delta: "主 Agent 已完成自己的目录检查。"}
+	default:
+		events <- protocol.StreamEvent{Type: "delta", Delta: "主 Agent 已并行完成并综合子代理结果。"}
+	}
+	close(events)
+	return events, nil
+}
+
+func (p *cancellingImplementProvider) Name() string { return "cancelling-implement" }
+
+func (p *cancellingImplementProvider) ListModels(context.Context) ([]protocol.Model, error) {
+	return []protocol.Model{{ID: "subagent-model"}}, nil
+}
+
+func (p *cancellingImplementProvider) Complete(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error) {
+	return protocol.CompletionResult{}, errors.New("unexpected non-streaming completion")
+}
+
+func (p *cancellingImplementProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+	events := make(chan protocol.StreamEvent, 1)
+	if request.Metadata["request_kind"] == "subagent" {
+		p.mu.Lock()
+		p.childCalls++
+		childCall := p.childCalls
+		p.mu.Unlock()
+		if childCall == 1 {
+			events <- protocol.StreamEvent{Type: "tool_calls", ToolCalls: []protocol.ToolCall{{
+				ID: "child-write", Type: "function", Function: protocol.ToolCallFunction{
+					Name: "write_file", Arguments: json.RawMessage(`{"path":"child.txt","content":"after\n"}`),
+				},
+			}}}
+			close(events)
+			return events, nil
+		}
+		p.childWriteSignal.Do(func() { close(p.childWriteDone) })
+		go func() {
+			defer close(events)
+			<-ctx.Done()
+		}()
+		return events, nil
+	}
+
+	p.mu.Lock()
+	p.mainCalls++
+	mainCall := p.mainCalls
+	p.mu.Unlock()
+	if mainCall == 1 {
+		events <- protocol.StreamEvent{Type: "tool_calls", ToolCalls: []protocol.ToolCall{{
+			ID: "delegate-implement", Type: "function", Function: protocol.ToolCallFunction{
+				Name:      "delegate_task",
+				Arguments: json.RawMessage(`{"tasks":[{"label":"写入后等待","task":"创建 child.txt 后等待","agentType":"implement"}]}`),
+			},
+		}}}
+	} else {
+		events <- protocol.StreamEvent{Type: "delta", Delta: "主 Agent 等待后台实现完成。"}
+	}
+	close(events)
+	return events, nil
+}
+
 func newSubagentToolTest(t *testing.T, provider protocol.Provider) (*Service, context.Context) {
 	t.Helper()
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
@@ -179,18 +313,27 @@ func newSubagentToolTest(t *testing.T, provider protocol.Provider) (*Service, co
 }
 
 func TestDelegateTaskRunsReadOnlyWorkersConcurrentlyWithoutCoordinatorTools(t *testing.T) {
-	provider := &subagentProbeProvider{delay: 80 * time.Millisecond}
+	provider := &subagentProbeProvider{delay: 200 * time.Millisecond}
 	service, ctx := newSubagentToolTest(t, provider)
 	args := json.RawMessage(`{"tasks":[
 		{"label":"结构探索","task":"检查目录结构","agentType":"explore"},
 		{"label":"风险审阅","task":"检查潜在回归","agentType":"review"}
 	]}`)
+	startedAt := time.Now()
 	result, err := (DelegateTaskTool{Service: service}).Execute(ctx, args)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.IsError {
 		t.Fatalf("delegate result = %#v", result)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 100*time.Millisecond {
+		t.Fatalf("delegate_task blocked for %s instead of returning immediately", elapsed)
+	}
+	assertSubagentParts(t, result.Parts, 2, "pending")
+	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
 	}
 	requests, maxActive := provider.snapshot()
 	if maxActive < 2 {
@@ -205,7 +348,8 @@ func TestDelegateTaskRunsReadOnlyWorkersConcurrentlyWithoutCoordinatorTools(t *t
 		}
 		assertSubagentToolSet(t, request.Tools, false)
 	}
-	assertSubagentParts(t, result.Parts, 2, "completed")
+	assertSubagentParts(t, collected.Parts, 2, "completed")
+	service.finishSubagentTurn(false)
 }
 
 func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
@@ -249,7 +393,7 @@ func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
 	childTools := append([]protocol.ToolDefinition(nil), provider.childTools...)
 	sawDelegatedResult := provider.sawDelegatedResult
 	provider.mu.Unlock()
-	if mainCalls != 2 || childCalls != 1 || !sawDelegatedResult {
+	if mainCalls != 3 || childCalls != 1 || !sawDelegatedResult {
 		t.Fatalf("provider calls main=%d child=%d saw result=%v", mainCalls, childCalls, sawDelegatedResult)
 	}
 	assertSubagentToolSet(t, childTools, false)
@@ -259,6 +403,150 @@ func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
 	}
 	if !strings.Contains(liveOutput, "子代理确认了真实目录结构") {
 		t.Fatalf("live subagent output = %q", liveOutput)
+	}
+}
+
+func TestMainAgentContinuesToolWorkWhileSubagentRuns(t *testing.T) {
+	provider := &parentChildParallelProvider{
+		childStarted:   make(chan struct{}),
+		mainProgressed: make(chan struct{}),
+		releaseChild:   make(chan struct{}),
+	}
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	service.reasoning = ReasoningHigh
+	service.runtimeSettings.WorkspaceRoot = t.TempDir()
+	service.runtimeSettings.FilesystemAccess = "workspace-write"
+	service.runtimeSettings.SandboxMode = "workspace-write"
+	service.runtimeSettings.ApprovalPolicy = "never"
+	service.runtimeSettings.Model = ModelSettings{
+		SelectedProviderID: "probe",
+		SelectedModelID:    "subagent-model",
+		Providers: []ModelProviderSetting{{
+			ID: "probe", Name: "Probe", Protocol: "local", APIType: "chat-completions",
+			BaseURL: "http://127.0.0.1:11434/v1", Enabled: true, DefaultModelID: "subagent-model",
+			Models: []ProviderModel{{ID: "subagent-model", DisplayName: "Subagent", Provider: "probe", ContextWindowTokens: 128000}},
+		}},
+	}
+	service.providerFactory = func(chatRoute) (protocol.Provider, error) { return provider, nil }
+
+	type chatOutcome struct {
+		result ChatResult
+		err    error
+	}
+	var eventsMu sync.Mutex
+	var events []ChatStreamEvent
+	done := make(chan chatOutcome, 1)
+	go func() {
+		result, err := service.SendChatMessageWithEvents(context.Background(), "并行检查项目", func(event ChatStreamEvent) {
+			eventsMu.Lock()
+			events = append(events, event)
+			eventsMu.Unlock()
+		})
+		done <- chatOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-provider.childStarted:
+	case <-time.After(time.Second):
+		t.Fatal("subagent did not start")
+	}
+	select {
+	case <-provider.mainProgressed:
+	case <-time.After(time.Second):
+		t.Fatal("main Agent did not continue its own tool work while child was blocked")
+	}
+	close(provider.releaseChild)
+
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		if outcome.result.Content != "主 Agent 已并行完成并综合子代理结果。" {
+			t.Fatalf("result content = %q", outcome.result.Content)
+		}
+		assertSubagentParts(t, outcome.result.Parts, 1, "completed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("parallel parent/child turn did not complete")
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.mainCalls != 4 || provider.childCalls != 1 || !provider.sawChildResult {
+		t.Fatalf("provider calls main=%d child=%d saw child=%v", provider.mainCalls, provider.childCalls, provider.sawChildResult)
+	}
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+	delegateCompleted := false
+	sawSubagentEvent := false
+	for _, event := range events {
+		if event.Type == "tool" && event.ToolName == "delegate_task" && event.Status == "completed" {
+			delegateCompleted = true
+			continue
+		}
+		if event.Type == "tool" && event.ToolName == "delegate_task" && event.Status == "running" && delegateCompleted {
+			t.Fatalf("delegate_task regressed to running after completion: %#v", event)
+		}
+		if event.Type == "subagent" && len(event.Parts) == 1 && event.Parts[0].Kind == tools.PartSubagent {
+			sawSubagentEvent = true
+		}
+	}
+	if !delegateCompleted || !sawSubagentEvent {
+		t.Fatalf("delegate completed=%v subagent event=%v events=%#v", delegateCompleted, sawSubagentEvent, events)
+	}
+}
+
+func TestParentCancellationJoinsImplementWorkerBeforeRollback(t *testing.T) {
+	workspace := t.TempDir()
+	provider := &cancellingImplementProvider{childWriteDone: make(chan struct{})}
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	service.reasoning = ReasoningHigh
+	service.runtimeSettings.WorkspaceRoot = workspace
+	service.runtimeSettings.FilesystemAccess = "workspace-write"
+	service.runtimeSettings.SandboxMode = "workspace-write"
+	service.runtimeSettings.ApprovalPolicy = "never"
+	service.runtimeSettings.Model = ModelSettings{
+		SelectedProviderID: "probe",
+		SelectedModelID:    "subagent-model",
+		Providers: []ModelProviderSetting{{
+			ID: "probe", Name: "Probe", Protocol: "local", APIType: "chat-completions",
+			BaseURL: "http://127.0.0.1:11434/v1", Enabled: true, DefaultModelID: "subagent-model",
+			Models: []ProviderModel{{ID: "subagent-model", DisplayName: "Subagent", Provider: "probe", ContextWindowTokens: 128000}},
+		}},
+	}
+	service.providerFactory = func(chatRoute) (protocol.Provider, error) { return provider, nil }
+	turn := service.captureTurnSnapshot()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.SendChatMessageWithEvents(ctx, "让后台实现后等待", nil)
+		done <- err
+	}()
+	select {
+	case <-provider.childWriteDone:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("implement subagent did not finish its write")
+	}
+	path := filepath.Join(workspace, "child.txt")
+	if content, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(content)) != "after" {
+		cancel()
+		t.Fatalf("child write was not visible before cancellation: content=%q err=%v", content, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parent result error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled parent did not join its implement subagent")
+	}
+	if err := service.rollbackTurn(turn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("child write survived parent rollback: %v", err)
 	}
 }
 
@@ -273,6 +561,11 @@ func TestDelegateTaskRunsImplementWorkersConcurrentlyAndAllowsWriteTools(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertSubagentParts(t, result.Parts, 2, "pending")
+	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
 	requests, maxActive := provider.snapshot()
 	if maxActive < 2 {
 		t.Fatalf("implement workers did not overlap, max active = %d", maxActive)
@@ -283,18 +576,81 @@ func TestDelegateTaskRunsImplementWorkersConcurrentlyAndAllowsWriteTools(t *test
 	for _, request := range requests {
 		assertSubagentToolSet(t, request.Tools, true)
 	}
-	assertSubagentParts(t, result.Parts, 2, "completed")
+	assertSubagentParts(t, collected.Parts, 2, "completed")
+	service.finishSubagentTurn(false)
+}
+
+func TestDelegateTaskRejectsFanoutBeyondActiveWorkerLimit(t *testing.T) {
+	provider := &subagentProbeProvider{block: true}
+	service, ctx := newSubagentToolTest(t, provider)
+	first, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+		{"label":"first","task":"wait","agentType":"explore"},
+		{"label":"second","task":"wait","agentType":"review"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubagentParts(t, first.Parts, 2, "pending")
+
+	second, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+		{"label":"third","task":"wait","agentType":"explore"},
+		{"label":"fourth","task":"wait","agentType":"review"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.IsError || !strings.Contains(second.Summary, "并发扇出最多为 3") {
+		t.Fatalf("fanout result = %#v", second)
+	}
+	if active := service.activeSubagentCount(); active != 2 {
+		t.Fatalf("active subagents = %d, want 2", active)
+	}
+	service.finishSubagentTurn(true)
+}
+
+func TestCompletedSubagentsReleaseActiveWorkerSlotsBeforeCollection(t *testing.T) {
+	provider := &subagentProbeProvider{delay: time.Millisecond}
+	service, ctx := newSubagentToolTest(t, provider)
+	first, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+		{"label":"first","task":"finish","agentType":"explore"},
+		{"label":"second","task":"finish","agentType":"review"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubagentParts(t, first.Parts, 2, "pending")
+	deadline := time.Now().Add(time.Second)
+	for service.activeSubagentCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if active := service.activeSubagentCount(); active != 0 {
+		t.Fatalf("completed subagents still occupy %d active slots", active)
+	}
+
+	second, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+		{"label":"third","task":"finish","agentType":"explore"},
+		{"label":"fourth","task":"finish","agentType":"review"},
+		{"label":"fifth","task":"finish","agentType":"explore"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.IsError {
+		t.Fatalf("released slots rejected new workers: %#v", second)
+	}
+	assertSubagentParts(t, second.Parts, 3, "pending")
+	service.finishSubagentTurn(false)
 }
 
 func TestDelegateTaskCancellationPersistsCancelledWorkerState(t *testing.T) {
 	provider := &subagentProbeProvider{block: true, started: make(chan struct{})}
 	service, baseCtx := newSubagentToolTest(t, provider)
 	ctx, cancel := context.WithCancel(baseCtx)
-	done := make(chan tools.Result, 1)
-	go func() {
-		result, _ := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[{"label":"阻塞检查","task":"等待取消","agentType":"explore"}]}`))
-		done <- result
-	}()
+	result, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[{"label":"阻塞检查","task":"等待取消","agentType":"explore"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubagentParts(t, result.Parts, 1, "pending")
 
 	select {
 	case <-provider.started:
@@ -302,14 +658,13 @@ func TestDelegateTaskCancellationPersistsCancelledWorkerState(t *testing.T) {
 		t.Fatal("subagent provider did not start")
 	}
 	cancel()
+	done := make(chan []tools.ResultPart, 1)
+	go func() { done <- service.finishSubagentTurn(true) }()
 	select {
-	case result := <-done:
-		if !result.IsError {
-			t.Fatalf("cancelled result should be marked as error: %#v", result)
-		}
-		assertSubagentParts(t, result.Parts, 1, "cancelled")
+	case parts := <-done:
+		assertSubagentParts(t, parts, 1, "cancelled")
 	case <-time.After(time.Second):
-		t.Fatal("delegate task did not stop promptly")
+		t.Fatal("parent cancellation did not join the delegated task promptly")
 	}
 }
 
@@ -328,14 +683,14 @@ func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {
 		taskIDs = append(taskIDs, part.TaskID)
 		mu.Unlock()
 	})
-	done := make(chan tools.Result, 1)
-	go func() {
-		result, _ := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
-			{"label":"first","task":"wait","agentType":"explore"},
-			{"label":"second","task":"wait","agentType":"review"}
-		]}`))
-		done <- result
-	}()
+	result, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+		{"label":"first","task":"wait","agentType":"explore"},
+		{"label":"second","task":"wait","agentType":"review"}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubagentParts(t, result.Parts, 2, "pending")
 
 	started := map[string]bool{}
 	for len(started) < 2 {
@@ -366,6 +721,11 @@ func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {
 	}
 	close(provider.release)
 
+	done := make(chan tools.Result, 1)
+	go func() {
+		collected, _ := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+		done <- collected
+	}()
 	select {
 	case result := <-done:
 		statuses := map[string]string{}
@@ -387,8 +747,9 @@ func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {
 			t.Fatalf("sibling status map = %#v", statuses)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("delegate task did not finish after sibling completed")
+		t.Fatal("await_subagents did not finish after sibling completed")
 	}
+	service.finishSubagentTurn(false)
 }
 
 func TestSubagentPartRoundTripsThroughEventLog(t *testing.T) {
@@ -416,6 +777,45 @@ func TestSubagentPartRoundTripsThroughEventLog(t *testing.T) {
 	}
 }
 
+func TestMergeOutcomePartsUpsertsSubagentWithoutTerminalRegression(t *testing.T) {
+	pending := tools.ResultPart{Kind: tools.PartSubagent, TaskID: "subagent-1", Status: "pending", Label: "审阅"}
+	completed := tools.ResultPart{Kind: tools.PartSubagent, TaskID: "subagent-1", Status: "completed", Label: "审阅", Summary: "完成"}
+	parts := mergeOutcomeParts([]tools.ResultPart{pending}, []tools.ResultPart{completed})
+	assertSubagentParts(t, parts, 1, "completed")
+
+	parts = mergeOutcomeParts(parts, []tools.ResultPart{pending})
+	assertSubagentParts(t, parts, 1, "completed")
+	if parts[0].Summary != "完成" {
+		t.Fatalf("terminal subagent details regressed: %#v", parts[0])
+	}
+}
+
+func TestCollectedSubagentArtifactsAreReturnedOnlyOnce(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	control := &subagentControl{
+		taskID: "subagent-artifact", cancel: func() {}, done: make(chan struct{}),
+		latest: tools.ResultPart{Kind: tools.PartSubagent, TaskID: "subagent-artifact", Status: "running"},
+	}
+	service.subagents = map[string]*subagentControl{control.taskID: control}
+	control.finish(delegatedTaskResult{
+		part:      tools.ResultPart{Kind: tools.PartSubagent, TaskID: control.taskID, Status: "completed"},
+		artifacts: []tools.ResultPart{{Kind: tools.PartDiff, Path: "one.go", Patch: "+one"}},
+	})
+
+	first, _ := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	if countPartKind(first.Parts, tools.PartDiff) != 1 {
+		t.Fatalf("first collection artifacts = %#v", first.Parts)
+	}
+	secondArgs := json.RawMessage(`{"taskIds":["subagent-artifact"]}`)
+	second, _ := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), secondArgs)
+	if countPartKind(second.Parts, tools.PartDiff) != 0 {
+		t.Fatalf("second collection repeated artifacts = %#v", second.Parts)
+	}
+	if final := service.finishSubagentTurn(false); countPartKind(final, tools.PartDiff) != 0 {
+		t.Fatalf("turn cleanup repeated artifacts = %#v", final)
+	}
+}
+
 func TestCancelledSubagentPartSurvivesToolErrorWrapping(t *testing.T) {
 	provider := &subagentProbeProvider{delay: time.Millisecond}
 	service, baseCtx := newSubagentToolTest(t, provider)
@@ -438,6 +838,16 @@ func containsString(values []string, expected string) bool {
 	return false
 }
 
+func countPartKind(parts []tools.ResultPart, kind tools.PartKind) int {
+	count := 0
+	for _, part := range parts {
+		if part.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
 func assertSubagentToolSet(t *testing.T, definitions []protocol.ToolDefinition, writable bool) {
 	t.Helper()
 	names := make(map[string]bool, len(definitions))
@@ -446,6 +856,9 @@ func assertSubagentToolSet(t *testing.T, definitions []protocol.ToolDefinition, 
 	}
 	if names["delegate_task"] {
 		t.Fatal("worker tool registry contains delegate_task")
+	}
+	if names["await_subagents"] {
+		t.Fatal("worker tool registry contains await_subagents")
 	}
 	if names["update_plan"] {
 		t.Fatal("worker tool registry contains main-plan coordinator")

@@ -141,6 +141,7 @@ type DeepSeekSessionState struct {
 type Service struct {
 	activityMu      sync.Mutex
 	subagentMu      sync.Mutex
+	toolMutationMu  sync.Mutex
 	stateMu         sync.RWMutex
 	snapshotMu      sync.RWMutex
 	turnActive      bool
@@ -852,6 +853,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
 	turn := s.captureTurnSnapshot()
 	defer func() {
+		subagentParts := s.finishSubagentTurn(err != nil || ctx.Err() != nil)
+		if len(subagentParts) > 0 {
+			result.Parts = mergeOutcomeParts(result.Parts, subagentParts)
+		}
 		if err == nil {
 			result.TurnCommitted = true
 			return
@@ -1219,7 +1224,8 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 			"保持稳定前缀文本、顺序和 schema 哈希可复现。",
 			"Skills 正文只在触发时加载，默认只注入稳定索引。",
 			"工具结果先摘要，再用 raw_result_id 引用原文。",
-			"遇到 1-3 个彼此独立且能明显并行推进的探索、审阅或实现子任务时，可使用 delegate_task；不要为简单任务委派，子代理不得递归委派。",
+			"遇到 1-3 个彼此独立且能明显并行推进的探索、审阅或实现子任务时，可使用 delegate_task；它会立即返回，子代理在后台运行且不得递归委派。",
+			"启动子代理后，先继续主 Agent 可独立完成且文件范围不重叠的工作；只在需要结果或准备最终综合时调用 await_subagents，不要启动后立刻空等。",
 			"密码 SSH 通过主机托管的不透明凭据引用直接认证，不需要 SSH Key、ssh-agent 或外部授权条目。",
 			"用户明确要求读取已授权目标系统中的账号、密码或令牌时，使用 ssh.capture_secret 将目标值交给本机凭据库；模型和事件日志不得接收明文。SSH 登录密码永远不可返回。",
 		},

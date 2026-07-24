@@ -1067,6 +1067,13 @@ function App() {
           status: event.status === "running" ? `正在运行 ${event.toolName || "工具"}` : event.status === "error" ? `${event.toolName || "工具"} 执行失败` : `${event.toolName || "工具"} 已完成`,
         }));
         break;
+      case "subagent":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+          ...message,
+          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
+          status: event.message || "子代理正在工作",
+        }));
+        break;
       case "progress":
         if (event.progress) updateSessionTaskProgress(projectID, sessionID, event.progress);
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, parts: updateLiveProgressPart(message.parts, event.progress), status: "正在执行任务" }));
@@ -1307,6 +1314,15 @@ function App() {
             : event.status === "error"
               ? `${event.toolName || "工具"} 执行失败`
               : `${event.toolName || "工具"} 已完成`,
+          statusKind: undefined,
+          compressionStatus: undefined,
+        }));
+        break;
+      case "subagent":
+        updateStreamingMessage((message) => ({
+          ...message,
+          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
+          status: event.message || "子代理正在工作",
           statusKind: undefined,
           compressionStatus: undefined,
         }));
@@ -4790,7 +4806,10 @@ function updateLiveToolParts(parts: MessagePart[] | undefined, event: ChatTaskEv
     output: status === "running" ? undefined : event.message,
   };
   if (index >= 0) {
-    next[index] = { ...next[index], ...livePart } as MessagePart;
+    const currentPart = next[index] as Extract<MessagePart, { kind: "tool_call" }>;
+    next[index] = isTerminalToolStatus(currentPart.status) && livePart.status === "running"
+      ? currentPart
+      : { ...currentPart, ...livePart } as MessagePart;
   } else {
     next.push(livePart);
   }
@@ -4891,7 +4910,9 @@ function mergeLiveToolResultParts(
       }
       if (index >= 0) {
         const currentPart = next[index] as Extract<MessagePart, { kind: "tool_call" }>;
-        next[index] = { ...currentPart, ...part, toolCallId: currentPart.toolCallId };
+        next[index] = isTerminalToolStatus(currentPart.status) && part.status === "running"
+          ? currentPart
+          : { ...currentPart, ...part, toolCallId: currentPart.toolCallId };
       } else {
         next.push(part);
       }
@@ -4922,7 +4943,12 @@ function mergeLiveToolResultParts(
     if (part.kind === "subagent") {
       const index = next.findIndex((item) => item.kind === "subagent" && item.taskId === part.taskId);
       if (index >= 0) {
-        next[index] = { ...next[index], ...part } as MessagePart;
+        const currentPart = next[index] as Extract<MessagePart, { kind: "subagent" }>;
+        const currentTerminal = ["completed", "error", "cancelled"].includes(currentPart.status || "");
+        const incomingTerminal = ["completed", "error", "cancelled"].includes(part.status || "");
+        next[index] = currentTerminal && !incomingTerminal
+          ? currentPart
+          : { ...currentPart, ...part } as MessagePart;
       } else {
         next.push(part);
       }
@@ -4931,6 +4957,10 @@ function mergeLiveToolResultParts(
     next.push(part);
   }
   return next;
+}
+
+function isTerminalToolStatus(status: Extract<MessagePart, { kind: "tool_call" }>["status"]): boolean {
+  return status === "ok" || status === "error";
 }
 
 function providerNoticeIdentity(part: Extract<MessagePart, { kind: "provider_notice" }>): string {

@@ -627,7 +627,7 @@ export type ChatTaskEvent = {
   taskId: string;
   projectId?: string;
   sessionId?: string;
-  type: "started" | "status" | "context_compression" | "delta" | "reasoning" | "provider_notice" | "usage" | "tool" | "completed" | "failed" | "cancelled" | string;
+  type: "started" | "status" | "context_compression" | "delta" | "reasoning" | "provider_notice" | "usage" | "tool" | "subagent" | "completed" | "failed" | "cancelled" | string;
   delta?: string;
   message?: string;
   model?: string;

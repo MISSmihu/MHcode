@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,23 +45,21 @@ func subagentExecutionScopeFrom(ctx context.Context) (subagentExecutionScope, bo
 	return scope, ok
 }
 
-func (s *Service) registerSubagent(parent context.Context, taskID string) (context.Context, func()) {
+func (s *Service) registerSubagent(parent context.Context, part tools.ResultPart) (context.Context, *subagentControl) {
 	ctx, cancel := context.WithCancel(parent)
-	control := &subagentControl{cancel: cancel}
+	control := &subagentControl{
+		taskID: part.TaskID,
+		cancel: cancel,
+		done:   make(chan struct{}),
+		latest: cloneSubagentPart(part),
+	}
 	s.subagentMu.Lock()
 	if s.subagents == nil {
 		s.subagents = make(map[string]*subagentControl)
 	}
-	s.subagents[taskID] = control
+	s.subagents[part.TaskID] = control
 	s.subagentMu.Unlock()
-	return ctx, func() {
-		cancel()
-		s.subagentMu.Lock()
-		if s.subagents[taskID] == control {
-			delete(s.subagents, taskID)
-		}
-		s.subagentMu.Unlock()
-	}
+	return ctx, control
 }
 
 // CancelSubagent stops one delegated worker without cancelling its siblings or
@@ -100,11 +99,83 @@ type delegatedTaskResult struct {
 }
 
 type subagentControl struct {
-	cancel context.CancelFunc
+	mu        sync.RWMutex
+	taskID    string
+	cancel    context.CancelFunc
+	done      chan struct{}
+	doneOnce  sync.Once
+	latest    tools.ResultPart
+	result    delegatedTaskResult
+	finished  bool
+	collected bool
 }
 
-// DelegateTaskTool lets the primary Agent create bounded, independent workers.
-// Worker registries deliberately omit this tool, so delegation cannot recurse.
+func (c *subagentControl) update(part tools.ResultPart) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.latest = cloneSubagentPart(part)
+	c.mu.Unlock()
+}
+
+func (c *subagentControl) finish(result delegatedTaskResult) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.result = cloneDelegatedTaskResult(result)
+	c.latest = cloneSubagentPart(result.part)
+	c.finished = true
+	c.mu.Unlock()
+	c.doneOnce.Do(func() { close(c.done) })
+}
+
+func (c *subagentControl) snapshot() (tools.ResultPart, delegatedTaskResult, bool, bool) {
+	if c == nil {
+		return tools.ResultPart{}, delegatedTaskResult{}, false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return cloneSubagentPart(c.latest), cloneDelegatedTaskResult(c.result), c.finished, c.collected
+}
+
+func (c *subagentControl) collect() (delegatedTaskResult, bool, bool) {
+	if c == nil {
+		return delegatedTaskResult{}, false, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.finished {
+		return delegatedTaskResult{}, false, false
+	}
+	newlyCollected := !c.collected
+	c.collected = true
+	return cloneDelegatedTaskResult(c.result), true, newlyCollected
+}
+
+func (c *subagentControl) stateFlags() (finished, collected bool) {
+	if c == nil {
+		return false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.finished, c.collected
+}
+
+func cloneDelegatedTaskResult(result delegatedTaskResult) delegatedTaskResult {
+	result.part = cloneSubagentPart(result.part)
+	result.artifacts = append([]tools.ResultPart(nil), result.artifacts...)
+	if result.usage != nil {
+		usage := *result.usage
+		result.usage = &usage
+	}
+	return result
+}
+
+// DelegateTaskTool starts independent workers in the background and returns
+// immediately. Worker registries deliberately omit coordinator tools, so
+// delegation cannot recurse.
 type DelegateTaskTool struct {
 	Service *Service
 }
@@ -112,7 +183,7 @@ type DelegateTaskTool struct {
 func (DelegateTaskTool) Name() string { return "delegate_task" }
 
 func (DelegateTaskTool) Description() string {
-	return "将 1-3 个彼此独立的子任务同时委派给动态子代理。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。多个 implement 必须明确划分互不重叠的文件范围。仅在并行探索、独立审阅或隔离实现能明显推进任务时使用。"
+	return "将 1-3 个彼此独立的子任务同时放到后台执行并立即返回任务 ID。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。启动后主 Agent 应继续自己的独立工作，临近最终综合时再调用 await_subagents。多个 implement 以及主 Agent 的写入范围必须互不重叠。"
 }
 
 func (DelegateTaskTool) InputSchema() map[string]any {
@@ -176,17 +247,18 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 	if err != nil {
 		return delegatedTaskError(err.Error()), nil
 	}
+	if active := t.Service.activeSubagentCount(); active+len(specs) > maxDelegatedTasks {
+		return delegatedTaskError(fmt.Sprintf("当前已有 %d 个子代理运行中，并发扇出最多为 %d；请先继续主任务或收集已有结果。", active, maxDelegatedTasks)), nil
+	}
 
-	results := make([]delegatedTaskResult, len(specs))
 	parts := make([]tools.ResultPart, len(specs))
 	workerContexts := make([]context.Context, len(specs))
-	workerCleanups := make([]func(), len(specs))
+	controls := make([]*subagentControl, len(specs))
 	callID := fmt.Sprintf("subagent-%d-%d", time.Now().UnixNano(), subagentSequence.Add(1))
 	var emitMu sync.Mutex
-	emit := func(part tools.ResultPart) {
-		part = cloneSubagentPart(part)
+	emitProgress := func(part tools.ResultPart) {
 		emitMu.Lock()
-		tools.EmitProgress(ctx, part)
+		tools.EmitProgress(ctx, cloneSubagentPart(part))
 		emitMu.Unlock()
 	}
 
@@ -199,45 +271,265 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 			Status:    "pending",
 			Summary:   "等待调度",
 		}
-		workerContexts[index], workerCleanups[index] = t.Service.registerSubagent(ctx, parts[index].TaskID)
-		emit(parts[index])
+	}
+	if ctx.Err() != nil {
+		for index := range parts {
+			parts[index].Status = "cancelled"
+			parts[index].Summary = "任务在开始前已停止"
+			parts[index].CurrentAction = "已停止"
+			emitProgress(parts[index])
+		}
+		return tools.Result{
+			Summary: "父任务已停止，子代理未启动。",
+			Parts:   parts,
+			IsError: true,
+		}, nil
+	}
+	for index := range parts {
+		workerContexts[index], controls[index] = t.Service.registerSubagent(ctx, parts[index])
+		emitProgress(parts[index])
 	}
 
-	var workers sync.WaitGroup
 	for index, spec := range specs {
-		workers.Add(1)
 		go func(index int, spec delegateTaskSpec) {
-			defer workers.Done()
-			defer workerCleanups[index]()
-			results[index] = t.Service.runDelegatedTask(workerContexts[index], scope, spec, parts[index], emit)
+			control := controls[index]
+			emit := func(part tools.ResultPart) {
+				part = cloneSubagentPart(part)
+				control.update(part)
+				emitProgress(part)
+			}
+			result := t.Service.runDelegatedTask(workerContexts[index], scope, spec, parts[index], emit)
+			control.finish(result)
 		}(index, spec)
 	}
-	workers.Wait()
+	return tools.Result{
+		Summary: delegatedTaskStartSummary(parts),
+		Parts:   parts,
+	}, nil
+}
 
-	resultParts := make([]tools.ResultPart, 0, len(results)*2)
-	completed := 0
-	for _, result := range results {
-		resultParts = append(resultParts, result.part)
-		resultParts = append(resultParts, result.artifacts...)
-		if result.part.Status == "completed" {
-			completed++
+type awaitSubagentsArguments struct {
+	TaskIDs []string `json:"taskIds,omitempty"`
+	Wait    *bool    `json:"wait,omitempty"`
+}
+
+// AwaitSubagentsTool collects background worker results near the synthesis
+// phase. Keeping it separate from delegate_task lets the primary Agent make
+// progress while children are still running.
+type AwaitSubagentsTool struct {
+	Service *Service
+}
+
+func (AwaitSubagentsTool) Name() string { return "await_subagents" }
+
+func (AwaitSubagentsTool) Description() string {
+	return "查询或等待后台子代理并收集最终结果。默认等待当前轮次尚未收集的全部子代理；wait=false 只查询当前状态。应先完成主 Agent 可独立推进的工作，再在最终综合前调用。"
+}
+
+func (AwaitSubagentsTool) InputSchema() map[string]any {
+	return map[string]any{
+		"type":                 "object",
+		"additionalProperties": false,
+		"properties": map[string]any{
+			"taskIds": map[string]any{
+				"type":        "array",
+				"description": "可选；指定要收集的子代理任务 ID。留空时处理当前轮次所有尚未收集的任务。",
+				"items":       map[string]any{"type": "string"},
+			},
+			"wait": map[string]any{
+				"type":        "boolean",
+				"description": "true=等待任务结束（默认）；false=仅返回当前状态。",
+				"default":     true,
+			},
+		},
+	}
+}
+
+func (t AwaitSubagentsTool) Execute(ctx context.Context, rawArgs json.RawMessage) (tools.Result, error) {
+	if t.Service == nil {
+		return delegatedTaskError("子代理执行器未初始化"), nil
+	}
+	var args awaitSubagentsArguments
+	if len(strings.TrimSpace(string(rawArgs))) > 0 {
+		if err := json.Unmarshal(rawArgs, &args); err != nil {
+			return delegatedTaskError("收集子代理参数无效: " + err.Error()), nil
 		}
-		if result.usage != nil && result.route.Provider.ID != "" {
-			t.Service.recordUsageMetrics(usageMetricsFor(result.route.Provider, result.usage), result.route)
+	}
+	taskIDs := normalizeSubagentTaskIDs(args.TaskIDs)
+	wait := true
+	if args.Wait != nil {
+		wait = *args.Wait
+	}
+	controls, missing := t.Service.selectSubagents(taskIDs, len(taskIDs) == 0)
+	if len(controls) == 0 {
+		message := "当前没有尚未收集的子代理。"
+		if len(missing) > 0 {
+			message = "未找到子代理任务: " + strings.Join(missing, ", ")
 		}
+		return delegatedTaskError(message), nil
+	}
+
+	results := make([]delegatedTaskResult, 0, len(controls))
+	parts := make([]tools.ResultPart, 0, len(controls)*2)
+	running := 0
+	for _, control := range controls {
+		if wait {
+			select {
+			case <-control.done:
+			case <-ctx.Done():
+			}
+		}
+		latest, _, finished, _ := control.snapshot()
+		if finished {
+			result, _, newlyCollected := control.collect()
+			results = append(results, result)
+			parts = append(parts, result.part)
+			if newlyCollected {
+				parts = append(parts, result.artifacts...)
+				t.Service.recordDelegatedTaskUsage(result)
+			}
+			continue
+		}
+		running++
+		results = append(results, delegatedTaskResult{part: latest})
+		parts = append(parts, latest)
 	}
 
 	summary := delegatedTaskSummary(results)
-	if completed == 0 {
-		resultParts = append([]tools.ResultPart{{
-			Kind: tools.PartToolCall, Name: "delegate_task", Status: "error", Output: summary,
-		}}, resultParts...)
+	if running > 0 {
+		summary = fmt.Sprintf("仍有 %d 个子代理运行中。\n\n%s", running, summary)
+	}
+	if len(missing) > 0 {
+		summary += "\n\n未找到任务: " + strings.Join(missing, ", ")
+	}
+	allFinishedWithoutSuccess := running == 0
+	if allFinishedWithoutSuccess {
+		for _, result := range results {
+			if result.part.Status == "completed" {
+				allFinishedWithoutSuccess = false
+				break
+			}
+		}
 	}
 	return tools.Result{
-		Summary: summary,
-		Parts:   resultParts,
-		IsError: completed == 0,
+		Summary: clipContextText(summary, 16_000),
+		Parts:   parts,
+		IsError: allFinishedWithoutSuccess,
 	}, nil
+}
+
+func normalizeSubagentTaskIDs(input []string) []string {
+	result := make([]string, 0, len(input))
+	seen := make(map[string]bool, len(input))
+	for _, taskID := range input {
+		taskID = strings.TrimSpace(taskID)
+		if taskID == "" || seen[taskID] {
+			continue
+		}
+		seen[taskID] = true
+		result = append(result, taskID)
+	}
+	return result
+}
+
+func (s *Service) selectSubagents(taskIDs []string, uncollectedOnly bool) ([]*subagentControl, []string) {
+	s.subagentMu.Lock()
+	controlsByID := make(map[string]*subagentControl, len(s.subagents))
+	for taskID, control := range s.subagents {
+		controlsByID[taskID] = control
+	}
+	s.subagentMu.Unlock()
+
+	missing := make([]string, 0)
+	controls := make([]*subagentControl, 0, len(controlsByID))
+	if len(taskIDs) > 0 {
+		for _, taskID := range taskIDs {
+			control := controlsByID[taskID]
+			if control == nil {
+				missing = append(missing, taskID)
+				continue
+			}
+			controls = append(controls, control)
+		}
+		return controls, missing
+	}
+
+	for _, control := range controlsByID {
+		if uncollectedOnly {
+			_, collected := control.stateFlags()
+			if collected {
+				continue
+			}
+		}
+		controls = append(controls, control)
+	}
+	sort.Slice(controls, func(left, right int) bool {
+		return controls[left].taskID < controls[right].taskID
+	})
+	return controls, nil
+}
+
+func (s *Service) activeSubagentCount() int {
+	controls, _ := s.selectSubagents(nil, false)
+	active := 0
+	for _, control := range controls {
+		finished, _ := control.stateFlags()
+		if !finished {
+			active++
+		}
+	}
+	return active
+}
+
+func (s *Service) hasUncollectedSubagents() bool {
+	controls, _ := s.selectSubagents(nil, true)
+	return len(controls) > 0
+}
+
+// finishSubagentTurn is the final lifecycle barrier. On cancellation every
+// worker is stopped first; in all cases the method joins workers before the
+// caller can commit or roll back the parent turn.
+func (s *Service) finishSubagentTurn(cancelWorkers bool) []tools.ResultPart {
+	controls, _ := s.selectSubagents(nil, false)
+	if cancelWorkers {
+		for _, control := range controls {
+			if control.cancel != nil {
+				control.cancel()
+			}
+		}
+	}
+	for _, control := range controls {
+		<-control.done
+	}
+
+	parts := make([]tools.ResultPart, 0, len(controls)*2)
+	for _, control := range controls {
+		result, finished, newlyCollected := control.collect()
+		if !finished {
+			continue
+		}
+		parts = append(parts, result.part)
+		if newlyCollected {
+			parts = append(parts, result.artifacts...)
+			s.recordDelegatedTaskUsage(result)
+		}
+	}
+
+	s.subagentMu.Lock()
+	for _, control := range controls {
+		if s.subagents[control.taskID] == control {
+			delete(s.subagents, control.taskID)
+		}
+	}
+	s.subagentMu.Unlock()
+	return parts
+}
+
+func (s *Service) recordDelegatedTaskUsage(result delegatedTaskResult) {
+	if result.usage == nil || result.route.Provider.ID == "" {
+		return
+	}
+	s.recordUsageMetrics(usageMetricsFor(result.route.Provider, result.usage), result.route)
 }
 
 func normalizeDelegatedTaskSpecs(input []delegateTaskSpec) ([]delegateTaskSpec, error) {
@@ -499,7 +791,7 @@ func subagentInstruction(spec delegateTaskSpec) string {
 	case subagentReview:
 		modeRule = "只读审阅真实工作区，优先报告正确性、回归、安全边界与测试缺口；禁止修改文件或运行 Shell。"
 	case subagentImplement:
-		modeRule = "使用结构化工具完成真实修改和必要验证；所有写入、命令、网络与审批继续遵守主 Agent 的沙箱策略。"
+		modeRule = "使用结构化工具完成真实修改和必要验证；只修改子任务明确分配的文件范围，避免触碰主 Agent 或兄弟子代理负责的文件；所有写入、命令、网络与审批继续遵守主 Agent 的沙箱策略。"
 	}
 	return strings.Join([]string{
 		"你是由 MHcode 主 Agent 动态创建的独立子代理。",
@@ -563,6 +855,19 @@ func delegatedTaskArtifacts(parts []tools.ResultPart) []tools.ResultPart {
 		artifacts = append(artifacts, part)
 	}
 	return artifacts
+}
+
+func delegatedTaskStartSummary(parts []tools.ResultPart) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "已在后台启动 %d 个子代理。主 Agent 应继续处理可独立推进且文件范围不重叠的工作，并在最终综合前调用 await_subagents 收集结果。", len(parts))
+	for _, part := range parts {
+		label := strings.TrimSpace(part.Label)
+		if label == "" {
+			label = "子任务"
+		}
+		fmt.Fprintf(&out, "\n- %s: %s (%s)", part.TaskID, label, part.AgentType)
+	}
+	return clipContextText(out.String(), 4_000)
 }
 
 func delegatedTaskSummary(results []delegatedTaskResult) string {

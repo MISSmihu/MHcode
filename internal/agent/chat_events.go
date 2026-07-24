@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -48,6 +49,18 @@ type providerStreamOpenResult struct {
 func emitChatEvent(sink ChatEventSink, event ChatStreamEvent) {
 	if sink != nil {
 		sink(event)
+	}
+}
+
+func serializedChatEventSink(sink ChatEventSink) ChatEventSink {
+	if sink == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(event ChatStreamEvent) {
+		mu.Lock()
+		sink(event)
+		mu.Unlock()
 	}
 }
 
