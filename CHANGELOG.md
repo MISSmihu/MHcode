@@ -2,6 +2,26 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.4 - 2026-07-24
+
+### Parallel subagents
+
+- Start explore, review, and implement subagents concurrently within one delegation, while requiring non-overlapping file ownership for parallel implementation work.
+- Add independent child cancellation so one subagent can be stopped without interrupting siblings or the coordinating parent task; cancelling the parent still stops every child.
+- Stream and persist each subagent's output, reasoning, tool activity, status, timing, and file-change statistics across conversation switches and reloads.
+- Show running subagents above the composer and provide a dedicated read-only output tab in the right-side workspace panel.
+
+### Open-ended Agent execution
+
+- Remove fixed tool-call counts from the main Agent, Plan mode, AI team roles, dynamic subagents, and managed remote credential tasks.
+- Keep reasoning levels focused on model reasoning, context, cache, and planner policy instead of silently shortening long tasks.
+- Continue to enforce cancellation, per-tool timeouts, context compression, approvals, sandbox policy, and duplicate-call guards.
+
+### Verification
+
+- All Go package tests and `go vet` pass, including concurrent child execution, independent cancellation, parent cancellation, event-log round trips, and a 40-call long-task regression.
+- Frontend type checking, 72 tests, production Vite build, and Wails Windows/amd64 production build pass.
+
 ## v0.3.3 - 2026-07-24
 
 ### Dynamic subagents and Agent execution

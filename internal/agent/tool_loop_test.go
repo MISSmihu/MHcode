@@ -33,6 +33,18 @@ type failingBrowserTool struct{ calls *int }
 
 type staticRepositoryTool struct{}
 
+type longTaskStepTool struct{ calls *int }
+
+func (t longTaskStepTool) Name() string        { return "long_task_step" }
+func (t longTaskStepTool) Description() string { return "records one step in a long-running test task" }
+func (t longTaskStepTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (t longTaskStepTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	(*t.calls)++
+	return tools.Result{Summary: "step completed"}, nil
+}
+
 func (staticRepositoryTool) Name() string        { return "read_repository" }
 func (staticRepositoryTool) Description() string { return "read a test repository" }
 func (staticRepositoryTool) InputSchema() map[string]any {
@@ -128,7 +140,7 @@ func TestAnthropicStreamingToolLoopExecutesAndReturnsToolResult(t *testing.T) {
 	outcome, err := svc.runStreamingToolLoop(context.Background(), provider, svc.buildToolRegistry(), protocol.ChatRequest{
 		Model:    "claude-test",
 		Messages: []protocol.Message{{Role: "user", Content: "read fixture.txt"}},
-	}, 4, nil)
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +184,7 @@ func TestGeminiStreamingToolLoopExecutesAndReturnsFunctionResponse(t *testing.T)
 	outcome, err := svc.runStreamingToolLoop(context.Background(), provider, svc.buildToolRegistry(), protocol.ChatRequest{
 		Model:    "gemini-test",
 		Messages: []protocol.Message{{Role: "user", Content: "read fixture.txt"}},
-	}, 4, nil)
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +231,7 @@ func TestDeepSeekThinkingToolLoopReturnsReasoningContent(t *testing.T) {
 		Model:          "deepseek-v4-pro",
 		ReasoningLevel: "high",
 		Messages:       []protocol.Message{{Role: "user", Content: "read fixture.txt"}},
-	}, 4)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +281,7 @@ func TestWebSearchToolLoopFeedsSourcesIntoFinalCompletion(t *testing.T) {
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model:    "test-model",
 		Messages: []protocol.Message{{Role: "user", Content: "搜索宁波台风预警"}},
-	}, 4, complete, nil)
+	}, complete, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +346,7 @@ func TestToolLoopReusesSimilarWebSearchAndMergesSources(t *testing.T) {
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "查询宁波台风预警"}},
-	}, 6, complete, nil)
+	}, complete, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +392,7 @@ func TestToolLoopDoesNotRestartUnavailableBrowser(t *testing.T) {
 	}
 	_, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "打开网页"}},
-	}, 4, complete, nil)
+	}, complete, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +447,7 @@ func TestToolLoopSuppressesUnrequestedExternalBrowserAfterSearch(t *testing.T) {
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "搜索宁波台风预警并附来源链接"}},
-	}, 5, complete, func(event ChatStreamEvent) { events = append(events, event) })
+	}, complete, func(event ChatStreamEvent) { events = append(events, event) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +536,7 @@ func TestWebSearchToolLoopRetriesFinalSynthesisWithoutRepeatingSearch(t *testing
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "inspect example project"}},
-	}, 4, complete, func(event ChatStreamEvent) { events = append(events, event) })
+	}, complete, func(event ChatStreamEvent) { events = append(events, event) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +702,7 @@ func TestRepositoryReadToolLoopKeepsResultAfterFinalSynthesisEOF(t *testing.T) {
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "读取 MHcode 仓库"}},
-	}, 4, complete, nil)
+	}, complete, nil)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("error = %v, want unexpected EOF", err)
 	}
@@ -739,7 +751,7 @@ func TestToolLoopEmitsAndPersistsTaskProgressWithDiffStats(t *testing.T) {
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model:    "test-model",
 		Messages: []protocol.Message{{Role: "user", Content: "implement"}},
-	}, 6, caller.Complete, func(event ChatStreamEvent) {
+	}, caller.Complete, func(event ChatStreamEvent) {
 		if event.Type == "progress" {
 			progressEvents = append(progressEvents, event)
 		}
@@ -800,7 +812,7 @@ func TestToolLoopPersistsSnapshotBeforeFinalCompletion(t *testing.T) {
 	_, loopErr := svc.runToolLoop(context.Background(), caller, svc.buildToolRegistry(), protocol.ChatRequest{
 		Model:    "test-model",
 		Messages: []protocol.Message{{Role: "user", Content: "create page"}},
-	}, 4)
+	})
 	if loopErr == nil {
 		t.Fatal("最终补全失败应返回错误")
 	}
@@ -828,20 +840,31 @@ func TestToolLoopPersistsSnapshotBeforeFinalCompletion(t *testing.T) {
 	}
 }
 
-func TestAdaptiveToolCallBudgetOnlyLimitsCredentialLookup(t *testing.T) {
-	lookup := []protocol.Message{{
-		Role:    "user",
-		Content: "使用 mhcode-credential://ssh-test 读取服务器里的管理员密码",
-	}}
-	if got := adaptiveToolCallBudget(lookup, 32); got != 8 {
-		t.Fatalf("lookup budget = %d, want 8", got)
+func TestToolLoopContinuesBeyondFormerFixedCallLimit(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	registry := tools.NewRegistry(longTaskStepTool{calls: &toolCalls})
+	complete := func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if completionCalls <= 40 {
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: fmt.Sprintf("long-step-%d", completionCalls), Type: "function",
+				Function: protocol.ToolCallFunction{
+					Name: "long_task_step", Arguments: json.RawMessage(fmt.Sprintf(`{"step":%d}`, completionCalls)),
+				},
+			}}}, nil
+		}
+		return protocol.CompletionResult{Content: "long task completed"}, nil
 	}
-	deployment := []protocol.Message{{
-		Role:    "user",
-		Content: "使用 mhcode-credential://ssh-test 部署网站并排障",
-	}}
-	if got := adaptiveToolCallBudget(deployment, 32); got != 32 {
-		t.Fatalf("deployment budget = %d, want 32", got)
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "完成长任务"}},
+	}, complete, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCalls != 40 || completionCalls != 41 || outcome.Content != "long task completed" {
+		t.Fatalf("toolCalls=%d completionCalls=%d content=%q", toolCalls, completionCalls, outcome.Content)
 	}
 }
 
@@ -882,7 +905,7 @@ func TestToolLoopGuardStopsAfterSecretCapture(t *testing.T) {
 	}
 }
 
-func TestRepeatedPlanUpdateDoesNotConsumeOrdinaryBudget(t *testing.T) {
+func TestRepeatedPlanUpdateDoesNotEndToolLoop(t *testing.T) {
 	svc, _ := newNativeToolLoopService(t)
 	registry := svc.buildToolRegistry()
 	planArgs := json.RawMessage("{\"steps\":[{\"title\":\"检查\",\"status\":\"in_progress\"}]}")
@@ -891,7 +914,6 @@ func TestRepeatedPlanUpdateDoesNotConsumeOrdinaryBudget(t *testing.T) {
 		context.Background(),
 		registry,
 		protocol.ChatRequest{Messages: []protocol.Message{{Role: "user", Content: "检查项目"}}},
-		1,
 		func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
 			completionCalls++
 			switch completionCalls {
@@ -915,6 +937,40 @@ func TestRepeatedPlanUpdateDoesNotConsumeOrdinaryBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if outcome.Content != "已完成检查" || completionCalls != 3 {
+		t.Fatalf("outcome = %#v, completion calls = %d", outcome, completionCalls)
+	}
+}
+
+func TestDistinctPlanUpdatesDoNotEndLongTask(t *testing.T) {
+	svc, _ := newNativeToolLoopService(t)
+	registry := svc.buildToolRegistry()
+	completionCalls := 0
+	outcome, err := svc.runToolLoopWithCompletion(
+		context.Background(),
+		registry,
+		protocol.ChatRequest{Messages: []protocol.Message{{Role: "user", Content: "完成一个包含很多阶段的任务"}}},
+		func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
+			completionCalls++
+			if completionCalls <= 20 {
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID: fmt.Sprintf("plan-%d", completionCalls),
+					Function: protocol.ToolCallFunction{
+						Name: "update_plan",
+						Arguments: json.RawMessage(fmt.Sprintf(
+							`{"steps":[{"title":"阶段 %d","status":"in_progress"}]}`,
+							completionCalls,
+						)),
+					},
+				}}}, nil
+			}
+			return protocol.CompletionResult{Content: "长任务已完成"}, nil
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Content != "长任务已完成" || completionCalls != 21 {
 		t.Fatalf("outcome = %#v, completion calls = %d", outcome, completionCalls)
 	}
 }

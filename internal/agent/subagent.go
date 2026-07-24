@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	maxDelegatedTasks          = 3
-	maxDelegatedToolCallBudget = 24
-	minDelegatedToolCallBudget = 6
-	maxSubagentTimelineSteps   = 10
+	maxDelegatedTasks        = 3
+	maxSubagentTimelineSteps = 10
+	maxSubagentActivities    = 120
+	maxSubagentOutputRunes   = 96_000
 )
 
 const (
@@ -31,7 +31,6 @@ var subagentSequence atomic.Uint64
 type subagentExecutionScope struct {
 	BaseRequest  protocol.ChatRequest
 	PrimaryRoute chatRoute
-	MaxToolCalls int
 }
 
 type subagentExecutionScopeKey struct{}
@@ -43,6 +42,42 @@ func withSubagentExecutionScope(ctx context.Context, scope subagentExecutionScop
 func subagentExecutionScopeFrom(ctx context.Context) (subagentExecutionScope, bool) {
 	scope, ok := ctx.Value(subagentExecutionScopeKey{}).(subagentExecutionScope)
 	return scope, ok
+}
+
+func (s *Service) registerSubagent(parent context.Context, taskID string) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	control := &subagentControl{cancel: cancel}
+	s.subagentMu.Lock()
+	if s.subagents == nil {
+		s.subagents = make(map[string]*subagentControl)
+	}
+	s.subagents[taskID] = control
+	s.subagentMu.Unlock()
+	return ctx, func() {
+		cancel()
+		s.subagentMu.Lock()
+		if s.subagents[taskID] == control {
+			delete(s.subagents, taskID)
+		}
+		s.subagentMu.Unlock()
+	}
+}
+
+// CancelSubagent stops one delegated worker without cancelling its siblings or
+// the coordinating parent turn.
+func (s *Service) CancelSubagent(taskID string) bool {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return false
+	}
+	s.subagentMu.Lock()
+	control := s.subagents[taskID]
+	s.subagentMu.Unlock()
+	if control == nil || control.cancel == nil {
+		return false
+	}
+	control.cancel()
+	return true
 }
 
 type delegateTaskArguments struct {
@@ -64,6 +99,10 @@ type delegatedTaskResult struct {
 	route     chatRoute
 }
 
+type subagentControl struct {
+	cancel context.CancelFunc
+}
+
 // DelegateTaskTool lets the primary Agent create bounded, independent workers.
 // Worker registries deliberately omit this tool, so delegation cannot recurse.
 type DelegateTaskTool struct {
@@ -73,7 +112,7 @@ type DelegateTaskTool struct {
 func (DelegateTaskTool) Name() string { return "delegate_task" }
 
 func (DelegateTaskTool) Description() string {
-	return "将 1-3 个彼此独立的子任务委派给动态子代理。explore/review 仅可读取并可并发；implement 可修改工作区但会串行执行并继续遵守当前沙箱与审批规则。仅在并行探索、独立审阅或隔离实现能明显推进任务时使用。"
+	return "将 1-3 个彼此独立的子任务同时委派给动态子代理。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。多个 implement 必须明确划分互不重叠的文件范围。仅在并行探索、独立审阅或隔离实现能明显推进任务时使用。"
 }
 
 func (DelegateTaskTool) InputSchema() map[string]any {
@@ -85,7 +124,7 @@ func (DelegateTaskTool) InputSchema() map[string]any {
 				"type":        "array",
 				"minItems":    1,
 				"maxItems":    maxDelegatedTasks,
-				"description": "彼此独立的子任务；需要前后依赖的工作应分多次调用。",
+				"description": "会同时启动的彼此独立子任务；implement 的文件范围不得重叠，需要前后依赖的工作应分多次调用。",
 				"items": map[string]any{
 					"type":                 "object",
 					"additionalProperties": false,
@@ -138,13 +177,14 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 		return delegatedTaskError(err.Error()), nil
 	}
 
-	budgets := allocateSubagentToolBudgets(scope.MaxToolCalls, specs)
 	results := make([]delegatedTaskResult, len(specs))
 	parts := make([]tools.ResultPart, len(specs))
+	workerContexts := make([]context.Context, len(specs))
+	workerCleanups := make([]func(), len(specs))
 	callID := fmt.Sprintf("subagent-%d-%d", time.Now().UnixNano(), subagentSequence.Add(1))
 	var emitMu sync.Mutex
 	emit := func(part tools.ResultPart) {
-		part.Steps = append([]tools.ProgressStep(nil), part.Steps...)
+		part = cloneSubagentPart(part)
 		emitMu.Lock()
 		tools.EmitProgress(ctx, part)
 		emitMu.Unlock()
@@ -159,30 +199,20 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 			Status:    "pending",
 			Summary:   "等待调度",
 		}
+		workerContexts[index], workerCleanups[index] = t.Service.registerSubagent(ctx, parts[index].TaskID)
 		emit(parts[index])
 	}
 
-	// Read-only workers can safely share the same workspace snapshot. They are
-	// completed before writable workers start, so reviews never race file edits.
-	var readers sync.WaitGroup
+	var workers sync.WaitGroup
 	for index, spec := range specs {
-		if spec.AgentType == subagentImplement {
-			continue
-		}
-		readers.Add(1)
+		workers.Add(1)
 		go func(index int, spec delegateTaskSpec) {
-			defer readers.Done()
-			results[index] = t.Service.runDelegatedTask(ctx, scope, spec, parts[index], budgets[index], emit)
+			defer workers.Done()
+			defer workerCleanups[index]()
+			results[index] = t.Service.runDelegatedTask(workerContexts[index], scope, spec, parts[index], emit)
 		}(index, spec)
 	}
-	readers.Wait()
-
-	for index, spec := range specs {
-		if spec.AgentType != subagentImplement {
-			continue
-		}
-		results[index] = t.Service.runDelegatedTask(ctx, scope, spec, parts[index], budgets[index], emit)
-	}
+	workers.Wait()
 
 	resultParts := make([]tools.ResultPart, 0, len(results)*2)
 	completed := 0
@@ -242,47 +272,11 @@ func normalizeDelegatedTaskSpecs(input []delegateTaskSpec) ([]delegateTaskSpec, 
 	return output, nil
 }
 
-func allocateSubagentToolBudgets(parentBudget int, specs []delegateTaskSpec) []int {
-	if len(specs) == 0 {
-		return nil
-	}
-	total := parentBudget
-	if total < minDelegatedToolCallBudget {
-		total = minDelegatedToolCallBudget
-	}
-	if total > maxDelegatedToolCallBudget {
-		total = maxDelegatedToolCallBudget
-	}
-	weights := make([]int, len(specs))
-	weightTotal := 0
-	for index, spec := range specs {
-		weights[index] = 1
-		if spec.AgentType == subagentImplement {
-			weights[index] = 2
-		}
-		weightTotal += weights[index]
-	}
-	budgets := make([]int, len(specs))
-	remaining := total
-	remainingWeight := weightTotal
-	for index, weight := range weights {
-		budget := remaining * weight / remainingWeight
-		if budget < 1 {
-			budget = 1
-		}
-		budgets[index] = budget
-		remaining -= budget
-		remainingWeight -= weight
-	}
-	return budgets
-}
-
 func (s *Service) runDelegatedTask(
 	ctx context.Context,
 	scope subagentExecutionScope,
 	spec delegateTaskSpec,
 	part tools.ResultPart,
-	toolBudget int,
 	emit func(tools.ResultPart),
 ) delegatedTaskResult {
 	startedAt := time.Now()
@@ -298,6 +292,15 @@ func (s *Service) runDelegatedTask(
 		part.Status = status
 		part.Summary = clipContextText(strings.TrimSpace(summary), 8_000)
 		part.CurrentAction = action
+		if content := sanitizeModelContent(outcome.Content); content != "" {
+			part.SubagentOutput = boundedSubagentText("", content)
+		}
+		if reasoning := strings.TrimSpace(outcome.Reasoning); reasoning != "" {
+			part.SubagentReasoning = boundedSubagentText("", reasoning)
+		}
+		if part.SubagentOutput == "" && strings.TrimSpace(summary) != "" {
+			part.SubagentOutput = boundedSubagentText("", summary)
+		}
 		part.CompletedAt = completedAt.Format(time.RFC3339Nano)
 		part.DurationMs = completedAt.Sub(startedAt).Milliseconds()
 		if part.DurationMs < 1 {
@@ -350,8 +353,23 @@ func (s *Service) runDelegatedTask(
 		registry = s.buildWorkerToolRegistry()
 	}
 	stepIndex := make(map[string]int)
+	activityIndex := make(map[string]int)
+	lastStreamEmit := time.Time{}
+	emitStream := func(force bool) {
+		if !force && time.Since(lastStreamEmit) < 75*time.Millisecond {
+			return
+		}
+		lastStreamEmit = time.Now()
+		emit(part)
+	}
 	childSink := func(event ChatStreamEvent) {
 		switch event.Type {
+		case "delta":
+			part.SubagentOutput = boundedSubagentText(part.SubagentOutput, event.Delta)
+			emitStream(false)
+		case "reasoning":
+			part.SubagentReasoning = boundedSubagentText(part.SubagentReasoning, event.Delta)
+			emitStream(false)
 		case "tool":
 			key := strings.TrimSpace(event.ToolCallID)
 			if key == "" {
@@ -379,16 +397,21 @@ func (s *Service) runDelegatedTask(
 			} else {
 				part.CurrentAction = subagentToolStepTitle(event.ToolName, event.ToolInput)
 			}
+			upsertSubagentActivity(&part, activityIndex, event)
 			emit(part)
 		case "status", "context_compression":
 			if message := strings.TrimSpace(event.Message); message != "" {
 				part.CurrentAction = clipContextText(message, 240)
 				emit(part)
 			}
+		case "provider_notice":
+			appendSubagentProviderActivity(&part, event)
+			emit(part)
 		}
 	}
 
-	outcome, runErr := s.runStreamingToolLoop(ctx, provider, registry, request, toolBudget, childSink)
+	outcome, runErr := s.runStreamingToolLoop(ctx, provider, registry, request, childSink)
+	emitStream(true)
 	content := sanitizeModelContent(outcome.Content)
 	if content == "" {
 		content = partialToolFailureContent(outcome)
@@ -567,4 +590,94 @@ func delegatedTaskSummary(results []delegatedTaskResult) string {
 
 func delegatedTaskError(message string) tools.Result {
 	return tools.Result{Summary: message, IsError: true}
+}
+
+func cloneSubagentPart(part tools.ResultPart) tools.ResultPart {
+	part.Steps = append([]tools.ProgressStep(nil), part.Steps...)
+	part.Activities = append([]tools.SubagentActivity(nil), part.Activities...)
+	return part
+}
+
+func boundedSubagentText(current, addition string) string {
+	if addition == "" {
+		return current
+	}
+	runes := []rune(current + addition)
+	if len(runes) <= maxSubagentOutputRunes {
+		return string(runes)
+	}
+	return "[较早的输出已省略]\n" + string(runes[len(runes)-maxSubagentOutputRunes:])
+}
+
+func upsertSubagentActivity(part *tools.ResultPart, indexes map[string]int, event ChatStreamEvent) {
+	if part == nil {
+		return
+	}
+	key := strings.TrimSpace(event.ToolCallID)
+	if key == "" {
+		key = event.ToolName + "\x00" + event.ToolInput
+	}
+	index, exists := indexes[key]
+	if !exists {
+		if len(part.Activities) >= maxSubagentActivities {
+			return
+		}
+		index = len(part.Activities)
+		indexes[key] = index
+		part.Activities = append(part.Activities, tools.SubagentActivity{
+			ID: key, Kind: "tool", Title: subagentToolStepTitle(event.ToolName, event.ToolInput),
+			Status: "running", Input: strings.TrimSpace(event.ToolInput), StartedAt: time.Now().Format(time.RFC3339Nano),
+		})
+	}
+	activity := &part.Activities[index]
+	if event.Status != "" {
+		activity.Status = event.Status
+	}
+	if output := subagentActivityOutput(event); output != "" {
+		activity.Output = boundedSubagentText(activity.Output, output)
+	}
+	if event.Status == "completed" || event.Status == "ok" || event.Status == "error" {
+		completed := time.Now()
+		activity.CompletedAt = completed.Format(time.RFC3339Nano)
+		if started, err := time.Parse(time.RFC3339Nano, activity.StartedAt); err == nil {
+			activity.DurationMs = completed.Sub(started).Milliseconds()
+			if activity.DurationMs < 1 {
+				activity.DurationMs = 1
+			}
+		}
+	}
+}
+
+func subagentActivityOutput(event ChatStreamEvent) string {
+	var output strings.Builder
+	for _, part := range event.Parts {
+		for _, value := range []string{part.Output, part.Stdout, part.Stderr} {
+			value = strings.TrimSpace(value)
+			if value == "" || strings.Contains(output.String(), value) {
+				continue
+			}
+			if output.Len() > 0 {
+				output.WriteString("\n")
+			}
+			output.WriteString(value)
+		}
+	}
+	if output.Len() == 0 && event.Status != "running" {
+		output.WriteString(strings.TrimSpace(event.Message))
+	}
+	return output.String()
+}
+
+func appendSubagentProviderActivity(part *tools.ResultPart, event ChatStreamEvent) {
+	if part == nil || len(part.Activities) >= maxSubagentActivities {
+		return
+	}
+	message := strings.TrimSpace(event.Message)
+	if message == "" {
+		return
+	}
+	part.Activities = append(part.Activities, tools.SubagentActivity{
+		ID: fmt.Sprintf("provider-%d", time.Now().UnixNano()), Kind: "provider", Title: "模型运行信息",
+		Status: "completed", Output: message, StartedAt: time.Now().Format(time.RFC3339Nano),
+	})
 }

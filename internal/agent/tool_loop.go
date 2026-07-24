@@ -53,7 +53,6 @@ func (s *Service) runToolLoopTurn(
 	streamProvider protocol.Provider,
 	caller protocol.ToolCaller,
 	baseRequest protocol.ChatRequest,
-	maxToolCalls int,
 	route chatRoute,
 	prefixDiagnostic requestPrefixDiagnostic,
 	requestMessages []protocol.Message,
@@ -77,7 +76,7 @@ func (s *Service) runToolLoopTurn(
 		if preflight.Attempted {
 			planRequest.Messages = appendDeploymentSSHPreflightSummary(baseRequest.Messages, preflight)
 		}
-		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest, maxToolCalls)
+		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest)
 		if planErr != nil {
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
 			s.markChatProviderStatus(route.Provider.ID, "error", planErr.Error())
@@ -137,9 +136,8 @@ func (s *Service) runToolLoopTurn(
 	executionCtx := withSubagentExecutionScope(ctx, subagentExecutionScope{
 		BaseRequest:  execRequest,
 		PrimaryRoute: route,
-		MaxToolCalls: maxToolCalls,
 	})
-	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, maxToolCalls, sink, preflight)
+	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, sink, preflight)
 	resolvedRoute := resolvedProviderRoute(streamProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
 		route = resolvedRoute
@@ -682,16 +680,15 @@ type toolLoopOutcome struct {
 }
 
 // runToolLoop 执行「补全 → 若有 tool_calls 则执行并回喂 → 再补全」的循环，
-// 直到模型给出最终文本或达到 maxToolCalls 上限。
+// 直到模型给出最终文本、用户取消或循环保护判定没有继续执行价值。
 // caller 为支持 function-calling 的 provider；baseMessages 为初始对话（含用户输入）。
 func (s *Service) runToolLoop(
 	ctx context.Context,
 	caller protocol.ToolCaller,
 	reg *tools.Registry,
 	req protocol.ChatRequest,
-	maxToolCalls int,
 ) (toolLoopOutcome, error) {
-	return s.runToolLoopWithCompletion(ctx, reg, req, maxToolCalls, caller.Complete, nil)
+	return s.runToolLoopWithCompletion(ctx, reg, req, caller.Complete, nil)
 }
 
 func (s *Service) runStreamingToolLoop(
@@ -699,10 +696,9 @@ func (s *Service) runStreamingToolLoop(
 	provider protocol.Provider,
 	reg *tools.Registry,
 	req protocol.ChatRequest,
-	maxToolCalls int,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, maxToolCalls, sink, deploymentSSHPreflight{})
+	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, sink, deploymentSSHPreflight{})
 }
 
 func (s *Service) runStreamingToolLoopWithState(
@@ -710,14 +706,13 @@ func (s *Service) runStreamingToolLoopWithState(
 	provider protocol.Provider,
 	reg *tools.Registry,
 	req protocol.ChatRequest,
-	maxToolCalls int,
 	sink ChatEventSink,
 	preflight deploymentSSHPreflight,
 ) (toolLoopOutcome, error) {
 	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
 		return collectProviderStream(ctx, provider, request, sink)
 	}
-	return s.runToolLoopWithCompletionState(ctx, reg, req, maxToolCalls, complete, sink, preflight)
+	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink, preflight)
 }
 
 type completionFunc func(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error)
@@ -744,8 +739,7 @@ type toolLoopGuard struct {
 }
 
 const (
-	maxPlanUpdatesPerTurn = 12
-	maxLookupPlanUpdates  = 4
+	maxLookupPlanUpdates = 4
 )
 
 func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.Message, bool, bool) {
@@ -757,11 +751,7 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 			summary := "计划内容与状态没有变化，已跳过重复更新。"
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
 		}
-		limit := g.maxPlanUpdates
-		if limit <= 0 {
-			limit = maxPlanUpdatesPerTurn
-		}
-		if g.planUpdates >= limit {
+		if g.maxPlanUpdates > 0 && g.planUpdates >= g.maxPlanUpdates {
 			summary := "计划更新过于频繁，已保留最近一次有效状态；请继续执行或直接总结。"
 			g.forceFinalResponse = true
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
@@ -1046,18 +1036,16 @@ func (s *Service) runToolLoopWithCompletion(
 	ctx context.Context,
 	reg *tools.Registry,
 	req protocol.ChatRequest,
-	maxToolCalls int,
 	complete completionFunc,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	return s.runToolLoopWithCompletionState(ctx, reg, req, maxToolCalls, complete, sink, deploymentSSHPreflight{})
+	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink, deploymentSSHPreflight{})
 }
 
 func (s *Service) runToolLoopWithCompletionState(
 	ctx context.Context,
 	reg *tools.Registry,
 	req protocol.ChatRequest,
-	maxToolCalls int,
 	complete completionFunc,
 	sink ChatEventSink,
 	preflight deploymentSSHPreflight,
@@ -1066,7 +1054,6 @@ func (s *Service) runToolLoopWithCompletionState(
 	messages := append([]protocol.Message{}, req.Messages...)
 	toolDefs := toolDefinitions(reg)
 	toolsDisabled := false // 自定义模型不支持 function-calling 时降级为纯对话
-	maxToolCalls = adaptiveToolCallBudget(req.Messages, maxToolCalls)
 	guard := toolLoopGuard{
 		browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages),
 		remoteLookup:               remoteLookupTask(req.Messages),
@@ -1174,15 +1161,6 @@ func (s *Service) runToolLoopWithCompletionState(
 			isProgressUpdate := call.Function.Name == "update_plan"
 			toolInput := toolInputForDisplay(call.Function.Name, call.Function.Arguments)
 			result, toolMsg, guarded, hidden := guard.before(call)
-			if !isProgressUpdate && !hidden && executed >= maxToolCalls {
-				// 达到上限：告知模型并结束。
-				note := fmt.Sprintf("已达到本轮工具调用上限（%d 次），停止继续调用。", maxToolCalls)
-				outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: note})
-				outcome.Content = strings.TrimSpace(outcome.Content + "\n" + note)
-				setOutcomeProgressStatus(&outcome, "failed")
-				emitOutcomeProgress(sink, outcome.Parts)
-				return outcome, nil
-			}
 			if !isProgressUpdate && !hidden {
 				executed++
 			}
@@ -1260,16 +1238,6 @@ func (s *Service) runToolLoopWithCompletionState(
 			}
 		}
 	}
-}
-
-func adaptiveToolCallBudget(messages []protocol.Message, configured int) int {
-	if configured <= 0 || !remoteLookupTask(messages) {
-		return configured
-	}
-	if configured > 8 {
-		return 8
-	}
-	return configured
 }
 
 func remoteLookupTask(messages []protocol.Message) bool {

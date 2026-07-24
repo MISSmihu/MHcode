@@ -32,6 +32,18 @@ type SearchSource struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
+type SubagentActivity struct {
+	ID          string `json:"id"`
+	Kind        string `json:"kind"` // tool | status | provider
+	Title       string `json:"title"`
+	Status      string `json:"status,omitempty"`
+	Input       string `json:"input,omitempty"`
+	Output      string `json:"output,omitempty"`
+	StartedAt   string `json:"startedAt,omitempty"`
+	CompletedAt string `json:"completedAt,omitempty"`
+	DurationMs  int64  `json:"durationMs,omitempty"`
+}
+
 // ResultPart 是一段结构化输出，会被 agent 收集进 ChatResult.Parts。
 type ResultPart struct {
 	Kind PartKind `json:"kind"`
@@ -85,10 +97,13 @@ type ResultPart struct {
 	Attempt    int    `json:"attempt,omitempty"`
 
 	// subagent
-	TaskID        string `json:"taskId,omitempty"`
-	AgentType     string `json:"agentType,omitempty"`
-	Label         string `json:"label,omitempty"`
-	CurrentAction string `json:"currentAction,omitempty"`
+	TaskID            string             `json:"taskId,omitempty"`
+	AgentType         string             `json:"agentType,omitempty"`
+	Label             string             `json:"label,omitempty"`
+	CurrentAction     string             `json:"currentAction,omitempty"`
+	SubagentOutput    string             `json:"subagentOutput,omitempty"`
+	SubagentReasoning string             `json:"subagentReasoning,omitempty"`
+	Activities        []SubagentActivity `json:"activities,omitempty"`
 
 	// provider_notice
 	NoticeKind     string   `json:"noticeKind,omitempty"`

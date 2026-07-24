@@ -15,7 +15,9 @@ describe("frontend fallback state", () => {
   });
   test("keeps reasoning budgets explicit", () => {
     expect(reasoningOptions.find((item) => item.id === "max")?.budget.planner).toBe(true);
-    expect(reasoningOptions.find((item) => item.id === "low")?.budget.maxToolCalls).toBe(3);
+	const lowBudget = reasoningOptions.find((item) => item.id === "low")?.budget;
+	expect(lowBudget?.contextPolicy).toBe("minimal");
+	expect(lowBudget && "maxToolCalls" in lowBudget).toBe(false);
   });
 
   test("renders code and escapes raw HTML", () => {

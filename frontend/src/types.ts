@@ -1,7 +1,6 @@
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type ReasoningBudget = {
-  maxToolCalls: number;
   contextPolicy: string;
   cachePolicy: string;
   planner: boolean;
@@ -834,6 +833,19 @@ export type MessagePart =
       model?: string;
       summary?: string;
       currentAction?: string;
+	  subagentOutput?: string;
+	  subagentReasoning?: string;
+	  activities?: Array<{
+		id: string;
+		kind: "tool" | "status" | "provider" | string;
+		title: string;
+		status?: "running" | "completed" | "ok" | "error" | string;
+		input?: string;
+		output?: string;
+		startedAt?: string;
+		completedAt?: string;
+		durationMs?: number;
+	  }>;
       steps?: Array<{ title: string; status: "pending" | "in_progress" | "completed" | "error" | "cancelled" | string }>;
       changedFiles?: number;
       additions?: number;

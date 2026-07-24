@@ -303,7 +303,6 @@ func (s *Service) teamModeEnabled() bool {
 func (s *Service) runTeamTurnLegacy(
 	ctx context.Context,
 	baseRequest protocol.ChatRequest,
-	maxToolCalls int,
 	primary chatRoute,
 	prefixDiagnostic requestPrefixDiagnostic,
 	requestMessages []protocol.Message,
@@ -330,7 +329,7 @@ func (s *Service) runTeamTurnLegacy(
 			return teamArtifact{role: role}, err
 		}
 		roleSettings := teamRoleSettings(settings, role)
-		artifact, err := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, maxToolCalls, prior, sink)
+		artifact, err := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, prior, sink)
 		if artifact.route.Provider.ID != "" {
 			aggregate = addUsageMetrics(aggregate, artifact.usage)
 		}
@@ -498,7 +497,6 @@ func (s *Service) runTeamRole(
 	attempt int,
 	primary chatRoute,
 	baseRequest protocol.ChatRequest,
-	maxToolCalls int,
 	artifacts []teamArtifact,
 	sink ChatEventSink,
 ) (teamArtifact, error) {
@@ -527,11 +525,10 @@ func (s *Service) runTeamRole(
 		}
 	} else {
 		registry := s.buildReadOnlyRegistry()
-		budget := teamToolBudget(role, maxToolCalls)
 		if role == TeamRoleImplementer {
 			registry = s.buildWorkerToolRegistry()
 		}
-		outcome, err = s.runStreamingToolLoop(ctx, provider, registry, request, budget, roleSink)
+		outcome, err = s.runStreamingToolLoop(ctx, provider, registry, request, roleSink)
 	}
 
 	artifact := teamArtifact{role: role, attempt: attempt, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts}
@@ -635,26 +632,6 @@ func formatTeamHandoff(artifacts []teamArtifact) string {
 		fmt.Fprintf(&out, "\n[%s / %s]\n%s\n", artifact.role, artifact.route.ModelID, content)
 	}
 	return strings.TrimSpace(out.String())
-}
-
-func teamToolBudget(role string, maximum int) int {
-	if maximum < 1 {
-		maximum = 1
-	}
-	switch role {
-	case TeamRoleImplementer:
-		return maximum
-	case TeamRolePlanner:
-		if maximum/2 < 3 {
-			return 3
-		}
-		return maximum / 2
-	default:
-		if maximum/4 < 3 {
-			return 3
-		}
-		return maximum / 4
-	}
 }
 
 func teamRoleToolSink(sink ChatEventSink) ChatEventSink {

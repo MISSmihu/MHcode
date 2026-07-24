@@ -21,7 +21,6 @@ const (
 func (s *Service) runTeamTurn(
 	ctx context.Context,
 	baseRequest protocol.ChatRequest,
-	maxToolCalls int,
 	primary chatRoute,
 	prefixDiagnostic requestPrefixDiagnostic,
 	requestMessages []protocol.Message,
@@ -138,7 +137,7 @@ func (s *Service) runTeamTurn(
 		}
 		parts = removeTeamRolePart(parts, role, attempt)
 		roleSettings := teamRoleSettings(settings, role)
-		artifact, roleErr := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, maxToolCalls, prior, sink)
+		artifact, roleErr := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, prior, sink)
 		if artifact.route.Provider.ID != "" {
 			aggregate = addUsageMetrics(aggregate, artifact.usage)
 		}

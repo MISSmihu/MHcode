@@ -19,6 +19,7 @@ type WailsAppBinding = {
   GuideChatMessage?: (taskID: string, guidanceID: string, prompt: string) => Promise<boolean>;
   GuideChatMessageWithAttachments?: (taskID: string, guidanceID: string, prompt: string, attachments: ChatAttachment[]) => Promise<boolean>;
   StopChatMessage?: (taskID: string) => Promise<boolean>;
+  StopSubagent?: (parentTaskID: string, subagentTaskID: string) => Promise<boolean>;
   GetActiveChatTask?: () => Promise<ChatTaskState | null>;
   GetActiveChatTasks?: () => Promise<ChatTaskState[]>;
 	RevealSecretResult?: (projectID: string, sessionID: string, secretID: string) => Promise<SecretResultReveal>;
@@ -441,6 +442,14 @@ export async function stopChatMessage(taskID: string): Promise<boolean> {
   return true;
 }
 
+export async function stopSubagent(parentTaskID: string, subagentTaskID: string): Promise<boolean> {
+  const binding = wailsBinding();
+  if (binding?.StopSubagent) {
+    return binding.StopSubagent(parentTaskID, subagentTaskID);
+  }
+  return false;
+}
+
 export async function guideChatMessage(
   taskID: string,
   guidanceID: string,
@@ -502,7 +511,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.3",
+  version: "0.3.4",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",

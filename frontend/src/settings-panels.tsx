@@ -1311,7 +1311,7 @@ export function ModelSettingsPanel(props: {
         </div>
         <MetricGrid
           items={[
-            ["工具预算", `${formatInteger(props.profile.budget.maxToolCalls)} 次`],
+			["工具执行", "按任务需要"],
             ["上下文策略", props.profile.budget.contextPolicy],
             ["缓存策略", props.profile.budget.cachePolicy],
             ["规划器", props.profile.budget.planner ? "开启" : "关闭"],

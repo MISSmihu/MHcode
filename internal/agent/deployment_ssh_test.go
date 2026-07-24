@@ -54,7 +54,6 @@ func TestDeploymentTurnRunsSSHPreflightBeforeModel(t *testing.T) {
 		provider,
 		provider,
 		protocol.ChatRequest{Model: "deployment-test", Messages: messages},
-		8,
 		chatRoute{Provider: ModelProviderSetting{ID: "test", Name: "Test", Protocol: "openai-compatible"}, ModelID: "deployment-test"},
 		requestPrefixDiagnostic{},
 		messages,

@@ -71,8 +71,8 @@ import { Portal } from "solid-js/web";
 import { ReasoningMenu } from "./components/ReasoningMenu";
 import { SidePanelHost } from "./components/SidePanelHost";
 import type { SidePanelView } from "./components/SidePanelHost";
-import { MessageContent, TaskProgress, TeamRun, textToParts } from "./components/chat/MessageContent";
-import type { TaskProgressPart, TeamPart } from "./components/chat/MessageContent";
+import { MessageContent, SubagentDock, TaskProgress, TeamRun, textToParts } from "./components/chat/MessageContent";
+import type { SubagentPart, TaskProgressPart, TeamPart } from "./components/chat/MessageContent";
 import { TimelinePanel } from "./components/TimelinePanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
@@ -91,6 +91,7 @@ import {
   getActiveChatTasks,
   guideChatMessage,
   stopChatMessage,
+  stopSubagent,
   onChatTaskEvent,
   onMCPState,
   setReasoningLevel,
@@ -259,6 +260,7 @@ type SessionViewState = {
   reviewOpen: boolean;
   sidePanelView: SidePanelView;
   workspaceFileRequest?: WorkspaceFileRequest;
+  selectedSubagentTaskID?: string;
 };
 
 function sessionIdentityKey(projectID: string, sessionID: string): string {
@@ -378,6 +380,8 @@ function App() {
   const [reviewOpen, setReviewOpen] = createSignal(false);
   const [sidePanelView, setSidePanelView] = createSignal<SidePanelView>("browser");
   const [workspaceFileRequest, setWorkspaceFileRequest] = createSignal<WorkspaceFileRequest>();
+  const [selectedSubagentTaskID, setSelectedSubagentTaskID] = createSignal("");
+  const [stoppingSubagentTaskID, setStoppingSubagentTaskID] = createSignal("");
   let chatScrollRef: HTMLElement | undefined;
   let shellRef: HTMLElement | undefined;
   let workbenchRef: HTMLDivElement | undefined;
@@ -493,6 +497,7 @@ function App() {
         reviewOpen: reviewOpen(),
         sidePanelView: sidePanelView(),
         workspaceFileRequest: workspaceFileRequest(),
+        selectedSubagentTaskID: selectedSubagentTaskID(),
       },
     }));
   };
@@ -511,6 +516,7 @@ function App() {
       setReviewOpen(false);
       setSidePanelView("browser");
       setWorkspaceFileRequest(undefined);
+      setSelectedSubagentTaskID("");
       return false;
     }
     setMessages([...view.messages]);
@@ -524,6 +530,7 @@ function App() {
     setReviewOpen(view.reviewOpen);
     setSidePanelView(view.sidePanelView);
     setWorkspaceFileRequest(view.workspaceFileRequest);
+    setSelectedSubagentTaskID(view.selectedSubagentTaskID ?? "");
     return true;
   };
 
@@ -581,6 +588,24 @@ function App() {
     return [...latestByRole.values()].sort((left, right) =>
       (roleOrder.get(left.role) ?? 99) - (roleOrder.get(right.role) ?? 99),
     );
+  });
+  const activeSubagentParts = createMemo<SubagentPart[]>(() => {
+    const task = activeSessionTask();
+    if (!task) return [];
+    return (task.assistantMessage.parts ?? []).filter(
+	  (part): part is SubagentPart => part.kind === "subagent" && (part.status === "pending" || part.status === "running"),
+	);
+  });
+  const selectedSubagent = createMemo<SubagentPart | undefined>(() => {
+    const taskID = selectedSubagentTaskID();
+    if (!taskID) return undefined;
+    for (const message of [...messages()].reverse()) {
+      const part = message.parts?.find((candidate): candidate is SubagentPart => candidate.kind === "subagent" && candidate.taskId === taskID);
+      if (part) return part;
+    }
+    return activeSessionTask()?.assistantMessage.parts?.find(
+	  (candidate): candidate is SubagentPart => candidate.kind === "subagent" && candidate.taskId === taskID,
+	);
   });
   const undoableFileChangeMessageID = createMemo(() => {
     const latestAssistant = [...messages()].reverse().find((message) => message.role === "assistant" && !message.streaming);
@@ -710,11 +735,13 @@ function App() {
   const closeBrowserPanel = () => {
     setBrowserPreview(undefined);
     if (reviewOpen()) setSidePanelView("files");
+    else if (selectedSubagent()) setSidePanelView("subagent");
   };
 
   const closeReviewPanel = () => {
     setReviewOpen(false);
     if (browserPreview()) setSidePanelView("browser");
+    else if (selectedSubagent()) setSidePanelView("subagent");
   };
 
   const openReviewPanel = () => {
@@ -722,6 +749,34 @@ function App() {
     setSidePanelView("files");
     setWorkspaceToolsOpen(false);
     queueMicrotask(constrainBrowserPanelWidth);
+  };
+
+  const openSubagentPanel = (part: SubagentPart) => {
+    setSelectedSubagentTaskID(part.taskId);
+    setSidePanelView("subagent");
+    setWorkspaceToolsOpen(false);
+    queueMicrotask(constrainBrowserPanelWidth);
+  };
+
+  const closeSubagentPanel = () => {
+    setSelectedSubagentTaskID("");
+    if (browserPreview()) setSidePanelView("browser");
+    else if (reviewOpen()) setSidePanelView("files");
+  };
+
+  const stopOneSubagent = async (part: SubagentPart) => {
+    const parent = activeSessionTask();
+    if (!parent || stoppingSubagentTaskID()) return;
+    setStoppingSubagentTaskID(part.taskId);
+    setError("");
+    try {
+      const stopped = await stopSubagent(parent.taskID, part.taskId);
+      if (!stopped) setError("该子代理已经结束或不属于当前任务。");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setStoppingSubagentTaskID("");
+    }
   };
 
   const toggleReviewPanel = () => {
@@ -3234,7 +3289,7 @@ function App() {
   });
 
   createEffect(() => {
-    if (browserPreview() || reviewOpen()) {
+    if (browserPreview() || reviewOpen() || selectedSubagent()) {
       queueMicrotask(constrainBrowserPanelWidth);
     }
   });
@@ -3743,9 +3798,10 @@ function App() {
       <div
         class="workbench-main"
         classList={{
-          "side-panel-open": !drawerOpen() && (Boolean(browserPreview()) || reviewOpen()),
+          "side-panel-open": !drawerOpen() && (Boolean(browserPreview()) || reviewOpen() || Boolean(selectedSubagent())),
           "browser-open": !drawerOpen() && sidePanelView() === "browser" && Boolean(browserPreview()),
           "review-open": !drawerOpen() && sidePanelView() === "files" && reviewOpen(),
+		  "subagent-open": !drawerOpen() && sidePanelView() === "subagent" && Boolean(selectedSubagent()),
           "resizing-browser": resizingBrowserPanel(),
         }}
         ref={workbenchRef}
@@ -3883,6 +3939,8 @@ function App() {
                       onOpenWorkspaceFile={handleOpenWorkspaceFile}
                       onOpenURL={requestOpenURL}
                       onRevealSecret={revealMessageSecret}
+					  onOpenSubagent={openSubagentPanel}
+					  onStopSubagent={stopOneSubagent}
                       isDisclosureOpen={(key) => isMessageDisclosureOpen(message.id, key)}
                       onDisclosureChange={(key, open) => setMessageDisclosureOpen(message.id, key, open)}
                     />
@@ -4086,10 +4144,10 @@ function App() {
           </Show>
         </div>
 
-        <Show when={Boolean(activeTaskProgress()) || activeTeamParts().length > 0}>
+        <Show when={Boolean(activeTaskProgress()) || activeTeamParts().length > 0 || activeSubagentParts().length > 0}>
           <section
             class="execution-status-dock"
-            classList={{ combined: Boolean(activeTaskProgress()) && activeTeamParts().length > 0 }}
+			classList={{ combined: [Boolean(activeTaskProgress()), activeTeamParts().length > 0, activeSubagentParts().length > 0].filter(Boolean).length > 1 }}
             aria-label="当前执行状态"
             aria-live="polite"
           >
@@ -4099,6 +4157,14 @@ function App() {
             <Show when={activeTeamParts().length > 0}>
               <TeamRun parts={activeTeamParts()} docked />
             </Show>
+			<Show when={activeSubagentParts().length > 0}>
+			  <SubagentDock
+				parts={activeSubagentParts()}
+				stoppingTaskID={stoppingSubagentTaskID()}
+				onOpen={openSubagentPanel}
+				onStop={stopOneSubagent}
+			  />
+			</Show>
           </section>
         </Show>
 
@@ -4334,7 +4400,7 @@ function App() {
         />
       </section>
 
-      <Show when={!drawerOpen() && (Boolean(browserPreview()) || reviewOpen())}>
+      <Show when={!drawerOpen() && (Boolean(browserPreview()) || reviewOpen() || Boolean(selectedSubagent()))}>
         <>
           <div
             class="browser-panel-resizer"
@@ -4378,6 +4444,9 @@ function App() {
           <SidePanelHost
             browser={browserPreview()}
             reviewOpen={reviewOpen()}
+			subagent={selectedSubagent()}
+			parentTaskID={activeSessionTask()?.taskID}
+			stoppingSubagentID={stoppingSubagentTaskID()}
             activeView={sidePanelView()}
             workspaceRoot={runtimeSettings().workspaceRoot}
             fileRequest={workspaceFileRequest()}
@@ -4388,6 +4457,8 @@ function App() {
             onSelectView={setSidePanelView}
             onCloseBrowser={closeBrowserPanel}
             onCloseFiles={closeReviewPanel}
+			onStopSubagent={stopOneSubagent}
+			onCloseSubagent={closeSubagentPanel}
           />
         </>
       </Show>

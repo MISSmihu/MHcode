@@ -20,7 +20,6 @@ const (
 const DefaultReasoningLevel = ReasoningMax
 
 type ReasoningBudget struct {
-	MaxToolCalls  int    `json:"maxToolCalls"`
 	ContextPolicy string `json:"contextPolicy"`
 	CachePolicy   string `json:"cachePolicy"`
 	Planner       bool   `json:"planner"`
@@ -39,7 +38,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "关闭",
 		Description: "不请求模型进行额外推理",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  3,
 			ContextPolicy: "minimal",
 			CachePolicy:   "reuse-prefix",
 			Planner:       false,
@@ -50,7 +48,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "轻度",
 		Description: "简单问答、轻量编辑、低成本优先",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  3,
 			ContextPolicy: "minimal",
 			CachePolicy:   "reuse-prefix",
 			Planner:       false,
@@ -61,7 +58,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "中",
 		Description: "普通代码修改、单文件任务",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  8,
 			ContextPolicy: "task-summary",
 			CachePolicy:   "reuse-prefix",
 			Planner:       false,
@@ -72,7 +68,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "高",
 		Description: "跨文件修改、复杂 bug、测试修复",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  16,
 			ContextPolicy: "expanded",
 			CachePolicy:   "stable-prefix",
 			Planner:       true,
@@ -83,7 +78,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "很高",
 		Description: "大型实现、深入排查、多阶段验证",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  24,
 			ContextPolicy: "full-relevant",
 			CachePolicy:   "strict-stable-prefix",
 			Planner:       true,
@@ -94,7 +88,6 @@ var reasoningProfiles = []ReasoningProfile{
 		Label:       "极高",
 		Description: "协议设计、Agent 架构、发布级检查",
 		Budget: ReasoningBudget{
-			MaxToolCalls:  32,
 			ContextPolicy: "full-relevant",
 			CachePolicy:   "strict-stable-prefix",
 			Planner:       true,

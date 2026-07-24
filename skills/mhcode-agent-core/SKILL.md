@@ -38,19 +38,21 @@ description: 统一管理 MHcode Agent 的推理强度、权限审批、结构�
 使用稳定枚举：
 
 ```ts
-type ReasoningLevel = "low" | "medium" | "high" | "ultra"
+type ReasoningLevel = "none" | "low" | "medium" | "high" | "xhigh" | "max"
 ```
 
-中文展示为：`低 / 中 / 高 / 超高`。四档同时影响工具调用上限、上下文策略、缓存策略和规划器：
+中文展示为：`关闭 / 轻度 / 中 / 高 / 很高 / 极高`。推理档位影响上游推理参数、上下文策略、缓存策略和规划器，不限制工具调用次数：
 
 ```json
 {
-  "low": { "maxToolCalls": 3, "contextPolicy": "minimal", "cachePolicy": "reuse-prefix", "planner": false },
-  "medium": { "maxToolCalls": 8, "contextPolicy": "task-summary", "cachePolicy": "reuse-prefix", "planner": false },
-  "high": { "maxToolCalls": 16, "contextPolicy": "expanded", "cachePolicy": "stable-prefix", "planner": true },
-  "ultra": { "maxToolCalls": 32, "contextPolicy": "full-relevant", "cachePolicy": "strict-stable-prefix", "planner": true }
+  "low": { "contextPolicy": "minimal", "cachePolicy": "reuse-prefix", "planner": false },
+  "medium": { "contextPolicy": "task-summary", "cachePolicy": "reuse-prefix", "planner": false },
+  "high": { "contextPolicy": "expanded", "cachePolicy": "stable-prefix", "planner": true },
+  "max": { "contextPolicy": "full-relevant", "cachePolicy": "strict-stable-prefix", "planner": true }
 }
 ```
+
+工具循环持续到模型给出最终答案、用户取消、单次工具超时或循环保护判定无进展。禁止用固定调用次数截断长任务；重复调用检测、上下文压缩、审批、沙箱和资源限制仍必须生效。
 
 运行中切换只影响下一轮请求，并显示“下一轮生效”。不要让菜单成为没有执行效果的装饰。
 
@@ -141,6 +143,15 @@ planner → implementer → tester / reviewer → synthesizer
 - 审阅反馈触发有限轮次修订。
 - 任一角色取消、超时或失败都必须更新团队和计划终态。
 - 每个角色可以使用独立供应商/模型，但共享结构化 artifact 摘要，不重复注入完整对话。
+
+## 动态子代理
+
+- 同一次 `delegate_task` 中的 explore、review 和 implement 全部并发启动。
+- 多个 implement 必须由主 Agent 划分互不重叠的文件范围。
+- 每个子代理拥有独立取消句柄；停止一个子代理不影响兄弟任务和父任务，停止父任务会取消全部子代理。
+- 实时正文、推理、工具活动、状态和最终摘要写入结构化 `subagent` 片段，并随会话事件持久化。
+- 子代理输出窗口只读；用户可以查看和停止，不能向子代理直接发送消息。
+- 子代理工具循环同样没有固定调用次数上限，但继续受防重复、超时、上下文、审批和沙箱约束。
 
 ## 上下文压缩
 

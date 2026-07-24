@@ -1,6 +1,7 @@
 import { For, Match, Switch, Show, createMemo, createSignal, onCleanup } from "solid-js";
 import {
   AlertCircle,
+	Bot,
   Check,
 	Copy,
   ChevronDown,
@@ -21,6 +22,7 @@ import {
   Route,
   Search,
   ShieldAlert,
+	Square,
   TerminalSquare,
   Undo2,
   Users,
@@ -49,6 +51,8 @@ export function MessageContent(props: {
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
 	onRevealSecret?: (secretID: string) => Promise<string>;
+	onOpenSubagent?: (part: SubagentPart) => void;
+	onStopSubagent?: (part: SubagentPart) => void | Promise<void>;
 	isDisclosureOpen?: (key: string) => boolean;
 	onDisclosureChange?: (key: string, open: boolean) => void;
 }) {
@@ -83,7 +87,11 @@ export function MessageContent(props: {
               </Show>
             </Match>
             <Match when={block.kind === "subagents"}>
-              <SubagentRun parts={(block as SubagentRenderBlock).parts} />
+              <SubagentRun
+				parts={(block as SubagentRenderBlock).parts}
+				onOpen={props.onOpenSubagent}
+				onStop={props.onStopSubagent}
+			  />
             </Match>
             <Match when={block.kind === "provider"}>
               <ProviderNotice part={(block as ProviderRenderBlock).part} />
@@ -773,7 +781,11 @@ function ProviderNotice(props: { part: ProviderNoticePart }) {
   );
 }
 
-export function SubagentRun(props: { parts: SubagentPart[] }) {
+export function SubagentRun(props: {
+  parts: SubagentPart[];
+  onOpen?: (part: SubagentPart) => void;
+  onStop?: (part: SubagentPart) => void | Promise<void>;
+}) {
   const completed = createMemo(() => props.parts.filter((part) => part.status === "completed").length);
   const running = createMemo(() => props.parts.filter((part) => part.status === "running").length);
   return (
@@ -792,7 +804,9 @@ export function SubagentRun(props: { parts: SubagentPart[] }) {
               <span class="op-subagent-status" aria-hidden="true"><SubagentStatus status={part.status} /></span>
               <span class="op-subagent-main">
                 <span class="op-subagent-name">
-                  <strong>{part.label || "子任务"}</strong>
+                  <button type="button" title="在右侧查看子代理输出" onClick={() => props.onOpen?.(part)}>
+					{part.label || "子任务"}
+				  </button>
                   <small>{subagentTypeLabel(part.agentType)}</small>
                 </span>
                 <small class="op-subagent-meta">
@@ -804,6 +818,16 @@ export function SubagentRun(props: { parts: SubagentPart[] }) {
                   <span class="op-subagent-action">{part.currentAction}</span>
                 </Show>
               </span>
+			  <span class="op-subagent-actions">
+				<button type="button" title="查看子代理输出" aria-label={`查看 ${part.label || "子任务"} 输出`} onClick={() => props.onOpen?.(part)}>
+				  <ChevronRight size={13} />
+				</button>
+				<Show when={(part.status === "pending" || part.status === "running") && props.onStop}>
+				  <button class="stop" type="button" title="停止此子代理" aria-label={`停止 ${part.label || "子任务"}`} onClick={() => void props.onStop?.(part)}>
+					<Square size={10} fill="currentColor" />
+				  </button>
+				</Show>
+			  </span>
               <Show when={(part.steps?.length ?? 0) > 0 || part.summary}>
                 <details class="op-subagent-details">
                   <summary>查看工作记录 <ChevronRight size={12} /></summary>
@@ -820,6 +844,47 @@ export function SubagentRun(props: { parts: SubagentPart[] }) {
                 </details>
               </Show>
             </article>
+          )}
+        </For>
+      </div>
+    </section>
+  );
+}
+
+export function SubagentDock(props: {
+  parts: SubagentPart[];
+  stoppingTaskID?: string;
+  onOpen: (part: SubagentPart) => void;
+  onStop: (part: SubagentPart) => void | Promise<void>;
+}) {
+  return (
+    <section class="op-subagent-dock" aria-label="运行中的子代理">
+      <header>
+        <span class="op-subagent-dock-icon" aria-hidden="true"><Bot size={14} /></span>
+        <span><strong>子代理</strong><small>{props.parts.length} 个并行任务</small></span>
+      </header>
+      <div class="op-subagent-dock-list">
+        <For each={props.parts}>
+          {(part) => (
+            <div class="op-subagent-chip" classList={{ [part.status || "pending"]: true }}>
+              <button type="button" class="op-subagent-chip-main" title="查看子代理输出" onClick={() => props.onOpen(part)}>
+                <SubagentStatus status={part.status} />
+                <span>
+                  <strong>{part.label || "子任务"}</strong>
+                  <small>{part.currentAction || subagentTypeLabel(part.agentType)}</small>
+                </span>
+              </button>
+              <button
+                type="button"
+                class="op-subagent-chip-stop"
+                title="停止此子代理"
+                aria-label={`停止 ${part.label || "子任务"}`}
+                disabled={props.stoppingTaskID === part.taskId}
+                onClick={() => void props.onStop(part)}
+              >
+                <Square size={9} fill="currentColor" />
+              </button>
+            </div>
           )}
         </For>
       </div>

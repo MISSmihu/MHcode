@@ -46,9 +46,12 @@ describe("chat UI regressions", () => {
   });
 
   test("merges and renders dynamic subagents independently from the fixed AI team", async () => {
-    const [app, messageContent, css, types] = await Promise.all([
+    const [app, messageContent, panel, host, services, css, types] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/components/SubagentPanel.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/components/SidePanelHost.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
       Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
       Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
     ]);
@@ -56,10 +59,19 @@ describe("chat UI regressions", () => {
     expect(types).toContain('agentType: "explore" | "review" | "implement"');
     expect(app).toContain('item.kind === "subagent" && item.taskId === part.taskId');
     expect(messageContent).toContain("<SubagentRun");
+	expect(messageContent).toContain("export function SubagentDock");
     expect(messageContent).toContain('aria-label="动态子代理执行记录"');
     expect(messageContent).toContain('part.name === "delegate_task"');
     expect(css).toContain(".op-subagent-run {");
     expect(css).toContain(".op-subagent-item.running .op-subagent-status");
+	expect(app).toContain("stopSubagent(parent.taskID, part.taskId)");
+	expect(app).toContain("selectedSubagentTaskID");
+	expect(host).toContain('<SubagentPanel');
+	expect(panel).toContain('class="subagent-panel-scroll"');
+	expect(panel).not.toContain("textarea");
+	expect(services).toContain("StopSubagent?:");
+	expect(types).toContain("subagentOutput?: string;");
+	expect(types).toContain("activities?: Array<{");
   });
 
   test("keeps a one-line user message compact", async () => {
@@ -226,7 +238,7 @@ describe("chat UI regressions", () => {
     expect(css).toContain("visibility: hidden;");
   });
 
-  test("keeps plan and AI team status in separate centered panels above the composer", async () => {
+  test("keeps plan, AI team, and subagent status in separate centered panels above the composer", async () => {
     const [app, messageContent, reasoningMenu, css] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
@@ -236,11 +248,13 @@ describe("chat UI regressions", () => {
     expect(messageContent).not.toContain('<Match when={block.kind === "progress"}>');
     expect(messageContent).toContain('if (part.kind === "task_progress") {');
     expect(app).toContain('class="execution-status-dock"');
-    expect(app).toContain('classList={{ combined: Boolean(activeTaskProgress()) && activeTeamParts().length > 0 }}');
+    expect(app).toContain('activeSubagentParts().length > 0].filter(Boolean).length > 1');
     expect(app).toContain('<TeamRun parts={activeTeamParts()} docked />');
+	expect(app).toContain('<SubagentDock');
     expect(messageContent).toContain("hideTeamRun?: boolean;");
     expect(css).toContain(".execution-status-dock.combined");
-    expect(css).toContain("grid-template-columns: minmax(260px, 420px) minmax(340px, 520px);");
+	expect(css).toContain("flex-wrap: wrap;");
+	expect(css).toContain(".execution-status-dock > .op-subagent-dock");
     expect(messageContent).toContain('<details class="op-team-run docked"');
     expect(messageContent).toContain('class="op-team-stage-track"');
     expect(reasoningMenu).toContain("<Portal>");
@@ -256,8 +270,8 @@ describe("chat UI regressions", () => {
     expect(reasoningMenu).toContain('data-placement={position().placement}');
     expect(reasoningMenu).toContain('document.addEventListener("scroll", reposition, true)');
     expect(css).toContain("position: fixed;");
-    expect(app).toContain('<Show when={!drawerOpen() && (Boolean(browserPreview()) || reviewOpen())}>');
-    expect(app).toContain('"side-panel-open": !drawerOpen() && (Boolean(browserPreview()) || reviewOpen())');
+    expect(app).toContain('<Show when={!drawerOpen() && (Boolean(browserPreview()) || reviewOpen() || Boolean(selectedSubagent()))}>');
+    expect(app).toContain('"side-panel-open": !drawerOpen() && (Boolean(browserPreview()) || reviewOpen() || Boolean(selectedSubagent()))');
   });
 
   test("keeps the jump-to-bottom action centered above the plan and composer", async () => {

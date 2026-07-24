@@ -178,7 +178,7 @@ func (s *Service) PlanMode() bool {
 }
 
 // runPlanPhase 执行只读规划阶段，返回计划文本与该阶段产出的片段。
-func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, baseRequest protocol.ChatRequest, maxToolCalls int) (string, toolLoopOutcome, error) {
+func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, baseRequest protocol.ChatRequest) (string, toolLoopOutcome, error) {
 	reg := s.buildReadOnlyRegistry()
 
 	planReq := baseRequest
@@ -191,12 +191,7 @@ func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, 
 	planReq.Messages = append(append([]protocol.Message{}, baseRequest.Messages...),
 		protocol.Message{Role: "user", Content: planInstruction})
 
-	// 规划阶段工具预算取一半（够调研即可），至少 3。
-	planBudget := maxToolCalls / 2
-	if planBudget < 3 {
-		planBudget = 3
-	}
-	outcome, err := s.runToolLoop(ctx, caller, reg, planReq, planBudget)
+	outcome, err := s.runToolLoop(ctx, caller, reg, planReq)
 	if err != nil {
 		return "", toolLoopOutcome{}, err
 	}

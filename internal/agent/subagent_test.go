@@ -32,6 +32,34 @@ type subagentEndToEndProvider struct {
 	sawDelegatedResult bool
 }
 
+type selectiveSubagentProvider struct {
+	started   chan string
+	cancelled chan string
+	release   chan struct{}
+}
+
+func (p *selectiveSubagentProvider) Name() string { return "selective-subagent" }
+
+func (p *selectiveSubagentProvider) ListModels(context.Context) ([]protocol.Model, error) {
+	return []protocol.Model{{ID: "subagent-model"}}, nil
+}
+
+func (p *selectiveSubagentProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
+	taskID := request.Metadata["subagent_task_id"]
+	events := make(chan protocol.StreamEvent, 2)
+	go func() {
+		defer close(events)
+		p.started <- taskID
+		select {
+		case <-ctx.Done():
+			p.cancelled <- taskID
+		case <-p.release:
+			events <- protocol.StreamEvent{Type: "delta", Delta: "worker completed"}
+		}
+	}()
+	return events, nil
+}
+
 func (p *subagentProbeProvider) Name() string { return "subagent-probe" }
 
 func (p *subagentProbeProvider) ListModels(context.Context) ([]protocol.Model, error) {
@@ -146,7 +174,6 @@ func newSubagentToolTest(t *testing.T, provider protocol.Provider) (*Service, co
 			ToolChoice: "auto",
 		},
 		PrimaryRoute: route,
-		MaxToolCalls: 12,
 	}
 	return service, withSubagentExecutionScope(context.Background(), scope)
 }
@@ -200,10 +227,14 @@ func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
 	}
 	service.providerFactory = func(chatRoute) (protocol.Provider, error) { return provider, nil }
 	var liveStatuses []string
+	var liveOutput string
 	result, err := service.SendChatMessageWithEvents(context.Background(), "请并行检查项目结构", func(event ChatStreamEvent) {
 		for _, part := range event.Parts {
 			if part.Kind == tools.PartSubagent {
 				liveStatuses = append(liveStatuses, part.Status)
+				if part.SubagentOutput != "" {
+					liveOutput = part.SubagentOutput
+				}
 			}
 		}
 	})
@@ -226,9 +257,12 @@ func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
 	if !containsString(liveStatuses, "running") || !containsString(liveStatuses, "completed") {
 		t.Fatalf("live subagent statuses = %#v", liveStatuses)
 	}
+	if !strings.Contains(liveOutput, "子代理确认了真实目录结构") {
+		t.Fatalf("live subagent output = %q", liveOutput)
+	}
 }
 
-func TestDelegateTaskSerializesImplementWorkersAndAllowsWriteTools(t *testing.T) {
+func TestDelegateTaskRunsImplementWorkersConcurrentlyAndAllowsWriteTools(t *testing.T) {
 	provider := &subagentProbeProvider{delay: 45 * time.Millisecond}
 	service, ctx := newSubagentToolTest(t, provider)
 	args := json.RawMessage(`{"tasks":[
@@ -240,8 +274,8 @@ func TestDelegateTaskSerializesImplementWorkersAndAllowsWriteTools(t *testing.T)
 		t.Fatal(err)
 	}
 	requests, maxActive := provider.snapshot()
-	if maxActive != 1 {
-		t.Fatalf("implement workers ran concurrently, max active = %d", maxActive)
+	if maxActive < 2 {
+		t.Fatalf("implement workers did not overlap, max active = %d", maxActive)
 	}
 	if len(requests) != 2 {
 		t.Fatalf("request count = %d, want 2", len(requests))
@@ -279,11 +313,91 @@ func TestDelegateTaskCancellationPersistsCancelledWorkerState(t *testing.T) {
 	}
 }
 
+func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {
+	provider := &selectiveSubagentProvider{
+		started: make(chan string, 2), cancelled: make(chan string, 1), release: make(chan struct{}),
+	}
+	service, baseCtx := newSubagentToolTest(t, provider)
+	var mu sync.Mutex
+	var taskIDs []string
+	ctx := tools.WithProgressSink(baseCtx, func(part tools.ResultPart) {
+		if part.Kind != tools.PartSubagent || part.Status != "pending" {
+			return
+		}
+		mu.Lock()
+		taskIDs = append(taskIDs, part.TaskID)
+		mu.Unlock()
+	})
+	done := make(chan tools.Result, 1)
+	go func() {
+		result, _ := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
+			{"label":"first","task":"wait","agentType":"explore"},
+			{"label":"second","task":"wait","agentType":"review"}
+		]}`))
+		done <- result
+	}()
+
+	started := map[string]bool{}
+	for len(started) < 2 {
+		select {
+		case taskID := <-provider.started:
+			started[taskID] = true
+		case <-time.After(time.Second):
+			t.Fatal("workers did not start concurrently")
+		}
+	}
+	mu.Lock()
+	if len(taskIDs) != 2 {
+		mu.Unlock()
+		t.Fatalf("pending task IDs = %#v", taskIDs)
+	}
+	selected := taskIDs[0]
+	mu.Unlock()
+	if !service.CancelSubagent(selected) {
+		t.Fatal("selected subagent was not cancelled")
+	}
+	select {
+	case cancelled := <-provider.cancelled:
+		if cancelled != selected {
+			t.Fatalf("cancelled worker = %q, want %q", cancelled, selected)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selected worker did not stop promptly")
+	}
+	close(provider.release)
+
+	select {
+	case result := <-done:
+		statuses := map[string]string{}
+		for _, part := range result.Parts {
+			if part.Kind == tools.PartSubagent {
+				statuses[part.TaskID] = part.Status
+			}
+		}
+		if statuses[selected] != "cancelled" {
+			t.Fatalf("selected status = %q", statuses[selected])
+		}
+		completed := 0
+		for taskID, status := range statuses {
+			if taskID != selected && status == "completed" {
+				completed++
+			}
+		}
+		if completed != 1 {
+			t.Fatalf("sibling status map = %#v", statuses)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("delegate task did not finish after sibling completed")
+	}
+}
+
 func TestSubagentPartRoundTripsThroughEventLog(t *testing.T) {
 	source := []tools.ResultPart{{
 		Kind: tools.PartSubagent, TaskID: "subagent-1", AgentType: "review", Label: "审阅",
 		Status: "completed", ProviderID: "provider", Model: "model", Summary: "没有发现回归。",
 		CurrentAction: "已完成", Steps: []tools.ProgressStep{{Title: "检查测试", Status: "completed"}},
+		SubagentOutput: "审阅输出", SubagentReasoning: "检查路径",
+		Activities:   []tools.SubagentActivity{{ID: "tool-1", Kind: "tool", Title: "读取文件", Status: "completed", Output: "ok"}},
 		ChangedFiles: 2, Additions: 4, Deletions: 1, DurationMs: 25,
 	}}
 	restored := fromEventParts(toEventParts(source))
@@ -296,6 +410,9 @@ func TestSubagentPartRoundTripsThroughEventLog(t *testing.T) {
 	}
 	if len(part.Steps) != 1 || part.Steps[0].Title != "检查测试" || part.ChangedFiles != 2 {
 		t.Fatalf("restored subagent details = %#v", part)
+	}
+	if part.SubagentOutput != "审阅输出" || part.SubagentReasoning != "检查路径" || len(part.Activities) != 1 || part.Activities[0].Output != "ok" {
+		t.Fatalf("restored subagent transcript = %#v", part)
 	}
 }
 

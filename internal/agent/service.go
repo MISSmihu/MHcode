@@ -140,6 +140,7 @@ type DeepSeekSessionState struct {
 
 type Service struct {
 	activityMu      sync.Mutex
+	subagentMu      sync.Mutex
 	stateMu         sync.RWMutex
 	snapshotMu      sync.RWMutex
 	turnActive      bool
@@ -171,6 +172,7 @@ type Service struct {
 	usageLedger     UsageLedgerState
 	providerFactory func(chatRoute) (protocol.Provider, error)
 	installationID  string
+	subagents       map[string]*subagentControl
 	// projectID is kept alongside sessionID so a background runtime can update
 	// its own metadata without changing the application's active session.
 	projectID string
@@ -985,9 +987,9 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		TargetInputTokens: compression.Budget.TargetTokens,
 	}
 
-	// 工具循环分支：provider 支持 function-calling 且推理档位允许工具调用时启用。
+	// 工具循环按任务需要持续运行。推理档位只控制模型推理、上下文和规划策略，
+	// 不再以固定调用次数截断长任务。
 	profile, _ := ReasoningProfileFor(s.reasoning)
-	maxToolCalls := profile.Budget.MaxToolCalls
 	if s.teamModeEnabled() && !isGuidanceChatTurn(ctx) {
 		if !profile.Budget.Planner {
 			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errTeamModeRequiresPlanner
@@ -995,10 +997,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		if resumeTeamRun {
 			ctx = withTeamResumeTurn(ctx)
 		}
-		return s.runTeamTurn(ctx, baseRequest, maxToolCalls, route, prefixDiagnostic, requestMessages, baseMessageCount, sink)
+		return s.runTeamTurn(ctx, baseRequest, route, prefixDiagnostic, requestMessages, baseMessageCount, sink)
 	}
-	if caller, ok := chatProvider.(protocol.ToolCaller); ok && maxToolCalls > 0 {
-		result, loopErr := s.runToolLoopTurn(ctx, chatProvider, caller, baseRequest, maxToolCalls, route, prefixDiagnostic, requestMessages, baseMessageCount, sink)
+	if caller, ok := chatProvider.(protocol.ToolCaller); ok {
+		result, loopErr := s.runToolLoopTurn(ctx, chatProvider, caller, baseRequest, route, prefixDiagnostic, requestMessages, baseMessageCount, sink)
 		if loopErr != nil {
 			return result, loopErr
 		}

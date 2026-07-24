@@ -226,6 +226,26 @@ func (a *App) StopChatMessage(taskID string) bool {
 	return true
 }
 
+// StopSubagent cancels one delegated worker while the parent task and sibling
+// workers continue running.
+func (a *App) StopSubagent(parentTaskID, subagentTaskID string) bool {
+	parentTaskID = strings.TrimSpace(parentTaskID)
+	subagentTaskID = strings.TrimSpace(subagentTaskID)
+	if subagentTaskID == "" {
+		return false
+	}
+	a.chat.mu.Lock()
+	task := a.chat.tasks[parentTaskID]
+	if task == nil && a.chat.active != nil && (parentTaskID == "" || a.chat.active.id == parentTaskID) {
+		task = a.chat.active
+	}
+	a.chat.mu.Unlock()
+	if task == nil || task.service == nil {
+		return false
+	}
+	return task.service.CancelSubagent(subagentTaskID)
+}
+
 func (a *App) GuideChatMessage(taskID, guidanceID, prompt string) (bool, error) {
 	return a.GuideChatMessageWithAttachments(taskID, guidanceID, prompt, nil)
 }

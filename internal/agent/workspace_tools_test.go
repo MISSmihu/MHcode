@@ -160,7 +160,7 @@ func TestAgentToolLoopWritesStagesCommitsAndReturnsFinalReply(t *testing.T) {
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), svc.buildToolRegistry(), protocol.ChatRequest{
 		Model: "integration-model", Messages: []protocol.Message{{Role: "user", Content: "创建并提交文件"}},
-	}, 8, complete, nil)
+	}, complete, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

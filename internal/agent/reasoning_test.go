@@ -10,8 +10,8 @@ func TestReasoningProfilesIncludeUltraDefault(t *testing.T) {
 	if profile.ID != ReasoningUltra {
 		t.Fatalf("default reasoning = %s, want %s", profile.ID, ReasoningUltra)
 	}
-	if profile.Budget.MaxToolCalls != 32 {
-		t.Fatalf("ultra max tool calls = %d, want 32", profile.Budget.MaxToolCalls)
+	if profile.Budget.ContextPolicy != "full-relevant" || !profile.Budget.Planner {
+		t.Fatalf("unexpected default reasoning budget: %#v", profile.Budget)
 	}
 }
 
