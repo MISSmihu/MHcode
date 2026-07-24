@@ -516,8 +516,16 @@ func (s *Service) runTeamRole(
 	request := teamRoleRequest(baseRequest, role, attempt, route, artifacts)
 	roleSink := teamRoleToolSink(sink)
 	var outcome toolLoopOutcome
+	roleUsage := cache.UsageMetrics{}
+	observeUsage := func(usage *protocol.TokenUsage) {
+		metrics := s.recordLiveUsage(usage, route, sink)
+		roleUsage = addUsageMetrics(roleUsage, metrics)
+	}
 	if role == TeamRoleSynthesizer {
 		completion, completionErr := collectProviderStream(ctx, provider, request, sink)
+		if completion.Usage != nil {
+			observeUsage(completion.Usage)
+		}
 		if completionErr != nil {
 			err = completionErr
 		} else {
@@ -528,14 +536,10 @@ func (s *Service) runTeamRole(
 		if role == TeamRoleImplementer {
 			registry = s.buildWorkerToolRegistry()
 		}
-		outcome, err = s.runStreamingToolLoop(ctx, provider, registry, request, roleSink)
+		outcome, err = s.runStreamingToolLoopWithState(ctx, provider, registry, request, roleSink, deploymentSSHPreflight{}, observeUsage)
 	}
 
-	artifact := teamArtifact{role: role, attempt: attempt, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts}
-	if outcome.Usage != nil {
-		artifact.usage = usageMetricsFor(route.Provider, outcome.Usage)
-		s.recordUsageMetrics(artifact.usage, route)
-	}
+	artifact := teamArtifact{role: role, attempt: attempt, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts, usage: roleUsage}
 	artifact.verdict = teamVerdict(role, artifact.content)
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, context.Canceled) {

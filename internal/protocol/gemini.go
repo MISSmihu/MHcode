@@ -339,6 +339,17 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 	toolIndex := 0
 	continuationParts := make([]geminiPart, 0, 8)
 	hasToolCall := false
+	emitTerminal := func(finishReason string) {
+		if hasToolCall {
+			if continuation := geminiContinuation(continuationParts); continuation != nil {
+				events <- StreamEvent{Type: "continuation", Continuation: continuation}
+			}
+		}
+		if finishReason != "" {
+			events <- StreamEvent{Type: "finish", FinishReason: finishReason}
+		}
+		events <- StreamEvent{Type: "done"}
+	}
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -352,15 +363,23 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" {
 			continue
+		}
+		if payload == "[DONE]" {
+			emitTerminal("")
+			return
 		}
 		var chunk geminiStreamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			events <- StreamEvent{Type: "error", Error: "无法解析 Gemini 流式响应: " + err.Error()}
 			return
 		}
+		finishReason := ""
 		for _, candidate := range chunk.Candidates {
+			if finishReason == "" {
+				finishReason = strings.TrimSpace(candidate.FinishReason)
+			}
 			for _, part := range candidate.Content.Parts {
 				continuationParts = append(continuationParts, part)
 				if part.Text != "" {
@@ -392,17 +411,16 @@ func parseGeminiStream(ctx context.Context, body io.Reader, events chan<- Stream
 		if chunk.UsageMetadata != nil {
 			events <- StreamEvent{Type: "usage", Usage: chunk.UsageMetadata.toTokenUsage()}
 		}
+		if finishReason != "" {
+			emitTerminal(finishReason)
+			return
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		events <- StreamEvent{Type: "error", Error: "读取 Gemini 流式响应失败: " + err.Error()}
 		return
 	}
-	if hasToolCall {
-		if continuation := geminiContinuation(continuationParts); continuation != nil {
-			events <- StreamEvent{Type: "continuation", Continuation: continuation}
-		}
-	}
-	events <- StreamEvent{Type: "done"}
+	emitTerminal("")
 }
 
 func geminiAPIError(resp *http.Response) error {

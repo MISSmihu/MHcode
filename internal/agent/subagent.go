@@ -94,7 +94,7 @@ type delegateTaskSpec struct {
 type delegatedTaskResult struct {
 	part      tools.ResultPart
 	artifacts []tools.ResultPart
-	usage     *protocol.TokenUsage
+	usage     []protocol.TokenUsage
 	route     chatRoute
 }
 
@@ -166,10 +166,7 @@ func (c *subagentControl) stateFlags() (finished, collected bool) {
 func cloneDelegatedTaskResult(result delegatedTaskResult) delegatedTaskResult {
 	result.part = cloneSubagentPart(result.part)
 	result.artifacts = append([]tools.ResultPart(nil), result.artifacts...)
-	if result.usage != nil {
-		usage := *result.usage
-		result.usage = &usage
-	}
+	result.usage = append([]protocol.TokenUsage(nil), result.usage...)
 	return result
 }
 
@@ -526,10 +523,13 @@ func (s *Service) finishSubagentTurn(cancelWorkers bool) []tools.ResultPart {
 }
 
 func (s *Service) recordDelegatedTaskUsage(result delegatedTaskResult) {
-	if result.usage == nil || result.route.Provider.ID == "" {
+	if len(result.usage) == 0 || result.route.Provider.ID == "" {
 		return
 	}
-	s.recordUsageMetrics(usageMetricsFor(result.route.Provider, result.usage), result.route)
+	for index := range result.usage {
+		usage := result.usage[index]
+		s.recordUsageMetrics(usageMetricsFor(result.route.Provider, &usage), result.route)
+	}
 }
 
 func normalizeDelegatedTaskSpecs(input []delegateTaskSpec) ([]delegateTaskSpec, error) {
@@ -612,10 +612,14 @@ func (s *Service) runDelegatedTask(
 		part.Additions = additions
 		part.Deletions = deletions
 		emit(part)
+		usageSamples := append([]protocol.TokenUsage(nil), outcome.UsageSamples...)
+		if len(usageSamples) == 0 && outcome.Usage != nil {
+			usageSamples = append(usageSamples, *outcome.Usage)
+		}
 		return delegatedTaskResult{
 			part:      part,
 			artifacts: delegatedTaskArtifacts(outcome.Parts),
-			usage:     outcome.Usage,
+			usage:     usageSamples,
 			route:     route,
 		}
 	}

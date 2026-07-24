@@ -178,7 +178,13 @@ func (s *Service) PlanMode() bool {
 }
 
 // runPlanPhase 执行只读规划阶段，返回计划文本与该阶段产出的片段。
-func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, baseRequest protocol.ChatRequest) (string, toolLoopOutcome, error) {
+func (s *Service) runPlanPhase(
+	ctx context.Context,
+	caller protocol.ToolCaller,
+	baseRequest protocol.ChatRequest,
+	route chatRoute,
+	sink ChatEventSink,
+) (string, toolLoopOutcome, error) {
 	reg := s.buildReadOnlyRegistry()
 
 	planReq := baseRequest
@@ -191,7 +197,14 @@ func (s *Service) runPlanPhase(ctx context.Context, caller protocol.ToolCaller, 
 	planReq.Messages = append(append([]protocol.Message{}, baseRequest.Messages...),
 		protocol.Message{Role: "user", Content: planInstruction})
 
-	outcome, err := s.runToolLoop(ctx, caller, reg, planReq)
+	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completion, err := caller.Complete(ctx, request)
+		if completion.Usage != nil {
+			s.recordLiveUsage(completion.Usage, route, sink)
+		}
+		return completion, err
+	}
+	outcome, err := s.runToolLoopWithCompletion(ctx, reg, planReq, complete, nil)
 	if err != nil {
 		return "", toolLoopOutcome{}, err
 	}

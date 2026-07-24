@@ -78,7 +78,7 @@ func (s *Service) runToolLoopTurn(
 		if preflight.Attempted {
 			planRequest.Messages = appendDeploymentSSHPreflightSummary(baseRequest.Messages, preflight)
 		}
-		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest)
+		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest, route, sink)
 		if planErr != nil {
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
 			s.markChatProviderStatus(route.Provider.ID, "error", planErr.Error())
@@ -139,7 +139,11 @@ func (s *Service) runToolLoopTurn(
 		BaseRequest:  execRequest,
 		PrimaryRoute: route,
 	})
-	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, sink, preflight)
+	usageObserver := func(usage *protocol.TokenUsage) {
+		usageRoute := resolvedProviderRoute(streamProvider, route)
+		s.recordLiveUsage(usage, usageRoute, sink)
+	}
+	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, sink, preflight, usageObserver)
 	resolvedRoute := resolvedProviderRoute(streamProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
 		route = resolvedRoute
@@ -148,10 +152,6 @@ func (s *Service) runToolLoopTurn(
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
-		if outcome.Usage != nil {
-			s.metrics = usageMetricsFor(route.Provider, outcome.Usage)
-			s.recordUsageMetrics(s.metrics, route)
-		}
 		cancelled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 		partialCompleted := !cancelled && hasUsablePartialToolResult(outcome.Parts)
 		if planStarted {
@@ -216,10 +216,6 @@ func (s *Service) runToolLoopTurn(
 		return result, err
 	}
 
-	if outcome.Usage != nil {
-		s.metrics = usageMetricsFor(route.Provider, outcome.Usage)
-		s.recordUsageMetrics(s.metrics, route)
-	}
 	if planStarted {
 		if planStateErr := s.finishPlanState("completed"); planStateErr != nil {
 			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
@@ -675,11 +671,12 @@ func toolDefinitions(reg *tools.Registry) []protocol.ToolDefinition {
 
 // toolLoopOutcome 汇总一次工具循环的最终结果。
 type toolLoopOutcome struct {
-	Content   string
-	Reasoning string
-	Parts     []tools.ResultPart
-	Changes   []tools.FileChange
-	Usage     *protocol.TokenUsage
+	Content      string
+	Reasoning    string
+	Parts        []tools.ResultPart
+	Changes      []tools.FileChange
+	Usage        *protocol.TokenUsage
+	UsageSamples []protocol.TokenUsage
 }
 
 // runToolLoop 执行「补全 → 若有 tool_calls 则执行并回喂 → 再补全」的循环，
@@ -701,8 +698,10 @@ func (s *Service) runStreamingToolLoop(
 	req protocol.ChatRequest,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, sink, deploymentSSHPreflight{})
+	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, sink, deploymentSSHPreflight{}, nil)
 }
+
+type usageObserver func(*protocol.TokenUsage)
 
 func (s *Service) runStreamingToolLoopWithState(
 	ctx context.Context,
@@ -711,9 +710,15 @@ func (s *Service) runStreamingToolLoopWithState(
 	req protocol.ChatRequest,
 	sink ChatEventSink,
 	preflight deploymentSSHPreflight,
+	observeUsage usageObserver,
 ) (toolLoopOutcome, error) {
 	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
-		return collectProviderStream(ctx, provider, request, sink)
+		completion, err := collectProviderStream(ctx, provider, request, sink)
+		if completion.Usage != nil && observeUsage != nil {
+			usage := *completion.Usage
+			observeUsage(&usage)
+		}
+		return completion, err
 	}
 	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink, preflight)
 }
@@ -1277,7 +1282,9 @@ func (s *Service) runToolLoopWithCompletionState(
 		}
 		outcome.Parts = mergeOutcomeParts(outcome.Parts, providerNoticeParts(completion.Notices))
 		if completion.Usage != nil {
-			outcome.Usage = completion.Usage
+			usage := *completion.Usage
+			outcome.Usage = &usage
+			outcome.UsageSamples = append(outcome.UsageSamples, usage)
 		}
 		if strings.TrimSpace(completion.Reasoning) != "" {
 			outcome.Reasoning = completion.Reasoning

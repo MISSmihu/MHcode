@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -137,6 +140,162 @@ func TestCollectProviderStreamStopsWhileProviderOpenIsBlocked(t *testing.T) {
 		t.Fatal("blocked provider open prevented prompt cancellation")
 	}
 	close(provider.release)
+}
+
+func TestCollectProviderStreamStopsAfterSemanticFinishWithoutEOF(t *testing.T) {
+	events := make(chan protocol.StreamEvent, 2)
+	events <- protocol.StreamEvent{Type: "delta", Delta: "finished answer"}
+	events <- protocol.StreamEvent{Type: "finish", FinishReason: "stop"}
+	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
+
+	started := time.Now()
+	result, err := collectProviderStreamWithFinishGrace(
+		context.Background(), provider, protocol.ChatRequest{}, nil, 25*time.Millisecond,
+	)
+	close(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "finished answer" {
+		t.Fatalf("content = %q", result.Content)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("semantic finish waited too long: %s", elapsed)
+	}
+}
+
+func TestCollectProviderStreamKeepsTrailingUsageUntilDone(t *testing.T) {
+	events := make(chan protocol.StreamEvent, 6)
+	events <- protocol.StreamEvent{Type: "delta", Delta: "done"}
+	events <- protocol.StreamEvent{Type: "finish", FinishReason: "stop"}
+	events <- protocol.StreamEvent{Type: "usage", Usage: &protocol.TokenUsage{
+		PromptTokens: 100, PromptCacheHitTokens: 80, PromptCacheMissTokens: 20,
+	}}
+	events <- protocol.StreamEvent{Type: "usage", Usage: &protocol.TokenUsage{CompletionTokens: 12}}
+	events <- protocol.StreamEvent{Type: "done"}
+	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
+
+	result, err := collectProviderStreamWithFinishGrace(
+		context.Background(), provider, protocol.ChatRequest{}, nil, time.Second,
+	)
+	close(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage == nil || result.Usage.PromptTokens != 100 || result.Usage.CompletionTokens != 12 || result.Usage.TotalTokens != 112 {
+		t.Fatalf("merged usage = %#v", result.Usage)
+	}
+}
+
+func TestCollectProviderStreamCancelsHTTPStreamAfterFinishWithoutDone(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"finished answer\"},\"finish_reason\":\"stop\"}]}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+
+	provider := protocol.OpenAICompatibleProvider{
+		BaseURL: server.URL, APIKey: "sk-test", HTTPClient: server.Client(),
+	}
+	started := time.Now()
+	result, err := collectProviderStreamWithFinishGrace(context.Background(), provider, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "ping"}},
+	}, nil, 30*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "finished answer" {
+		t.Fatalf("content = %q", result.Content)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("semantic finish waited too long: %s", elapsed)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("finished HTTP request was not canceled")
+	}
+}
+
+func TestCollectProviderStreamKeepsHTTPUsageBeforeCancelingStalledStream(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"total_tokens\":100}}\n\n")
+		flusher.Flush()
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"completion_tokens\":12,\"total_tokens\":12}}\n\n")
+		flusher.Flush()
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+
+	provider := protocol.OpenAICompatibleProvider{
+		BaseURL: server.URL, APIKey: "sk-test", HTTPClient: server.Client(),
+	}
+	result, err := collectProviderStreamWithFinishGrace(context.Background(), provider, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "ping"}},
+	}, nil, 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage == nil || result.Usage.PromptTokens != 100 || result.Usage.CompletionTokens != 12 || result.Usage.TotalTokens != 112 {
+		t.Fatalf("merged HTTP usage = %#v", result.Usage)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stalled usage stream was not canceled")
+	}
+}
+
+func TestCollectProviderStreamReturnsImmediatelyOnHTTPDone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	provider := protocol.OpenAICompatibleProvider{
+		BaseURL: server.URL, APIKey: "sk-test", HTTPClient: server.Client(),
+	}
+	started := time.Now()
+	result, err := collectProviderStreamWithFinishGrace(context.Background(), provider, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "ping"}},
+	}, nil, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "done" {
+		t.Fatalf("content = %q", result.Content)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("[DONE] waited for finish grace period: %s", elapsed)
+	}
+}
+
+func TestCollectProviderStreamPreservesTypedProviderErrorAfterFinish(t *testing.T) {
+	events := make(chan protocol.StreamEvent, 2)
+	events <- protocol.StreamEvent{Type: "finish", FinishReason: "stop"}
+	events <- protocol.StreamEvent{
+		Type: "error", Error: "request blocked",
+		ProviderError: &protocol.ProviderErrorInfo{Code: "cyber_policy", Message: "request blocked", Retryable: false},
+	}
+	close(events)
+	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
+	_, err := collectProviderStreamWithFinishGrace(context.Background(), provider, protocol.ChatRequest{}, nil, time.Second)
+	info, ok := protocol.ProviderErrorDetails(err)
+	if !ok || info.Code != "cyber_policy" || info.Retryable {
+		t.Fatalf("error = %v, info = %#v, ok = %v", err, info, ok)
+	}
 }
 
 func TestCollectProviderStreamEmitsAndCollectsProviderNotice(t *testing.T) {

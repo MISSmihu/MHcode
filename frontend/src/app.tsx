@@ -1053,6 +1053,9 @@ function App() {
       case "reasoning":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, reasoning: (message.reasoning ?? "") + (event.delta ?? ""), status: "正在推理" }));
         break;
+      case "usage":
+      case "usage_state":
+        break;
       case "provider_notice":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
@@ -1229,6 +1232,20 @@ function App() {
     }
   };
 
+  const applyLiveUsageState = (event: ChatTaskEvent) => {
+    const usageState = event.usageState;
+    if (!usageState) return;
+    setState((current) => current ? {
+      ...current,
+      usageMetrics: usageState.usageMetrics,
+      cacheHitRate: usageState.cacheHitRate,
+      cacheHealth: usageState.cacheHealth,
+      deepSeekSession: usageState.deepSeekSession,
+      cacheDiagnostics: usageState.cacheDiagnostics,
+      usageLedger: usageState.usageLedger,
+    } : current);
+  };
+
   const handleChatTaskEvent = (event: ChatTaskEvent) => {
     const eventProjectID = event.projectId?.trim() || activeProjectID();
     const eventSessionID = event.sessionId?.trim() || activeSessionID();
@@ -1295,6 +1312,14 @@ function App() {
           statusKind: undefined,
           compressionStatus: undefined,
         }));
+        break;
+      case "usage":
+        break;
+      case "usage_state":
+        applyLiveUsageState(event);
+        if (event.usageState) {
+          updateStreamingMessage((message) => ({ ...message, usage: event.usageState!.usageMetrics }));
+        }
         break;
       case "provider_notice":
         updateStreamingMessage((message) => ({

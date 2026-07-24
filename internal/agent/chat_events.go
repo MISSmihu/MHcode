@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -23,6 +24,7 @@ type ChatStreamEvent struct {
 	ToolInput   string                   `json:"toolInput,omitempty"`
 	Status      string                   `json:"status,omitempty"`
 	Usage       *protocol.TokenUsage     `json:"usage,omitempty"`
+	UsageState  *LiveUsageState          `json:"usageState,omitempty"`
 	Progress    *tools.ResultPart        `json:"progress,omitempty"`
 	Parts       []tools.ResultPart       `json:"parts,omitempty"`
 	Compression *ContextCompressionEvent `json:"compression,omitempty"`
@@ -45,6 +47,8 @@ type providerStreamOpenResult struct {
 	events <-chan protocol.StreamEvent
 	err    error
 }
+
+const providerFinishGracePeriod = 1500 * time.Millisecond
 
 func emitChatEvent(sink ChatEventSink, event ChatStreamEvent) {
 	if sink != nil {
@@ -70,9 +74,24 @@ func collectProviderStream(
 	request protocol.ChatRequest,
 	sink ChatEventSink,
 ) (protocol.CompletionResult, error) {
+	return collectProviderStreamWithFinishGrace(ctx, provider, request, sink, providerFinishGracePeriod)
+}
+
+func collectProviderStreamWithFinishGrace(
+	ctx context.Context,
+	provider protocol.Provider,
+	request protocol.ChatRequest,
+	sink ChatEventSink,
+	finishGrace time.Duration,
+) (protocol.CompletionResult, error) {
+	if finishGrace <= 0 {
+		finishGrace = providerFinishGracePeriod
+	}
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
 	opened := make(chan providerStreamOpenResult, 1)
 	go func() {
-		events, err := provider.Stream(ctx, request)
+		events, err := provider.Stream(streamCtx, request)
 		opened <- providerStreamOpenResult{events: events, err: err}
 	}()
 
@@ -100,13 +119,33 @@ func collectProviderStream(
 		return result
 	}
 	noticesSeen := make(map[string]bool)
+	var finishTimer *time.Timer
+	var finishDeadline <-chan time.Time
+	finishSeen := false
+	stopFinishTimer := func() {
+		if finishTimer != nil && !finishTimer.Stop() {
+			select {
+			case <-finishTimer.C:
+			default:
+			}
+		}
+	}
+	defer stopFinishTimer()
 	for {
 		var event protocol.StreamEvent
 		var ok bool
 		select {
 		case <-ctx.Done():
+			cancelStream()
 			go drainProviderStream(events)
 			return partialResult(), ctx.Err()
+		case <-finishDeadline:
+			// Some OpenAI-compatible relays send finish_reason but never send
+			// [DONE] or close the response body. Keep a short window for the
+			// trailing usage chunk, then treat the semantic finish as terminal.
+			cancelStream()
+			go drainProviderStream(events)
+			return partialResult(), nil
 		case event, ok = <-events:
 			if !ok {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -145,8 +184,19 @@ func collectProviderStream(
 				Parts:   []tools.ResultPart{part},
 			})
 		case "usage":
-			result.Usage = event.Usage
-			emitChatEvent(sink, ChatStreamEvent{Type: "usage", Usage: event.Usage})
+			result.Usage = mergeTokenUsage(result.Usage, event.Usage)
+			if result.Usage != nil {
+				usage := *result.Usage
+				emitChatEvent(sink, ChatStreamEvent{Type: "usage", Usage: &usage})
+			}
+		case "finish":
+			if !finishSeen {
+				finishSeen = true
+				finishTimer = time.NewTimer(finishGrace)
+				finishDeadline = finishTimer.C
+			}
+		case "done":
+			return partialResult(), nil
 		case "error":
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return partialResult(), ctxErr
@@ -154,9 +204,42 @@ func collectProviderStream(
 			if event.ProviderError != nil {
 				return partialResult(), protocol.NewProviderError(*event.ProviderError)
 			}
+			if finishSeen {
+				return partialResult(), nil
+			}
 			return partialResult(), errors.New(event.Error)
 		}
 	}
+}
+
+func mergeTokenUsage(current, next *protocol.TokenUsage) *protocol.TokenUsage {
+	if next == nil {
+		return current
+	}
+	if current == nil {
+		usage := *next
+		if combined := usage.PromptTokens + usage.CompletionTokens; usage.TotalTokens < combined {
+			usage.TotalTokens = combined
+		}
+		return &usage
+	}
+	merged := *current
+	merged.PromptTokens = maxInt64(merged.PromptTokens, next.PromptTokens)
+	merged.CompletionTokens = maxInt64(merged.CompletionTokens, next.CompletionTokens)
+	merged.TotalTokens = maxInt64(merged.TotalTokens, next.TotalTokens)
+	merged.PromptCacheHitTokens = maxInt64(merged.PromptCacheHitTokens, next.PromptCacheHitTokens)
+	merged.PromptCacheMissTokens = maxInt64(merged.PromptCacheMissTokens, next.PromptCacheMissTokens)
+	if combined := merged.PromptTokens + merged.CompletionTokens; merged.TotalTokens < combined {
+		merged.TotalTokens = combined
+	}
+	return &merged
+}
+
+func maxInt64(left, right int64) int64 {
+	if right > left {
+		return right
+	}
+	return left
 }
 
 func providerNoticeParts(notices []protocol.ProviderNotice) []tools.ResultPart {

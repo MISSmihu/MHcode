@@ -72,6 +72,7 @@ type ChatTaskEvent struct {
 	ToolInput   string                         `json:"toolInput,omitempty"`
 	Status      string                         `json:"status,omitempty"`
 	Usage       *protocol.TokenUsage           `json:"usage,omitempty"`
+	UsageState  *agent.LiveUsageState          `json:"usageState,omitempty"`
 	Progress    *tools.ResultPart              `json:"progress,omitempty"`
 	Parts       []tools.ResultPart             `json:"parts,omitempty"`
 	Compression *agent.ContextCompressionEvent `json:"compression,omitempty"`
@@ -362,6 +363,7 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 			ToolInput:   progress.ToolInput,
 			Status:      progress.Status,
 			Usage:       progress.Usage,
+			UsageState:  progress.UsageState,
 			Progress:    progress.Progress,
 			Parts:       progress.Parts,
 			Compression: progress.Compression,

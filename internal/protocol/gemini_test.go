@@ -125,6 +125,25 @@ func TestGeminiStreamParsesDeltaAndUsage(t *testing.T) {
 	}
 }
 
+func TestGeminiStreamTreatsFinishReasonAsTerminal(t *testing.T) {
+	events := make(chan StreamEvent, 8)
+	parseGeminiStream(context.Background(), strings.NewReader(
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":9,\"candidatesTokenCount\":1,\"totalTokenCount\":10}}\n\n",
+	), events)
+	close(events)
+
+	var got []StreamEvent
+	for event := range events {
+		got = append(got, event)
+	}
+	if len(got) != 4 || got[0].Type != "delta" || got[1].Type != "usage" || got[2].Type != "finish" || got[3].Type != "done" {
+		t.Fatalf("events = %#v, want delta/usage/finish/done", got)
+	}
+	if got[2].FinishReason != "STOP" {
+		t.Fatalf("finish reason = %q", got[2].FinishReason)
+	}
+}
+
 func TestGeminiContentsJoinStablePromptAndCompressedMemory(t *testing.T) {
 	system, contents := geminiContentsFromProtocol([]Message{
 		{Role: "system", Content: "stable prompt"},

@@ -389,6 +389,41 @@ func TestToolLoopReusesSimilarWebSearchAndMergesSources(t *testing.T) {
 	}
 }
 
+func TestToolLoopKeepsUsageForEveryModelRequest(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	calls := 0
+	registry := tools.NewRegistry(longTaskStepTool{calls: &calls})
+	completions := 0
+	complete := func(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completions++
+		if completions == 1 {
+			return protocol.CompletionResult{
+				Usage: &protocol.TokenUsage{PromptTokens: 100, CompletionTokens: 5},
+				ToolCalls: []protocol.ToolCall{{
+					ID: "step-1", Type: "function", Function: protocol.ToolCallFunction{Name: "long_task_step", Arguments: json.RawMessage(`{}`)},
+				}},
+			}, nil
+		}
+		return protocol.CompletionResult{
+			Content: "completed",
+			Usage:   &protocol.TokenUsage{PromptTokens: 140, CompletionTokens: 8},
+		}, nil
+	}
+
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "run"}},
+	}, complete, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcome.UsageSamples) != 2 {
+		t.Fatalf("usage samples = %#v", outcome.UsageSamples)
+	}
+	if outcome.UsageSamples[0].PromptTokens != 100 || outcome.UsageSamples[1].PromptTokens != 140 {
+		t.Fatalf("usage samples = %#v", outcome.UsageSamples)
+	}
+}
+
 func TestToolLoopDoesNotRestartUnavailableBrowser(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
 	svc.runtimeSettings.ApprovalPolicy = "never"

@@ -68,3 +68,23 @@ func TestUsageLedgerRecordsCostAndRestoresCurrentSession(t *testing.T) {
 		t.Fatalf("restored session cache = %#v", reloadedState.DeepSeekSession)
 	}
 }
+
+func TestRecordLiveUsageEmitsUpdatedCacheState(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	route := chatRoute{Provider: ModelProviderSetting{ID: "deepseek", Name: "DeepSeek", Protocol: "deepseek"}, ModelID: "deepseek-chat"}
+	var emitted ChatStreamEvent
+	service.recordLiveUsage(&protocol.TokenUsage{
+		PromptTokens: 200, CompletionTokens: 20, PromptCacheHitTokens: 192, PromptCacheMissTokens: 8,
+	}, route, func(event ChatStreamEvent) {
+		emitted = event
+	})
+	if emitted.Type != "usage_state" || emitted.UsageState == nil {
+		t.Fatalf("event = %#v", emitted)
+	}
+	if emitted.UsageState.UsageMetrics.InputTokens != 200 || emitted.UsageState.CacheHitRate != 0.96 {
+		t.Fatalf("usage state = %#v", emitted.UsageState)
+	}
+	if emitted.UsageState.DeepSeekSession.SessionCacheHitTokens != 192 || emitted.UsageState.DeepSeekSession.SessionCacheMissTokens != 8 {
+		t.Fatalf("session state = %#v", emitted.UsageState.DeepSeekSession)
+	}
+}

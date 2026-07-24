@@ -45,6 +45,19 @@ describe("chat UI regressions", () => {
     expect(types).toContain('kind: "provider_notice"');
   });
 
+  test("applies live usage and cache state while a task is running", async () => {
+    const [app, types] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+    ]);
+    expect(types).toContain('"usage_state"');
+    expect(types).toContain("usageState?: LiveUsageState");
+    expect(app).toContain('case "usage_state"');
+    expect(app).toContain("applyLiveUsageState(event)");
+    expect(app).toContain("usageMetrics: usageState.usageMetrics");
+    expect(app).toContain("usageLedger: usageState.usageLedger");
+  });
+
   test("merges and renders dynamic subagents independently from the fixed AI team", async () => {
     const [app, messageContent, panel, host, services, css, types] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),

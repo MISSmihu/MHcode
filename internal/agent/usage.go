@@ -34,6 +34,18 @@ type UsageLedgerState struct {
 	LastError            string  `json:"lastError,omitempty"`
 }
 
+// LiveUsageState is the small, task-scoped state patch sent while a detached
+// session runtime is active. Sending only usage fields avoids replacing the
+// application's active project/session state with a background runtime.
+type LiveUsageState struct {
+	UsageMetrics     cache.UsageMetrics   `json:"usageMetrics"`
+	CacheHitRate     float64              `json:"cacheHitRate"`
+	CacheHealth      cache.Health         `json:"cacheHealth"`
+	DeepSeekSession  DeepSeekSessionState `json:"deepSeekSession"`
+	CacheDiagnostics []string             `json:"cacheDiagnostics"`
+	UsageLedger      UsageLedgerState     `json:"usageLedger"`
+}
+
 func usageMetricsFor(provider ModelProviderSetting, usage *protocol.TokenUsage) cache.UsageMetrics {
 	if usage == nil {
 		return cache.UsageMetrics{}
@@ -66,6 +78,27 @@ func estimateUsageCost(provider ModelProviderSetting, metrics cache.UsageMetrics
 		float64(metrics.PromptCacheHitTokens)*cacheHitPrice +
 		float64(metrics.PromptCacheMissTokens)*cacheMissPrice +
 		float64(metrics.OutputTokens)*provider.OutputPricePerMillion) / perMillion
+}
+
+func (s *Service) recordLiveUsage(usage *protocol.TokenUsage, route chatRoute, sink ChatEventSink) cache.UsageMetrics {
+	metrics := usageMetricsFor(route.Provider, usage)
+	s.metrics = metrics
+	s.recordUsageMetrics(metrics, route)
+	snapshot := s.liveUsageState()
+	emitChatEvent(sink, ChatStreamEvent{Type: "usage_state", Usage: usage, UsageState: &snapshot})
+	return metrics
+}
+
+func (s *Service) liveUsageState() LiveUsageState {
+	history := append([]cache.UsageMetrics(nil), s.metricsHistory...)
+	return LiveUsageState{
+		UsageMetrics:     s.metrics,
+		CacheHitRate:     s.metrics.CacheHitRate(),
+		CacheHealth:      cache.AnalyzeHistory(history),
+		DeepSeekSession:  s.deepSeekSessionState(),
+		CacheDiagnostics: cache.DiagnosticsHistory(history),
+		UsageLedger:      s.usageLedger,
+	}
 }
 
 func (s *Service) restoreUsageMetrics() {

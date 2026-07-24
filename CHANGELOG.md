@@ -2,6 +2,26 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.7 - 2026-07-25
+
+### Reliable stream finalization
+
+- Treat a provider `finish_reason` as a semantic completion fallback when a broken OpenAI-compatible relay omits `[DONE]` and leaves the HTTP connection open.
+- Keep the normal `[DONE]` and EOF paths immediate, preserve a short grace period for trailing usage, and cancel the stalled transport afterward.
+- Preserve typed provider errors after semantic finish while tolerating transport errors caused by closing an already completed stream.
+- Honor Gemini `finishReason` and merge fragmented usage fields without losing prompt, completion, or cache token counts.
+
+### Live request usage
+
+- Refresh token, cache-health, DeepSeek-session, diagnostics, and usage-ledger state after every model request in normal Agent, Plan, tool-loop, and AI-team execution.
+- Count every dynamic-subagent model request instead of retaining only its final usage sample.
+- Patch only usage-related frontend state so background task events cannot replace the visible conversation state.
+
+### Verification
+
+- Add real HTTP/SSE regressions for a finished stream that never sends `[DONE]`, trailing fragmented usage, immediate normal completion, and typed post-finish errors.
+- All Go package tests, `go vet`, frontend type checking, 73 frontend tests, and the production Vite build pass.
+
 ## v0.3.6 - 2026-07-24
 
 ### True parent-child parallelism

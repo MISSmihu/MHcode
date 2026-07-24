@@ -1013,6 +1013,10 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	}
 
 	completion, err := collectProviderStream(ctx, chatProvider, baseRequest, sink)
+	resolvedRoute := resolvedProviderRoute(chatProvider, route)
+	if completion.Usage != nil {
+		s.recordLiveUsage(completion.Usage, resolvedRoute, sink)
+	}
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
@@ -1031,14 +1035,9 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		s.retainInterruptedTurn(&result, terminalStatus, requestMessages, baseMessageCount, prefixDiagnostic)
 		return result, err
 	}
-	resolvedRoute := resolvedProviderRoute(chatProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
 		route = resolvedRoute
 		s.adoptProviderRoute(route)
-	}
-	if completion.Usage != nil {
-		s.metrics = usageMetricsFor(route.Provider, completion.Usage)
-		s.recordUsageMetrics(s.metrics, route)
 	}
 
 	answer := sanitizeModelContent(completion.Content)
