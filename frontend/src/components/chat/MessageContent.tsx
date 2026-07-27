@@ -608,6 +608,9 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       // 任务清单固定显示在输入框上方，避免把执行状态混进助手正文。
       continue;
     }
+    if (part.kind === "tool_call" && part.name === "update_plan") {
+      continue;
+    }
     if (part.kind === "team_role") {
       if (!teamAdded) {
         blocks.push({ kind: "team", parts: teamParts });
@@ -1070,7 +1073,7 @@ function teamCurrentStatus(part: TeamPart | undefined, completed: number, total:
 }
 
 function aggregateActivity(category: ActivityCategory): boolean {
-  return category === "command" || category === "edit" || category === "read" || category === "image" || category === "search";
+  return category === "command" || category === "edit" || category === "read" || category === "image" || category === "search" || category === "repository";
 }
 
 function activityStatus(item: ActivityItem): "running" | "ok" | "error" {
@@ -1102,7 +1105,9 @@ function activityLabel(item: ActivityItem): string {
       }
 	  return running ? (input ? `正在搜索网络“${compactLabel(input)}”` : "正在搜索网络") : input ? `搜索了网络“${compactLabel(input)}”` : "搜索了网络";
     case "repository":
-	  return running ? (input ? `正在读取仓库 ${compactLabel(input)}` : "正在读取代码仓库") : input ? `读取了仓库 ${compactLabel(input)}` : "读取了代码仓库";
+	  return running
+		? (tools.length > 1 ? `正在读取 ${tools.length} 个仓库` : input ? `正在读取仓库 ${compactLabel(input)}` : "正在读取代码仓库")
+		: tools.length > 1 ? `读取了 ${tools.length} 个仓库` : input ? `读取了仓库 ${compactLabel(input)}` : "读取了代码仓库";
     case "image": {
       const count = Math.max(1, files.filter(isImagePath).length);
       return `查看了 ${count} 张图像`;

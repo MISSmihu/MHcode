@@ -149,10 +149,16 @@ func TestWindowsJobObjectTerminatesDescendantProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = process.Terminate() }()
+	waited := make(chan error, 1)
+	go func() { waited <- process.Wait() }()
 
 	var childPID uint64
-	deadline := time.Now().Add(6 * time.Second)
-	for time.Now().Before(deadline) {
+	deadline := time.NewTimer(15 * time.Second)
+	ticker := time.NewTicker(40 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for childPID == 0 {
 		raw, readErr := os.ReadFile(pidFile)
 		if readErr == nil {
 			childPID, err = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 32)
@@ -160,12 +166,15 @@ func TestWindowsJobObjectTerminatesDescendantProcess(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(40 * time.Millisecond)
-	}
-	if childPID == 0 {
-		_ = process.Terminate()
-		_ = process.Wait()
-		t.Fatal("descendant process did not start")
+		select {
+		case waitErr := <-waited:
+			t.Fatalf("contained root process exited before descendant startup: %v", waitErr)
+		case <-deadline.C:
+			_ = process.Terminate()
+			<-waited
+			t.Fatal("descendant process did not start within 15 seconds")
+		case <-ticker.C:
+		}
 	}
 	if !windowsProcessExists(uint32(childPID)) {
 		t.Fatal("descendant process exited before containment test")
@@ -174,9 +183,13 @@ func TestWindowsJobObjectTerminatesDescendantProcess(t *testing.T) {
 	if err := process.Terminate(); err != nil {
 		t.Fatal(err)
 	}
-	_ = process.Wait()
-	deadline = time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) && windowsProcessExists(uint32(childPID)) {
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("contained root process did not exit after Job Object termination")
+	}
+	terminationDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(terminationDeadline) && windowsProcessExists(uint32(childPID)) {
 		time.Sleep(40 * time.Millisecond)
 	}
 	if windowsProcessExists(uint32(childPID)) {

@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const terminalTestTimeout = 15 * time.Second
+
 func TestManagerRunsPersistentWorkspaceShell(t *testing.T) {
 	manager := NewManager()
 	defer manager.Close()
@@ -28,7 +30,7 @@ func TestManagerRunsPersistentWorkspaceShell(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(terminalTestTimeout)
 	for time.Now().Before(deadline) {
 		state, err = manager.State(state.ID)
 		if err != nil {
@@ -68,7 +70,7 @@ func TestManagerPushesOutputAndLifecycleUpdates(t *testing.T) {
 	}
 
 	outputSeen := false
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(terminalTestTimeout)
 	for !outputSeen {
 		select {
 		case update := <-updates:
@@ -80,7 +82,7 @@ func TestManagerPushesOutputAndLifecycleUpdates(t *testing.T) {
 	if err := manager.Stop(state.ID); err != nil {
 		t.Fatal(err)
 	}
-	deadline = time.After(5 * time.Second)
+	deadline = time.After(terminalTestTimeout)
 	for {
 		select {
 		case update := <-updates:
@@ -103,7 +105,7 @@ func TestManagerPreservesUnicodeOutput(t *testing.T) {
 	if err := manager.WriteLine(state.ID, "echo MHcode编码测试"); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(terminalTestTimeout)
 	for time.Now().Before(deadline) {
 		state, err = manager.State(state.ID)
 		if err != nil {

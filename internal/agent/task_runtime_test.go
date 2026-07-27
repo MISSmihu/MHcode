@@ -3,6 +3,7 @@ package agent
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/MISSmihu/MHcode/internal/eventlog"
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -46,6 +47,26 @@ func TestTaskRuntimePersistsLiveToolAndTerminalState(t *testing.T) {
 	}
 	if record.Parts[0].Status != "error" || record.Parts[0].Output == "" {
 		t.Fatalf("running tool was not settled: %#v", record.Parts[0])
+	}
+}
+
+func TestTaskRuntimeHeartbeatUpdatesStatusWithoutTimelineNoise(t *testing.T) {
+	service := newTaskRuntimeTestService(t, t.TempDir())
+	if err := service.StartTaskRuntime("task-heartbeat", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	service.taskRuntimeLastWrite = time.Time{}
+	if err := service.RecordTaskStreamEvent("task-heartbeat", ChatStreamEvent{
+		Type: "heartbeat", Message: "upstream still processing", Status: "waiting",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, ok, err := service.eventStore.ReadTaskRuntime()
+	if err != nil || !ok {
+		t.Fatalf("runtime ok=%v err=%v", ok, err)
+	}
+	if record.Status != "waiting" || record.Message != "upstream still processing" || len(record.Parts) != 0 {
+		t.Fatalf("heartbeat runtime = %#v", record)
 	}
 }
 

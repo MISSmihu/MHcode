@@ -132,7 +132,7 @@ func appendDeploymentSSHPreflightSummary(messages []protocol.Message, preflight 
 
 func (s *Service) deploymentSSHCredential(messages []protocol.Message) (string, bool) {
 	requestIndex, request := latestUserMessage(messages)
-	if requestIndex < 0 || !deploymentRequest(messages, requestIndex, request) {
+	if requestIndex < 0 || (!deploymentRequest(messages, requestIndex, request) && !remoteLookupTask(messages)) {
 		return "", false
 	}
 

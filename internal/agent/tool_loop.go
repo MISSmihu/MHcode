@@ -720,6 +720,7 @@ type toolLoopGuard struct {
 	browserExplicitlyRequested bool
 	externalBrowserSuppressed  bool
 	remoteLookup               bool
+	remoteTargetInspected      bool
 	completedSSHCalls          map[string]bool
 	lastPlanSignature          string
 	planUpdates                int
@@ -802,6 +803,15 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 			g.forceFinalResponse = true
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
 		}
+	}
+	if g.remoteLookup && !g.remoteTargetInspected && name != "ssh" && name != "update_plan" {
+		summary := "远程凭据查找必须先通过 SSH 检查目标主机的运行服务、启动参数、环境变量和实际配置；在获得目标机证据前，不执行本地命令、网络搜索、仓库读取或子代理任务。请改用 ssh action=run。"
+		return tools.Result{Summary: summary}, protocol.Message{
+			Role:       "tool",
+			ToolCallID: call.ID,
+			Name:       name,
+			Content:    summary,
+		}, true, true
 	}
 	if result, message, blocked := g.beforeEquivalentFailure(call); blocked {
 		return result, message, true, false
@@ -890,6 +900,13 @@ func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, messa
 	case "ssh":
 		if result.IsError {
 			return
+		}
+		var args sshToolArguments
+		if json.Unmarshal(normalizeToolArgs(call.Function.Arguments), &args) == nil {
+			switch strings.ToLower(strings.TrimSpace(args.Action)) {
+			case "run", "capture_secret":
+				g.remoteTargetInspected = true
+			}
 		}
 		if g.completedSSHCalls == nil {
 			g.completedSSHCalls = make(map[string]bool)
@@ -1654,7 +1671,10 @@ func remoteLookupTask(messages []protocol.Message) bool {
 	if request == "" || !strings.Contains(request, scopedCredentialScheme) {
 		return false
 	}
-	lower := strings.ToLower(request)
+	// The opaque URI contains the word "credential" by design; remove it before
+	// intent matching so an unrelated request with an available SSH reference
+	// does not become a remote secret lookup.
+	lower := strings.ToLower(scopedCredentialReferencePattern.ReplaceAllString(request, ""))
 	for _, marker := range []string{
 		"部署", "安装", "升级", "迁移", "修复", "排障", "调试", "配置服务", "发布",
 		"deploy", "install", "upgrade", "migrate", "repair", "debug", "troubleshoot", "configure", "release",
@@ -1664,7 +1684,7 @@ func remoteLookupTask(messages []protocol.Message) bool {
 		}
 	}
 	for _, marker := range []string{
-		"读取", "查找", "找出", "获取", "查看", "确认", "账号", "账户", "密码", "口令", "密钥", "令牌",
+		"读取", "查找", "找出", "找回", "恢复", "获取", "查看", "确认", "账号", "账户", "密码", "口令", "密钥", "秘钥", "令牌",
 		"read", "find", "locate", "get", "inspect", "account", "credential", "password", "secret", "token",
 	} {
 		if strings.Contains(lower, marker) {

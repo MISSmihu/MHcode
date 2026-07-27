@@ -4,6 +4,14 @@
 
 ## v0.3.9 - 2026-07-28
 
+### Agent execution timeline and remote operations
+
+- Keep provider wait heartbeats in the live task status instead of persisting a new conversation row every 8 seconds.
+- Preserve streamed Agent progress text before each tool batch so the conversation shows the real explanation, action, and result order while work is still running.
+- Hide raw `update_plan` calls from the conversation, keep the plan above the composer, and aggregate adjacent command and repository actions into compact expandable rows.
+- Recognize Chinese credential-recovery wording such as `找回` and `秘钥`, automatically verify the authorized password-based SSH target, and require target-host evidence before local commands, web search, repository reads, or delegation.
+- Stabilize Windows process-tree and persistent-terminal timing tests under loaded CI runners without weakening cancellation assertions.
+
 ### Windows artifact path identity
 
 - Canonicalize existing and deleted artifact paths through their nearest existing ancestor so Windows 8.3 short names and long names resolve to one durable identity.
@@ -12,8 +20,8 @@
 
 ### Verification
 
-- Add a Windows short/long path alias regression and rerun the artifact registry, rewind, download, render, and visual tool-loop tests.
-- All local Go package tests, `go vet`, frontend checks, and the production Wails build pass; GitHub Actions verification is required before publishing this patch release.
+- Add Windows short/long path alias, remote SSH routing, provider-heartbeat, live timeline, process-tree, and persistent-terminal regressions.
+- All local Go package tests, `go vet`, 83 frontend tests, and the production frontend build pass; GitHub Actions verification is required before publishing this patch release.
 
 ## v0.3.8 - 2026-07-28
 

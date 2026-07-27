@@ -194,6 +194,7 @@ import {
 } from "./lib/composer-history";
 import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
 import { hasMeaningfulTurnOutput } from "./lib/chat-results";
+import { appendLiveAssistantText, displayMessageParts, updateLiveTimelineParts } from "./lib/timeline";
 import { redactSensitiveTextForDisplay } from "./lib/sensitive-text";
 import type { UIAppearancePreferences } from "./ui-appearance";
 import {
@@ -1044,21 +1045,35 @@ function App() {
     switch (event.type) {
       case "started":
       case "status":
-		updateSessionStreamingMessage(projectID, sessionID, (message) => ({
-		  ...message,
-		  parts: updateLiveTimelineParts(message.parts, event),
-		  status: event.message || "正在思考",
-		  statusKind: streamStatusKind(event.status),
-		  compressionStatus: undefined,
-		}));
+		updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return {
+			...live,
+			parts: updateLiveTimelineParts(live.parts, event),
+			status: event.message || "正在思考",
+			statusKind: streamStatusKind(event.status),
+			compressionStatus: undefined,
+		  };
+		});
         break;
       case "context_compression":
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return {
+			...live,
+			parts: updateLiveTimelineParts(live.parts, event),
+			status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
+			statusKind: "compression",
+			compressionStatus: event.compression?.status === "completed" ? "completed" : event.compression?.status === "error" ? "error" : "running",
+		  };
+		});
+        break;
+      case "heartbeat":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
-		  parts: updateLiveTimelineParts(message.parts, event),
-          status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
-          statusKind: "compression",
-          compressionStatus: event.compression?.status === "completed" ? "completed" : event.compression?.status === "error" ? "error" : "running",
+          status: event.message || message.status || "上游模型仍在处理",
+          statusKind: streamStatusKind(event.status),
+          compressionStatus: undefined,
         }));
         break;
       case "delta":
@@ -1071,33 +1086,35 @@ function App() {
       case "usage_state":
         break;
       case "provider_notice":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
-          status: event.message || message.status || "正在处理供应商响应",
-        }));
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(live.parts ?? [], event.parts), status: event.message || message.status || "正在处理供应商响应" };
+		});
         break;
       case "tool":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(updateLiveToolParts(message.parts, event), event.parts),
-          status: toolEventMessage(event),
-          statusKind: toolEventStatusKind(event.status),
-        }));
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(updateLiveToolParts(live.parts, event), event.parts), status: toolEventMessage(event), statusKind: toolEventStatusKind(event.status) };
+		});
         break;
       case "subagent":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
-          status: event.message || "子代理正在工作",
-        }));
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(live.parts ?? [], event.parts), status: event.message || "子代理正在工作" };
+		});
         break;
       case "progress":
         if (event.progress) updateSessionTaskProgress(projectID, sessionID, event.progress);
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, parts: updateLiveProgressPart(message.parts, event.progress), status: "正在执行任务" }));
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: updateLiveProgressPart(live.parts, event.progress), status: "正在执行任务" };
+		});
         break;
       case "team":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, parts: updateLiveTeamPart(message.parts, event), model: event.model || message.model, status: event.message || `${event.team?.label || "团队角色"}正在工作` }));
+        updateSessionStreamingMessage(projectID, sessionID, (message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: updateLiveTeamPart(live.parts, event), model: event.model || message.model, status: event.message || `${event.team?.label || "团队角色"}正在工作` };
+		});
         break;
       case "guidance": {
         const previousResult = event.result;
@@ -1295,25 +1312,39 @@ function App() {
     switch (event.type) {
       case "started":
       case "status":
-		updateStreamingMessage((message) => ({
-		  ...message,
-		  parts: updateLiveTimelineParts(message.parts, event),
-		  status: event.message || "正在思考",
-		  statusKind: streamStatusKind(event.status),
-		  compressionStatus: undefined,
-		}));
+		updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return {
+			...live,
+			parts: updateLiveTimelineParts(live.parts, event),
+			status: event.message || "正在思考",
+			statusKind: streamStatusKind(event.status),
+			compressionStatus: undefined,
+		  };
+		});
         break;
       case "context_compression":
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return {
+			...live,
+			parts: updateLiveTimelineParts(live.parts, event),
+			status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
+			statusKind: "compression",
+			compressionStatus: event.compression?.status === "completed"
+			  ? "completed"
+			  : event.compression?.status === "error"
+				? "error"
+				: "running",
+		  };
+		});
+        break;
+      case "heartbeat":
         updateStreamingMessage((message) => ({
           ...message,
-		  parts: updateLiveTimelineParts(message.parts, event),
-          status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
-          statusKind: "compression",
-          compressionStatus: event.compression?.status === "completed"
-            ? "completed"
-            : event.compression?.status === "error"
-              ? "error"
-              : "running",
+          status: event.message || message.status || "上游模型仍在处理",
+          statusKind: streamStatusKind(event.status),
+          compressionStatus: undefined,
         }));
         break;
       case "delta":
@@ -1344,53 +1375,37 @@ function App() {
         }
         break;
       case "provider_notice":
-        updateStreamingMessage((message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
-          status: event.message || message.status || "正在处理供应商响应",
-          statusKind: undefined,
-          compressionStatus: undefined,
-        }));
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(live.parts ?? [], event.parts), status: event.message || message.status || "正在处理供应商响应", statusKind: undefined, compressionStatus: undefined };
+		});
         break;
       case "tool":
-        updateStreamingMessage((message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(updateLiveToolParts(message.parts, event), event.parts),
-          status: toolEventMessage(event),
-          statusKind: toolEventStatusKind(event.status),
-          compressionStatus: undefined,
-        }));
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(updateLiveToolParts(live.parts, event), event.parts), status: toolEventMessage(event), statusKind: toolEventStatusKind(event.status), compressionStatus: undefined };
+		});
         break;
       case "subagent":
-        updateStreamingMessage((message) => ({
-          ...message,
-          parts: mergeLiveToolResultParts(message.parts ?? [], event.parts),
-          status: event.message || "子代理正在工作",
-          statusKind: undefined,
-          compressionStatus: undefined,
-        }));
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: mergeLiveToolResultParts(live.parts ?? [], event.parts), status: event.message || "子代理正在工作", statusKind: undefined, compressionStatus: undefined };
+		});
         break;
       case "progress":
         if (event.progress) {
           updateSessionTaskProgress(eventProjectID, eventSessionID, event.progress);
         }
-        updateStreamingMessage((message) => ({
-          ...message,
-          parts: updateLiveProgressPart(message.parts, event.progress),
-          status: "正在执行任务",
-          statusKind: undefined,
-          compressionStatus: undefined,
-        }));
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: updateLiveProgressPart(live.parts, event.progress), status: "正在执行任务", statusKind: undefined, compressionStatus: undefined };
+		});
         break;
       case "team":
-        updateStreamingMessage((message) => ({
-          ...message,
-          parts: updateLiveTeamPart(message.parts, event),
-          model: event.model || message.model,
-          status: event.message || `${event.team?.label || "团队角色"}正在工作`,
-          statusKind: undefined,
-          compressionStatus: undefined,
-        }));
+        updateStreamingMessage((message) => {
+		  const live = flushLiveAssistantMessage(message);
+		  return { ...live, parts: updateLiveTeamPart(live.parts, event), model: event.model || message.model, status: event.message || `${event.team?.label || "团队角色"}正在工作`, statusKind: undefined, compressionStatus: undefined };
+		});
         break;
       case "guidance": {
         const previousResult = event.result;
@@ -4055,7 +4070,7 @@ function App() {
                 fallback={
 				  <article class="op-msg assistant" classList={{ system: message.role === "system", failed: message.failed, interrupted: message.interrupted }}>
                     <MessageContent
-                      parts={message.parts && message.parts.length > 0 ? message.parts : textToParts(message.content)}
+                      parts={displayMessageParts(message.parts, message.content, message.streaming)}
                       hideTeamRun={message.streaming && activeSessionTask()?.messageID === message.id}
                       hideFileChangesSummary={message.streaming}
                       undoingChanges={rewinding()}
@@ -4987,26 +5002,13 @@ function updateLiveToolParts(parts: MessagePart[] | undefined, event: ChatTaskEv
   return next;
 }
 
-function updateLiveTimelineParts(parts: MessagePart[] | undefined, event: ChatTaskEvent): MessagePart[] {
-  const message = event.message?.trim();
-  if (!message) return parts ?? [];
-  const status = event.type === "context_compression"
-    ? event.compression?.status || event.status || "running"
-    : event.status || "running";
-  const next = [...(parts ?? [])];
-  for (let index = next.length - 1; index >= 0; index--) {
-	const part = next[index];
-	if (part.kind !== "timeline_note") continue;
-	if (part.message === message && part.status === status) return next;
-	break;
-  }
-  next.push({
-	kind: "timeline_note",
-	message,
-	status,
-	startedAt: new Date().toISOString(),
-  });
-  return next;
+function flushLiveAssistantMessage(message: ChatMessage): ChatMessage {
+  if (!message.content.trim()) return message;
+  return {
+    ...message,
+    content: "",
+    parts: appendLiveAssistantText(message.parts, message.content),
+  };
 }
 
 function findTaskProgress(parts: MessagePart[] | undefined): TaskProgressPart | undefined {

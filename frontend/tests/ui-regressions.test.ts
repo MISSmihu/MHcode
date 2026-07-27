@@ -569,16 +569,23 @@ describe("chat UI regressions", () => {
   });
 
   test("shows verifiable progress notes while work is running and restores them from history", async () => {
-	const [app, messageContent, types, css] = await Promise.all([
+	const [app, messageContent, timeline, types, css] = await Promise.all([
 	  Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
 	  Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/lib/timeline.ts", import.meta.url)).text(),
 	  Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
 	  Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
 	]);
-	expect(app).toContain("updateLiveTimelineParts(message.parts, event)");
-	expect(app).toContain('kind: "timeline_note"');
+	expect(app).toContain("updateLiveTimelineParts(live.parts, event)");
+	expect(app).toContain('case "heartbeat":');
+	expect(app).toContain("displayMessageParts(message.parts, message.content, message.streaming)");
+	expect(app).toContain("flushLiveAssistantMessage(message)");
+	expect(timeline).toContain('if (event.type === "heartbeat") return parts ?? [];');
+	expect(timeline).toContain("appendLiveAssistantText");
+	expect(timeline).toContain('kind: "timeline_note"');
 	expect(messageContent).toContain("function TimelineNote");
 	expect(messageContent).toContain('block.kind === "timeline"');
+	expect(messageContent).toContain('part.name === "update_plan"');
 	expect(types).toContain('kind: "timeline_note"');
 	expect(css).toContain(".op-timeline-note {");
   });

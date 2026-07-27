@@ -61,3 +61,14 @@ func TestTurnTimelineSettlesProgressOnFailure(t *testing.T) {
 		t.Fatalf("failed progress note = %#v", history[0].Parts[0])
 	}
 }
+
+func TestTurnTimelineDoesNotPersistProviderHeartbeats(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	service.resetTurnTimeline()
+	service.captureTurnTimelineEvent(ChatStreamEvent{
+		Type: "heartbeat", Message: "upstream still processing", Status: "waiting",
+	})
+	if len(service.turnTimelineParts) != 0 {
+		t.Fatalf("provider heartbeat leaked into durable timeline: %#v", service.turnTimelineParts)
+	}
+}

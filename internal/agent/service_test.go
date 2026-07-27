@@ -873,6 +873,7 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 	for _, expected := range []string{
 		"enough detail to fully handle",
 		"materially changes state",
+		"meaningful batch of tool calls",
 		"length proportional to the task",
 		"immediately following any [MHcode private turn context] block",
 		"user explicitly supplies an absolute target",

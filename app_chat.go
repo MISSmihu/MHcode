@@ -690,7 +690,7 @@ func chatTaskStatusFromEvent(event ChatTaskEvent) string {
 	switch event.Type {
 	case "failed", "cancelled", "completed":
 		return event.Type
-	case "status", "started":
+	case "status", "started", "heartbeat":
 		if status := strings.TrimSpace(event.Status); status != "" {
 			return status
 		}

@@ -133,6 +133,50 @@ func TestDeploymentSSHPreflightRequiresIntentAndCredential(t *testing.T) {
 	}
 }
 
+func TestRemoteCredentialLookupUsesSSHPreflight(t *testing.T) {
+	service, reference := newDeploymentSSHService(t, "127.0.0.1:22", "lookup-password")
+	for _, request := range []string{
+		"find the server management secret " + reference,
+		"帮找回一下 CLIProxyAPI 登录管理秘钥，我忘记了 " + reference,
+	} {
+		messages := []protocol.Message{{Role: "user", Content: request}}
+		credentialID, ok := service.deploymentSSHCredential(messages)
+		if !ok || scopedCredentialScheme+credentialID != reference {
+			t.Fatalf("remote lookup did not select SSH preflight for %q: id=%q ok=%v", request, credentialID, ok)
+		}
+	}
+}
+
+func TestRemoteCredentialLookupRequiresTargetInspectionBeforeOtherTools(t *testing.T) {
+	guard := toolLoopGuard{remoteLookup: true, completedSSHCalls: map[string]bool{}}
+	repositoryCall := protocol.ToolCall{
+		ID: "repo-before-ssh",
+		Function: protocol.ToolCallFunction{
+			Name:      "read_repository",
+			Arguments: json.RawMessage(`{"url":"https://github.com/example/project"}`),
+		},
+	}
+	result, message, guarded, hidden := guard.before(repositoryCall)
+	if !guarded || !hidden || result.IsError || !strings.Contains(message.Content, "先通过 SSH 检查目标主机") {
+		t.Fatalf("repository detour was not blocked before SSH inspection: guarded=%v hidden=%v result=%+v message=%+v", guarded, hidden, result, message)
+	}
+
+	runCall := protocol.ToolCall{
+		ID: "ssh-inspect",
+		Function: protocol.ToolCallFunction{
+			Name:      "ssh",
+			Arguments: json.RawMessage(`{"action":"run","credential_id":"ssh-test","command":"systemctl status cliproxyapi"}`),
+		},
+	}
+	guard.after(runCall, successfulSSHGuardResult(), &protocol.Message{})
+	if !guard.remoteTargetInspected {
+		t.Fatal("successful SSH inspection did not unlock supporting tools")
+	}
+	if _, _, guarded, _ := guard.before(repositoryCall); guarded {
+		t.Fatal("supporting repository lookup remained blocked after SSH inspection")
+	}
+}
+
 func TestDeploymentSSHPreflightFailureAndApprovalRejectionReachModel(t *testing.T) {
 	const password = "correct-password"
 	server := startSSHTestServer(t, password)

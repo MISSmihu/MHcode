@@ -152,7 +152,7 @@ func collectProviderStreamWithTiming(
 			return protocol.CompletionResult{}, fmt.Errorf("%w after %s", ErrProviderStreamOpenTimeout, timing.OpenTimeout)
 		case <-openHeartbeat.C:
 			emitChatEvent(sink, ChatStreamEvent{
-				Type:    "status",
+				Type:    "heartbeat",
 				Message: fmt.Sprintf("上游模型仍在建立连接（已等待 %s）", roundedWaitDuration(time.Since(openStartedAt))),
 				Model:   request.Model,
 				Status:  "waiting",
@@ -221,7 +221,7 @@ func collectProviderStreamWithTiming(
 			return partialResult(), fmt.Errorf("%w for %s", ErrProviderStreamIdle, timing.IdleTimeout)
 		case <-heartbeat.C:
 			emitChatEvent(sink, ChatStreamEvent{
-				Type:    "status",
+				Type:    "heartbeat",
 				Message: fmt.Sprintf("上游模型仍在处理（%s 未收到新数据）", roundedWaitDuration(time.Since(lastProviderEventAt))),
 				Model:   request.Model,
 				Status:  "waiting",

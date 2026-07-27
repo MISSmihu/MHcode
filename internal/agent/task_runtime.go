@@ -241,7 +241,7 @@ func appendTaskRuntimeTimelineNote(state *TaskRuntimeState, event ChatStreamEven
 
 func taskRuntimeStatusFromStreamEvent(event ChatStreamEvent) string {
 	switch event.Type {
-	case "status", "started":
+	case "status", "started", "heartbeat":
 		if status := strings.TrimSpace(event.Status); status != "" {
 			return status
 		}

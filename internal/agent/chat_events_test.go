@@ -172,14 +172,14 @@ func TestCollectProviderStreamIdleTimeoutKeepsPartialOutputAndEmitsHeartbeat(t *
 	events := make(chan protocol.StreamEvent, 1)
 	events <- protocol.StreamEvent{Type: "delta", Delta: "partial answer"}
 	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
-	var statusEvents []ChatStreamEvent
+	var heartbeatEvents []ChatStreamEvent
 	result, err := collectProviderStreamWithTiming(
 		context.Background(),
 		provider,
 		protocol.ChatRequest{Model: "slow-stream"},
 		func(event ChatStreamEvent) {
-			if event.Type == "status" {
-				statusEvents = append(statusEvents, event)
+			if event.Type == "heartbeat" {
+				heartbeatEvents = append(heartbeatEvents, event)
 			}
 		},
 		providerStreamTiming{
@@ -195,8 +195,8 @@ func TestCollectProviderStreamIdleTimeoutKeepsPartialOutputAndEmitsHeartbeat(t *
 	if result.Content != "partial answer" {
 		t.Fatalf("partial content = %q", result.Content)
 	}
-	if len(statusEvents) == 0 || statusEvents[0].Status != "waiting" || statusEvents[0].Model != "slow-stream" {
-		t.Fatalf("heartbeat events = %#v", statusEvents)
+	if len(heartbeatEvents) == 0 || heartbeatEvents[0].Status != "waiting" || heartbeatEvents[0].Model != "slow-stream" {
+		t.Fatalf("heartbeat events = %#v", heartbeatEvents)
 	}
 }
 
