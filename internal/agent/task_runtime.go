@@ -75,7 +75,7 @@ func (s *Service) StartTaskRuntime(taskID, startedAt string) error {
 		StartedAt:    startedAt,
 		UpdatedAt:    startedAt,
 		Status:       "running",
-		Message:      "正在准备上下文",
+		Message:      "正在执行任务",
 		LastEvent:    "started",
 		TurnSequence: 1,
 	}
@@ -176,8 +176,14 @@ func applyTaskStreamEvent(state *TaskRuntimeState, event ChatStreamEvent) {
 		return
 	}
 	state.LastEvent = strings.TrimSpace(event.Type)
-	if message := strings.TrimSpace(event.Message); message != "" {
-		state.Message = redactSensitiveText(message)
+	if event.Type != "heartbeat" {
+		if message := strings.TrimSpace(event.Message); message != "" {
+			if isRoutineTaskStatus(message) {
+				state.Message = "正在执行任务"
+			} else {
+				state.Message = redactSensitiveText(message)
+			}
+		}
 	}
 	if model := strings.TrimSpace(event.Model); model != "" {
 		state.Model = model
@@ -213,7 +219,7 @@ func appendTaskRuntimeTimelineNote(state *TaskRuntimeState, event ChatStreamEven
 		return
 	}
 	message := strings.TrimSpace(event.Message)
-	if message == "" {
+	if message == "" || isRoutineTaskStatus(message) {
 		return
 	}
 	status := strings.TrimSpace(event.Status)
@@ -241,11 +247,13 @@ func appendTaskRuntimeTimelineNote(state *TaskRuntimeState, event ChatStreamEven
 
 func taskRuntimeStatusFromStreamEvent(event ChatStreamEvent) string {
 	switch event.Type {
-	case "status", "started", "heartbeat":
+	case "status", "started":
 		if status := strings.TrimSpace(event.Status); status != "" {
 			return status
 		}
 		return "running"
+	case "heartbeat":
+		return ""
 	case "tool":
 		switch event.Status {
 		case "waiting", "retrying":

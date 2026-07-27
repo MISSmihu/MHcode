@@ -29,20 +29,17 @@ func TestTurnTimelinePersistsProgressAroundToolActivity(t *testing.T) {
 		t.Fatalf("history = %#v", history)
 	}
 	parts := history[0].Parts
-	if len(parts) != 4 {
+	if len(parts) != 3 {
 		t.Fatalf("timeline parts = %#v", parts)
 	}
-	if parts[0].Kind != tools.PartTimelineNote || parts[0].Message != "正在分析任务" || parts[0].Status != "completed" {
-		t.Fatalf("first progress note = %#v", parts[0])
+	if parts[0].Kind != tools.PartToolCall || parts[0].Status != "ok" || parts[0].Output != "ok" {
+		t.Fatalf("tool activity = %#v", parts[0])
 	}
-	if parts[1].Kind != tools.PartToolCall || parts[1].Status != "ok" || parts[1].Output != "ok" {
-		t.Fatalf("tool activity = %#v", parts[1])
+	if parts[1].Kind != tools.PartTimelineNote || parts[1].Message != "正在整理验证结果" {
+		t.Fatalf("progress note = %#v", parts[1])
 	}
-	if parts[2].Kind != tools.PartTimelineNote || parts[2].Message != "正在整理验证结果" {
-		t.Fatalf("second progress note = %#v", parts[2])
-	}
-	if parts[3].Kind != tools.PartText || parts[3].Text != "全部验证通过。" {
-		t.Fatalf("final answer = %#v", parts[3])
+	if parts[2].Kind != tools.PartText || parts[2].Text != "全部验证通过。" {
+		t.Fatalf("final answer = %#v", parts[2])
 	}
 }
 
@@ -70,5 +67,15 @@ func TestTurnTimelineDoesNotPersistProviderHeartbeats(t *testing.T) {
 	})
 	if len(service.turnTimelineParts) != 0 {
 		t.Fatalf("provider heartbeat leaked into durable timeline: %#v", service.turnTimelineParts)
+	}
+}
+
+func TestTurnTimelineDoesNotPersistRoutineTaskStatuses(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	for _, message := range []string{"正在准备上下文", "正在连接 Anthropic", "正在分析任务", "正在生成执行计划"} {
+		service.captureTurnTimelineEvent(ChatStreamEvent{Type: "status", Message: message, Status: "running"})
+	}
+	if len(service.turnTimelineParts) != 0 {
+		t.Fatalf("routine status leaked into durable timeline: %#v", service.turnTimelineParts)
 	}
 }

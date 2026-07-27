@@ -27,10 +27,10 @@ export function updateLiveTimelineParts(
   parts: MessagePart[] | undefined,
   event: ChatTaskEvent,
 ): MessagePart[] {
-  if (event.type === "heartbeat") return parts ?? [];
+  if (event.type === "heartbeat" || event.type === "started") return parts ?? [];
 
   const message = event.message?.trim();
-  if (!message) return parts ?? [];
+  if (!message || isRoutineTaskStatus(message)) return parts ?? [];
   const status = event.type === "context_compression"
     ? event.compression?.status || event.status || "running"
     : event.status || "running";
@@ -48,4 +48,17 @@ export function updateLiveTimelineParts(
     startedAt: new Date().toISOString(),
   });
   return next;
+}
+
+export function isRoutineTaskStatus(message: string | undefined): boolean {
+  const normalized = message?.trim() ?? "";
+  return normalized === "正在准备上下文"
+    || normalized === "正在分析任务"
+    || normalized === "正在生成执行计划"
+    || normalized.startsWith("正在连接 ")
+    || normalized.startsWith("上游模型仍在处理");
+}
+
+export function liveTaskStatus(message: string | undefined): string {
+  return isRoutineTaskStatus(message) ? "正在执行任务" : message?.trim() || "正在执行任务";
 }

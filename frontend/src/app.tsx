@@ -194,7 +194,7 @@ import {
 } from "./lib/composer-history";
 import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
 import { hasMeaningfulTurnOutput } from "./lib/chat-results";
-import { appendLiveAssistantText, displayMessageParts, updateLiveTimelineParts } from "./lib/timeline";
+import { appendLiveAssistantText, displayMessageParts, liveTaskStatus, updateLiveTimelineParts } from "./lib/timeline";
 import { redactSensitiveTextForDisplay } from "./lib/sensitive-text";
 import type { UIAppearancePreferences } from "./ui-appearance";
 import {
@@ -1050,7 +1050,7 @@ function App() {
 		  return {
 			...live,
 			parts: updateLiveTimelineParts(live.parts, event),
-			status: event.message || "正在思考",
+			status: liveTaskStatus(event.message),
 			statusKind: streamStatusKind(event.status),
 			compressionStatus: undefined,
 		  };
@@ -1069,12 +1069,6 @@ function App() {
 		});
         break;
       case "heartbeat":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({
-          ...message,
-          status: event.message || message.status || "上游模型仍在处理",
-          statusKind: streamStatusKind(event.status),
-          compressionStatus: undefined,
-        }));
         break;
       case "delta":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, content: message.content + (event.delta ?? ""), model: event.model || message.model, status: "正在生成" }));
@@ -1317,7 +1311,7 @@ function App() {
 		  return {
 			...live,
 			parts: updateLiveTimelineParts(live.parts, event),
-			status: event.message || "正在思考",
+			status: liveTaskStatus(event.message),
 			statusKind: streamStatusKind(event.status),
 			compressionStatus: undefined,
 		  };
@@ -1340,12 +1334,6 @@ function App() {
 		});
         break;
       case "heartbeat":
-        updateStreamingMessage((message) => ({
-          ...message,
-          status: event.message || message.status || "上游模型仍在处理",
-          statusKind: streamStatusKind(event.status),
-          compressionStatus: undefined,
-        }));
         break;
       case "delta":
         updateStreamingMessage((message) => ({
@@ -2245,7 +2233,7 @@ function App() {
       createdAt: taskStartedAt,
       model: activeChatModel(),
       streaming: true,
-      status: "正在准备上下文",
+      status: "正在执行任务",
     };
     setActiveTaskProgress(undefined);
     setChatNearBottom(true);
@@ -2528,8 +2516,8 @@ function App() {
 			parts: task.parts,
 			durationMs: task.durationMs,
 			streaming: true,
-			status: task.message || "后台任务正在运行",
-			statusKind: streamStatusKind(task.status),
+			status: liveTaskStatus(task.message),
+			statusKind: liveTaskStatus(task.message) === "正在执行任务" ? "running" : streamStatusKind(task.status),
           },
         };
       }

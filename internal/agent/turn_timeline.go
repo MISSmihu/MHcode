@@ -29,7 +29,7 @@ func (s *Service) captureTurnTimelineEvent(event ChatStreamEvent) {
 	switch event.Type {
 	case "status", "context_compression":
 		message := strings.TrimSpace(event.Message)
-		if message == "" {
+		if message == "" || isRoutineTaskStatus(message) {
 			return
 		}
 		status := strings.TrimSpace(event.Status)
@@ -66,6 +66,15 @@ func (s *Service) captureTurnTimelineEvent(event ChatStreamEvent) {
 	case "subagent", "provider_notice":
 		s.turnTimelineParts = mergeTaskRuntimeParts(s.turnTimelineParts, redactTaskRuntimeParts(event.Parts))
 	}
+}
+
+func isRoutineTaskStatus(message string) bool {
+	message = strings.TrimSpace(message)
+	return message == "正在准备上下文" ||
+		message == "正在分析任务" ||
+		message == "正在生成执行计划" ||
+		strings.HasPrefix(message, "正在连接 ") ||
+		strings.HasPrefix(message, "上游模型仍在处理")
 }
 
 func (s *Service) mergeTurnTimelineParts(parts []tools.ResultPart, content, terminalStatus string) []tools.ResultPart {

@@ -35,6 +35,7 @@ import { inlineDiffStats } from "../../lib/inline-diff";
 import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench";
 import { formatElapsedDuration } from "../../lib/duration";
 import { writeClipboardText } from "../../lib/clipboard";
+import { isRoutineTaskStatus } from "../../lib/timeline";
 import { InlineCodePreview } from "./InlineCodePreview";
 import { InlineDiffPreview } from "./InlineDiffPreview";
 
@@ -601,6 +602,7 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       continue;
     }
 	if (part.kind === "timeline_note") {
+	  if (isRoutineTaskStatus(part.message)) continue;
 	  blocks.push({ kind: "timeline", part });
 	  continue;
 	}

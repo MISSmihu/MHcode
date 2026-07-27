@@ -112,7 +112,7 @@ func TestChatTaskStateTracksStructuredWaitingAndRetrying(t *testing.T) {
 		t.Fatalf("post-tool state = %#v", state)
 	}
 	app.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "heartbeat", Status: "waiting"})
-	if state := app.GetActiveChatTask(); state == nil || state.Status != "waiting" {
+	if state := app.GetActiveChatTask(); state == nil || state.Status != "running" {
 		t.Fatalf("heartbeat state = %#v", state)
 	}
 }

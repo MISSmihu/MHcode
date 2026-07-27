@@ -580,7 +580,8 @@ describe("chat UI regressions", () => {
 	expect(app).toContain('case "heartbeat":');
 	expect(app).toContain("displayMessageParts(message.parts, message.content, message.streaming)");
 	expect(app).toContain("flushLiveAssistantMessage(message)");
-	expect(timeline).toContain('if (event.type === "heartbeat") return parts ?? [];');
+	expect(timeline).toContain('if (event.type === "heartbeat" || event.type === "started") return parts ?? [];');
+	expect(timeline).toContain('normalized.startsWith("上游模型仍在处理")');
 	expect(timeline).toContain("appendLiveAssistantText");
 	expect(timeline).toContain('kind: "timeline_note"');
 	expect(messageContent).toContain("function TimelineNote");

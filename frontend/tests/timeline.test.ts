@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { appendLiveAssistantText, displayMessageParts, updateLiveTimelineParts } from "../src/lib/timeline";
+import { appendLiveAssistantText, displayMessageParts, liveTaskStatus, updateLiveTimelineParts } from "../src/lib/timeline";
 import type { ChatTaskEvent, MessagePart } from "../src/types";
 
 describe("live task timeline", () => {
@@ -19,6 +19,16 @@ describe("live task timeline", () => {
     };
 
     expect(updateLiveTimelineParts(parts, heartbeat)).toEqual(parts);
+    expect(liveTaskStatus(heartbeat.message)).toBe("正在执行任务");
+  });
+
+  test("hides routine setup phases while keeping one compact live status", () => {
+    const phases = ["正在准备上下文", "正在连接 Anthropic", "正在分析任务", "正在生成执行计划"];
+    for (const message of phases) {
+      const event: ChatTaskEvent = { taskId: "task-1", type: "status", status: "running", message };
+      expect(updateLiveTimelineParts([], event)).toEqual([]);
+      expect(liveTaskStatus(message)).toBe("正在执行任务");
+    }
   });
 
   test("persists meaningful phases once", () => {
@@ -26,7 +36,7 @@ describe("live task timeline", () => {
       taskId: "task-1",
       type: "status",
       status: "running",
-      message: "正在分析任务",
+      message: "连接中断，正在重试",
     };
     const first = updateLiveTimelineParts([], event);
     const duplicate = updateLiveTimelineParts(first, event);

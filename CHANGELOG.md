@@ -2,6 +2,19 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.10 - 2026-07-28
+
+### Cleaner live task status
+
+- Keep a single `正在执行任务` status with elapsed time while a task is active.
+- Hide provider heartbeat notices and routine setup phases from the conversation timeline without disabling timeout monitoring.
+- Prevent heartbeat state from reappearing after switching conversations or restoring a background task.
+- Filter routine status rows from existing history while preserving model progress, tool activity, retries, and failures.
+
+### Verification
+
+- All Go package tests, `go vet`, 84 frontend tests, TypeScript checks, Vite production build, and Wails production build pass.
+
 ## v0.3.9 - 2026-07-28
 
 ### Agent execution timeline and remote operations

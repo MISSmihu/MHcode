@@ -50,7 +50,7 @@ func TestTaskRuntimePersistsLiveToolAndTerminalState(t *testing.T) {
 	}
 }
 
-func TestTaskRuntimeHeartbeatUpdatesStatusWithoutTimelineNoise(t *testing.T) {
+func TestTaskRuntimeHeartbeatDoesNotChangeVisibleStatus(t *testing.T) {
 	service := newTaskRuntimeTestService(t, t.TempDir())
 	if err := service.StartTaskRuntime("task-heartbeat", "2026-07-27T01:02:03Z"); err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestTaskRuntimeHeartbeatUpdatesStatusWithoutTimelineNoise(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("runtime ok=%v err=%v", ok, err)
 	}
-	if record.Status != "waiting" || record.Message != "upstream still processing" || len(record.Parts) != 0 {
+	if record.Status != "running" || record.Message != "正在执行任务" || len(record.Parts) != 0 {
 		t.Fatalf("heartbeat runtime = %#v", record)
 	}
 }
