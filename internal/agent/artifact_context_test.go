@@ -35,6 +35,7 @@ func TestArtifactPathSurvivesSessionSwitchAndRestart(t *testing.T) {
 		ProjectsPath: filepath.Join(base, "projects.json"),
 	}
 	artifactPath := filepath.Join(base, "exports", "attendance.xlsx")
+	canonicalArtifactPath := canonicalArtifactTestPath(t, artifactPath)
 	service := NewService(config)
 	projectID, sessionID := service.ActiveSessionIDs()
 	service.recordUserEvent("create workbook")
@@ -57,17 +58,17 @@ func TestArtifactPathSurvivesSessionSwitchAndRestart(t *testing.T) {
 	if _, err := service.SwitchProjectSession(projectID, sessionID); err != nil {
 		t.Fatal(err)
 	}
-	if records := service.ListSessionArtifacts(); len(records) != 1 || records[0].Path != artifactPath {
+	if records := service.ListSessionArtifacts(); len(records) != 1 || records[0].Path != canonicalArtifactPath {
 		t.Fatalf("switched session artifact registry = %#v", records)
 	}
-	assertArtifactModelContext(t, service.sessionMessages, artifactPath)
+	assertArtifactModelContext(t, service.sessionMessages, canonicalArtifactPath)
 	assertExecutionModelContext(t, service.sessionMessages, "renderer unavailable")
 	assertArtifactHiddenFromHistory(t, service.GetSessionMessages())
 	service.Close()
 
 	restarted := NewService(config)
 	defer restarted.Close()
-	assertArtifactModelContext(t, restarted.sessionMessages, artifactPath)
+	assertArtifactModelContext(t, restarted.sessionMessages, canonicalArtifactPath)
 	assertExecutionModelContext(t, restarted.sessionMessages, "renderer unavailable")
 	assertArtifactHiddenFromHistory(t, restarted.GetSessionMessages())
 }
