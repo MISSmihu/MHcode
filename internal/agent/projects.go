@@ -246,7 +246,8 @@ func (s *Service) ArchiveProjectTasks(projectID string) (WorkbenchState, error) 
 	return s.workbenchStateLocked(), nil
 }
 
-// RemoveProject removes the project and its MHcode event logs, never the source workspace.
+// RemoveProject hides a project while preserving its sessions and event logs.
+// Adding the same workspace again restores the original project identity.
 func (s *Service) RemoveProject(projectID string) (WorkbenchState, error) {
 	release, err := s.beginActivity("removing a project")
 	if err != nil {
@@ -257,7 +258,6 @@ func (s *Service) RemoveProject(projectID string) (WorkbenchState, error) {
 		return s.workbenchStateLocked(), errProjectsDisabled()
 	}
 	manifest := s.projects.Snapshot()
-	var removedID string
 	var activeChanged bool
 	if len(manifest.Projects) == 1 {
 		temporaryRoot := strings.TrimSpace(s.config.TemporaryWorkspaceRoot)
@@ -271,36 +271,28 @@ func (s *Service) RemoveProject(projectID string) (WorkbenchState, error) {
 		if err := os.MkdirAll(temporaryRoot, 0o755); err != nil {
 			return s.workbenchStateLocked(), fmt.Errorf("创建临时工作区失败: %w", err)
 		}
-		removed, changed, removeErr := s.projects.RemoveProjectWithFallback(projectID, "MHcodeProject", temporaryRoot, nil)
+		if active, ok := s.projects.Project(projectID); ok && sameWorkspacePath(active.WorkspaceRoot, temporaryRoot) {
+			temporaryRoot = filepath.Join(temporaryRoot, "Temporary")
+			if err := os.MkdirAll(temporaryRoot, 0o755); err != nil {
+				return s.workbenchStateLocked(), fmt.Errorf("创建备用临时工作区失败: %w", err)
+			}
+		}
+		_, changed, removeErr := s.projects.RemoveProjectWithFallback(projectID, "MHcodeProject", temporaryRoot, nil)
 		if removeErr != nil {
 			return s.workbenchStateLocked(), removeErr
 		}
-		removedID = removed.ID
 		activeChanged = changed
 	} else {
-		removed, changed, removeErr := s.projects.RemoveProject(projectID)
+		_, changed, removeErr := s.projects.RemoveProject(projectID)
 		if removeErr != nil {
 			return s.workbenchStateLocked(), removeErr
 		}
-		removedID = removed.ID
 		activeChanged = changed
-	}
-
-	var removeErr error
-	if strings.TrimSpace(s.config.SessionsDir) != "" {
-		var projectDir string
-		projectDir, removeErr = safeProjectEventDir(s.config.SessionsDir, removedID)
-		if removeErr == nil {
-			removeErr = os.RemoveAll(projectDir)
-		}
 	}
 	if activeChanged {
 		s.activateCurrent()
 	} else {
 		s.refreshProjectMemory()
-	}
-	if removeErr != nil {
-		return s.workbenchStateLocked(), fmt.Errorf("项目已从列表移除，但清理本地会话目录失败: %w", removeErr)
 	}
 	return s.workbenchStateLocked(), nil
 }

@@ -71,6 +71,9 @@ export function MessageContent(props: {
                 onOpenWorkspaceFile={props.onOpenWorkspaceFile}
               />
             </Match>
+			<Match when={block.kind === "timeline"}>
+			  <TimelineNote part={(block as TimelineRenderBlock).part} />
+			</Match>
             <Match when={block.kind === "activity"}>
               <ActivityGroup
                 parts={(block as ActivityRenderBlock).parts}
@@ -128,14 +131,16 @@ export type TeamPart = Extract<MessagePart, { kind: "team_role" }>;
 export type SubagentPart = Extract<MessagePart, { kind: "subagent" }>;
 type ProviderNoticePart = Extract<MessagePart, { kind: "provider_notice" }>;
 type SecretResultPart = Extract<MessagePart, { kind: "secret_result" }>;
+type TimelineNotePart = Extract<MessagePart, { kind: "timeline_note" }>;
 type TextRenderBlock = { kind: "text"; part: TextPart };
 type ActivityRenderBlock = { kind: "activity"; parts: MessagePart[] };
 type TeamRenderBlock = { kind: "team"; parts: TeamPart[] };
 type SubagentRenderBlock = { kind: "subagents"; parts: SubagentPart[] };
 type ProviderRenderBlock = { kind: "provider"; part: ProviderNoticePart };
 type SecretRenderBlock = { kind: "secret"; part: SecretResultPart };
-type RenderBlock = TextRenderBlock | ActivityRenderBlock | TeamRenderBlock | SubagentRenderBlock | ProviderRenderBlock | SecretRenderBlock;
-type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "browser" | "computer" | "open" | "file" | "tool";
+type TimelineRenderBlock = { kind: "timeline"; part: TimelineNotePart };
+type RenderBlock = TextRenderBlock | TimelineRenderBlock | ActivityRenderBlock | TeamRenderBlock | SubagentRenderBlock | ProviderRenderBlock | SecretRenderBlock;
+type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "render" | "visual" | "browser" | "computer" | "open" | "file" | "tool";
 type ActivityItem = { category: ActivityCategory; parts: MessagePart[] };
 type DisclosureProps = {
 	isDisclosureOpen?: (key: string) => boolean;
@@ -296,6 +301,8 @@ function ActivityIcon(props: { category: ActivityCategory }) {
       <Match when={props.category === "search" || props.category === "web"}><Search size={14} /></Match>
       <Match when={props.category === "repository"}><GitBranch size={14} /></Match>
       <Match when={props.category === "image"}><ImageIcon size={14} /></Match>
+      <Match when={props.category === "render"}><ImageIcon size={14} /></Match>
+      <Match when={props.category === "visual"}><Eye size={14} /></Match>
       <Match when={props.category === "browser"}><Globe2 size={14} /></Match>
       <Match when={props.category === "computer"}><Monitor size={14} /></Match>
     </Switch>
@@ -308,7 +315,7 @@ function ToolDetail(props: {
   hideOutput?: boolean;
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
 } & DisclosureProps) {
-  if (props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh") {
+  if (props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh" || props.part.name === "git_repository") {
     return <ShellToolDetail part={props.part} />;
   }
   const readReference = createMemo(() => props.part.name === "read_file"
@@ -318,7 +325,7 @@ function ToolDetail(props: {
   return (
     <div class="op-activity-detail">
       <div class="op-activity-detail-head">
-        <code>{props.part.name}</code>
+        <code>{friendlyToolName(props.part.name)}</code>
         <span>{toolStatusLabel(props.part.status ?? "ok")}{props.part.durationMs !== undefined ? ` · ${formatElapsedDuration(props.part.durationMs)}` : ""}</span>
       </div>
       <Show when={readReference()} fallback={
@@ -385,7 +392,7 @@ function ShellToolDetail(props: { part: ToolPart }) {
   return (
     <div class="op-activity-detail op-shell-detail">
       <div class="op-activity-detail-head">
-        <span class="op-shell-title"><TerminalSquare size={13} /><code>{props.part.name === "terminal" ? "Terminal" : props.part.name === "ssh" ? "SSH" : "Shell"}</code></span>
+        <span class="op-shell-title"><TerminalSquare size={13} /><code>{shellToolTitle(props.part.name)}</code></span>
         <span class="op-shell-meta">
 		  <Show when={props.part.status === "running"}>
 			<em class="running"><LivePartElapsed startedAt={props.part.startedAt} /></em>
@@ -440,6 +447,13 @@ function commandDisplayInput(part: ToolPart): string {
   } catch {
     return input;
   }
+}
+
+function shellToolTitle(name: string): string {
+	if (name === "terminal") return "Terminal";
+	if (name === "ssh") return "SSH";
+	if (name === "git_repository") return "Git";
+	return "Shell";
 }
 
 function commandPartStatus(part: ToolPart): string {
@@ -586,6 +600,10 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       blocks.push({ kind: "text", part });
       continue;
     }
+	if (part.kind === "timeline_note") {
+	  blocks.push({ kind: "timeline", part });
+	  continue;
+	}
     if (part.kind === "task_progress") {
       // 任务清单固定显示在输入框上方，避免把执行状态混进助手正文。
       continue;
@@ -659,6 +677,7 @@ function buildActivityItems(parts: MessagePart[]): ActivityItem[] {
 }
 
 function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategory {
+	if (part.kind === "timeline_note") return "tool";
   if (part.kind === "diff") return "edit";
   if (part.kind === "file") return isImagePath(part.path) ? "image" : "file";
   if (part.kind === "web_search_results") return "web";
@@ -670,7 +689,8 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
   switch (part.name) {
     case "run_command":
     case "terminal":
-    case "ssh": return "command";
+    case "ssh":
+    case "git_repository": return "command";
     case "read_file": return "read";
     case "file_info": return "read";
     case "list_dir": return "directory";
@@ -678,6 +698,8 @@ function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategor
     case "web_search": return "web";
     case "read_webpage": return "web";
     case "read_repository": return "repository";
+    case "render_artifact": return "render";
+    case "inspect_visual": return "visual";
     case "browser": return "browser";
     case "computer": return "computer";
     case "open_file": return "open";
@@ -712,11 +734,29 @@ function partDisclosureIdentity(part: MessagePart | undefined): string {
 			return `provider:${part.noticeKind}:${part.requestId ?? ""}`;
 		case "secret_result":
 			return `secret:${part.secretId}`;
+		case "timeline_note":
+			return `timeline:${part.startedAt ?? ""}:${part.message}`;
 		case "task_progress":
 			return "progress";
 		case "text":
 			return "text";
 	}
+}
+
+function TimelineNote(props: { part: TimelineNotePart }) {
+  const status = () => props.part.status || "completed";
+  const running = () => status() === "running" || status() === "waiting" || status() === "retrying";
+  const failed = () => status() === "failed" || status() === "cancelled" || status() === "interrupted";
+  return (
+	<div class="op-timeline-note" classList={{ running: running(), failed: failed() }}>
+	  <span class="op-timeline-note-icon" aria-hidden="true">
+		<Show when={running()} fallback={<Show when={failed()} fallback={<Check size={12} />}><AlertCircle size={12} /></Show>}>
+		  <span class="op-activity-spinner" />
+		</Show>
+	  </span>
+	  <span>{props.part.message}</span>
+	</div>
+  );
 }
 
 function ProviderNotice(props: { part: ProviderNoticePart }) {
@@ -1036,7 +1076,7 @@ function aggregateActivity(category: ActivityCategory): boolean {
 function activityStatus(item: ActivityItem): "running" | "ok" | "error" {
   const tools = item.parts.filter((part): part is ToolPart => part.kind === "tool_call");
   if (tools.some((part) => part.status === "error")) return "error";
-  if (tools.some((part) => part.status === "running")) return "running";
+  if (tools.some((part) => part.status === "running" || part.status === "waiting" || part.status === "retrying")) return "running";
   return "ok";
 }
 
@@ -1067,6 +1107,10 @@ function activityLabel(item: ActivityItem): string {
       const count = Math.max(1, files.filter(isImagePath).length);
       return `查看了 ${count} 张图像`;
     }
+    case "render":
+	  return running ? (input ? `正在渲染 ${baseName(input)}` : "正在渲染预览") : input ? `渲染了 ${baseName(input)}` : "渲染了预览";
+    case "visual":
+	  return running ? "正在检查视觉效果" : "完成了视觉检查";
     case "browser":
 	  return running ? "正在使用内置浏览器" : input.startsWith("http") ? "打开了网页" : "使用了内置浏览器";
     case "computer":
@@ -1292,13 +1336,15 @@ function activityArtifacts(parts: MessagePart[]): FilePart[] {
   const byPath = new Map<string, FilePart>();
   for (const part of parts) {
     if (part.kind !== "file") continue;
-    if (part.fileAction !== "created" && part.created !== true) continue;
+    if (part.fileAction !== "created" && part.fileAction !== "available" && part.created !== true) continue;
     byPath.set(part.path, part);
   }
   return [...byPath.values()];
 }
 
 function friendlyToolName(name = "工具"): string {
+  if (name === "render_artifact") return "渲染预览";
+  if (name === "inspect_visual") return "视觉检查";
   return name.replaceAll("_", " ");
 }
 
@@ -1462,7 +1508,9 @@ function MarkdownBlock(props: {
   );
 }
 
-function toolStatusLabel(status: "running" | "ok" | "error"): string {
+function toolStatusLabel(status: NonNullable<ToolPart["status"]>): string {
+	if (status === "waiting") return "等待中…";
+	if (status === "retrying") return "重试中…";
   if (status === "running") return "执行中…";
   if (status === "error") return "失败";
   return "完成";

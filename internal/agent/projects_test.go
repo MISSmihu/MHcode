@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -292,7 +293,7 @@ func TestArchiveProjectTasksKeepsFreshActiveSession(t *testing.T) {
 	}
 }
 
-func TestRemoveProjectCleansSessionDataButKeepsWorkspace(t *testing.T) {
+func TestRemoveAndReattachProjectPreservesSessionDataAndWorkspace(t *testing.T) {
 	base := t.TempDir()
 	sessionsDir := filepath.Join(base, "sessions")
 	svc := NewService(ServiceConfig{
@@ -309,8 +310,10 @@ func TestRemoveProjectCleansSessionDataButKeepsWorkspace(t *testing.T) {
 	if _, err := svc.CreateProject("remove me", workspace); err != nil {
 		t.Fatal(err)
 	}
-	projectID, _ := svc.projects.ActiveIDs()
+	projectID, sessionID := svc.projects.ActiveIDs()
 	svc.recordUserEvent("persisted task")
+	svc.sessionState.TurnCount++
+	svc.recordAssistantAndCheckpoint("persisted reply", "test-model", nil)
 	projectEventDir := filepath.Join(sessionsDir, projectID)
 	if _, err := os.Stat(projectEventDir); err != nil {
 		t.Fatalf("project event directory was not created: %v", err)
@@ -327,8 +330,8 @@ func TestRemoveProjectCleansSessionDataButKeepsWorkspace(t *testing.T) {
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("workspace source was removed: %v", err)
 	}
-	if _, err := os.Stat(projectEventDir); !os.IsNotExist(err) {
-		t.Fatalf("project event directory still exists or check failed: %v", err)
+	if _, err := os.Stat(projectEventDir); err != nil {
+		t.Fatalf("project event directory was removed: %v", err)
 	}
 	if svc.runtimeSettings.WorkspaceRoot == workspace {
 		t.Fatalf("active workspace still points at removed project: %q", workspace)
@@ -336,6 +339,20 @@ func TestRemoveProjectCleansSessionDataButKeepsWorkspace(t *testing.T) {
 	remaining := svc.ListProjects()
 	if len(remaining) != 1 {
 		t.Fatalf("remaining projects = %#v", remaining)
+	}
+	if _, err := svc.CreateProject("remove me", workspace); err != nil {
+		t.Fatal(err)
+	}
+	restoredProjectID, restoredSessionID := svc.projects.ActiveIDs()
+	if restoredProjectID != projectID || restoredSessionID != sessionID {
+		t.Fatalf("reattached identity = %s/%s, want %s/%s", restoredProjectID, restoredSessionID, projectID, sessionID)
+	}
+	history := svc.GetSessionMessages()
+	if len(history) != 2 || history[0].Content != "persisted task" || history[1].Content != "persisted reply" {
+		t.Fatalf("reattached history = %#v", history)
+	}
+	if _, err := svc.RemoveProject(restoredProjectID); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := svc.RemoveProject(remaining[0].ID); err != nil {
 		t.Fatal(err)
@@ -347,6 +364,201 @@ func TestRemoveProjectCleansSessionDataButKeepsWorkspace(t *testing.T) {
 	if svc.runtimeSettings.WorkspaceRoot != filepath.Join(base, "MHcodeProject") {
 		t.Fatalf("runtime workspace = %q", svc.runtimeSettings.WorkspaceRoot)
 	}
+}
+
+func TestRemoveRestartAndReattachRestoresConversationRuntime(t *testing.T) {
+	base := t.TempDir()
+	settingsPath := filepath.Join(base, "settings.json")
+	defaultWorkspace := filepath.Join(base, "default-workspace")
+	workspace := filepath.Join(base, "reattach-workspace")
+	if err := os.MkdirAll(defaultWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := DefaultRuntimeSettings()
+	settings.WorkspaceRoot = defaultWorkspace
+	settings.Team.Enabled = true
+	if err := saveRuntimeSettings(settingsPath, settings); err != nil {
+		t.Fatal(err)
+	}
+	config := ServiceConfig{
+		SkillsDir:              t.TempDir(),
+		SettingsPath:           settingsPath,
+		SessionsDir:            filepath.Join(base, "sessions"),
+		ProjectsPath:           filepath.Join(base, "projects.json"),
+		TemporaryWorkspaceRoot: filepath.Join(base, "MHcodeProject"),
+	}
+	svc := NewService(config)
+	if _, err := svc.CreateProject("reattach", workspace); err != nil {
+		t.Fatal(err)
+	}
+	projectID, memorySessionID := svc.projects.ActiveIDs()
+	svc.recordUserEvent("remember the durable project decision")
+	svc.sessionState.TurnCount = 1
+	svc.recordAssistantAndCheckpoint("DURABLE_PROJECT_MEMORY", "memory-model", nil)
+
+	if _, err := svc.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	_, branchSessionID := svc.projects.ActiveIDs()
+	svc.recordUserEvent("create branch baseline")
+	svc.sessionState.TurnCount = 1
+	svc.recordAssistantAndCheckpoint("BRANCH_BASELINE", "branch-model", nil)
+	baselineCheckpoint := svc.ListCheckpoints()[0].ID
+	svc.recordUserEvent("keep old branch")
+	svc.sessionState.TurnCount = 2
+	svc.recordAssistantAndCheckpoint("OLD_BRANCH_ONLY", "branch-model", nil)
+	oldBranchLeaf := svc.eventStore.Head()
+	if _, err := svc.RewindToCheckpoint(baselineCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+	svc.recordUserEvent("use replacement branch")
+	svc.sessionState.TurnCount = 2
+	svc.recordAssistantAndCheckpoint("CURRENT_BRANCH_ONLY", "branch-model", nil)
+	if err := svc.startPlanState([]tools.ProgressStep{
+		{Title: "preserve runtime", Status: "completed"},
+		{Title: "resume review", Status: "in_progress"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.teamState = TeamState{
+		Enabled: true, Active: false, RunID: "team-remount", Status: "paused", CurrentRole: TeamRoleReviewer,
+		Roles: []TeamRoleState{{Role: TeamRoleReviewer, Label: "审阅", Enabled: true, Status: "paused", Attempt: 2}},
+	}
+	teamCheckpoint := newTeamRunCheckpoint(settings.Team)
+	teamCheckpoint.Status = "paused"
+	teamCheckpoint.NextRole = TeamRoleReviewer
+	teamCheckpoint.NextAttempt = 2
+	teamCheckpoint.ReviewRound = 1
+	teamCheckpoint.Artifacts = []teamCheckpointArtifact{{Role: TeamRoleImplementer, Attempt: 1, Content: "implementation retained"}}
+	if err := svc.persistTeamRunCheckpoint(teamCheckpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	_, newerSessionID := svc.projects.ActiveIDs()
+	svc.recordUserEvent("newer session that must not steal activation")
+	svc.sessionState.TurnCount = 1
+	svc.recordAssistantAndCheckpoint("NEWER_SESSION", "other-model", nil)
+	if _, err := svc.SwitchProjectSession(projectID, branchSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if memorySessionID == branchSessionID || branchSessionID == newerSessionID {
+		t.Fatalf("test sessions are not distinct: %q %q %q", memorySessionID, branchSessionID, newerSessionID)
+	}
+
+	headBefore := svc.eventStore.Head()
+	branchesBefore := svc.ListBranches()
+	checkpointsBefore := svc.ListCheckpoints()
+	historyBefore := svc.GetSessionMessages()
+	memoryBefore := svc.WorkbenchState().ProjectMemory
+	prefixBefore := svc.contextPreviewForInput("继续").PrefixHash
+	providerSessionBefore := svc.providerSessionID()
+	if len(branchesBefore) != 2 || len(checkpointsBefore) != 2 {
+		t.Fatalf("branch setup = branches %#v checkpoints %#v", branchesBefore, checkpointsBefore)
+	}
+	if !strings.Contains(memoryBefore.Summary, "DURABLE_PROJECT_MEMORY") || !strings.Contains(memoryBefore.Summary, "NEWER_SESSION") {
+		t.Fatalf("project memory before detach = %#v", memoryBefore)
+	}
+	if svc.teamResume == nil || svc.teamResume.NextRole != TeamRoleReviewer || svc.planState.Status != "running" {
+		t.Fatalf("runtime before detach: team=%#v plan=%#v", svc.teamResume, svc.planState)
+	}
+
+	if _, err := svc.RemoveProject(projectID); err != nil {
+		t.Fatal(err)
+	}
+	svc = NewService(config)
+	for _, project := range svc.ListProjects() {
+		if project.ID == projectID {
+			t.Fatalf("detached project returned after restart: %#v", project)
+		}
+	}
+	if _, err := svc.CreateProject("reattach", workspace); err != nil {
+		t.Fatal(err)
+	}
+	restoredProjectID, restoredSessionID := svc.projects.ActiveIDs()
+	if restoredProjectID != projectID || restoredSessionID != branchSessionID {
+		t.Fatalf("reattached identity = %s/%s, want %s/%s", restoredProjectID, restoredSessionID, projectID, branchSessionID)
+	}
+	if svc.eventStore.Head() != headBefore {
+		t.Fatalf("restored head = %q, want %q", svc.eventStore.Head(), headBefore)
+	}
+	if providerSession := svc.providerSessionID(); providerSession != providerSessionBefore {
+		t.Fatalf("provider session identity = %q, want %q", providerSession, providerSessionBefore)
+	}
+	if prefix := svc.contextPreviewForInput("继续").PrefixHash; prefix != prefixBefore {
+		t.Fatalf("stable prefix hash = %q, want %q", prefix, prefixBefore)
+	}
+	if got := svc.GetSessionMessages(); !sameSessionMessageContents(got, historyBefore) {
+		t.Fatalf("restored history = %#v, want %#v", got, historyBefore)
+	}
+	if got := svc.ListCheckpoints(); !sameCheckpointIDs(got, checkpointsBefore) {
+		t.Fatalf("restored checkpoints = %#v, want %#v", got, checkpointsBefore)
+	}
+	if got := svc.ListBranches(); !sameBranchIdentity(got, branchesBefore) {
+		t.Fatalf("restored branches = %#v, want %#v", got, branchesBefore)
+	}
+	if !containsBranchLeaf(svc.ListBranches(), oldBranchLeaf) {
+		t.Fatalf("old branch leaf %q was lost: %#v", oldBranchLeaf, svc.ListBranches())
+	}
+	if svc.teamResume == nil || svc.teamResume.NextRole != TeamRoleReviewer || svc.teamResume.NextAttempt != 2 || svc.teamState.Status != "paused" {
+		t.Fatalf("restored team runtime = checkpoint %#v state %#v", svc.teamResume, svc.teamState)
+	}
+	if svc.planState.Status != "running" || len(svc.planState.Steps) != 2 || svc.planState.Steps[1].Status != "in_progress" {
+		t.Fatalf("restored plan = %#v", svc.planState)
+	}
+	if memory := svc.WorkbenchState().ProjectMemory; memory.SnapshotHash != memoryBefore.SnapshotHash || memory.Summary != memoryBefore.Summary {
+		t.Fatalf("restored project memory = %#v, want %#v", memory, memoryBefore)
+	}
+}
+
+func sameSessionMessageContents(left, right []SessionMessage) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].ID != right[index].ID || left[index].Role != right[index].Role || left[index].Content != right[index].Content || left[index].Status != right[index].Status {
+			return false
+		}
+	}
+	return true
+}
+
+func sameCheckpointIDs(left, right []CheckpointInfo) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].ID != right[index].ID {
+			return false
+		}
+	}
+	return true
+}
+
+func sameBranchIdentity(left, right []BranchInfo) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].LeafID != right[index].LeafID || left[index].IsCurrent != right[index].IsCurrent || left[index].TurnCount != right[index].TurnCount {
+			return false
+		}
+	}
+	return true
+}
+
+func containsBranchLeaf(branches []BranchInfo, leafID string) bool {
+	for _, branch := range branches {
+		if branch.LeafID == leafID {
+			return true
+		}
+	}
+	return false
 }
 
 func TestOpenProjectInFileManagerUsesConfiguredWorkspace(t *testing.T) {

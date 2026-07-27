@@ -41,8 +41,22 @@ func TestAnthropicListModels(t *testing.T) {
 			t.Fatal("anthropic-version header should be set")
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": []map[string]string{
-				{"id": "claude-3-5-sonnet-latest", "display_name": "Claude 3.5 Sonnet"},
+			"data": []map[string]any{
+				{
+					"id": "claude-fable-5", "display_name": "Claude Fable 5",
+					"max_input_tokens": 1_000_000, "max_tokens": 128_000,
+					"capabilities": map[string]any{
+						"thinking": map[string]any{"supported": true, "types": map[string]any{
+							"adaptive": map[string]any{"supported": true}, "enabled": map[string]any{"supported": false},
+						}},
+						"effort": map[string]any{
+							"supported": true,
+							"low":       map[string]any{"supported": true}, "medium": map[string]any{"supported": true},
+							"high": map[string]any{"supported": true}, "xhigh": map[string]any{"supported": true},
+							"max": map[string]any{"supported": true},
+						},
+					},
+				},
 			},
 		})
 	}))
@@ -57,8 +71,14 @@ func TestAnthropicListModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "claude-3-5-sonnet-latest" || models[0].Provider != "anthropic-compatible" {
+	if len(models) != 1 || models[0].ID != "claude-fable-5" || models[0].Provider != "anthropic-compatible" {
 		t.Fatalf("models = %#v", models)
+	}
+	if models[0].ContextWindowTokens != 1_000_000 || models[0].ContextWindowSource != "upstream" {
+		t.Fatalf("model context = %#v", models[0])
+	}
+	if models[0].MaxOutputTokens != 128_000 || strings.Join(models[0].ReasoningLevels, ",") != "low,medium,high,xhigh,max" || strings.Join(models[0].ThinkingModes, ",") != "adaptive" {
+		t.Fatalf("model capabilities = %#v", models[0])
 	}
 }
 
@@ -147,6 +167,140 @@ func TestAnthropicErrorIncludesMessage(t *testing.T) {
 	_, err := provider.ListModels(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "bad key") {
 		t.Fatalf("error = %v, want bad key", err)
+	}
+}
+
+func TestAnthropicCompleteRetriesOnceAndLearnsUnsupportedTemperature(t *testing.T) {
+	var payloads []map[string]any
+	var feedback []AnthropicCompatibilityFeedback
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		payloads = append(payloads, payload)
+		if len(payloads) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"temperature is deprecated for this model"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "ok"}},
+		})
+	}))
+	defer server.Close()
+
+	provider := AnthropicProvider{
+		BaseURL:            server.URL,
+		APIKey:             "test-key",
+		ProviderID:         "relay",
+		CompatibilityCache: NewAnthropicCompatibilityCache(),
+		CompatibilityFeedback: func(item AnthropicCompatibilityFeedback) {
+			feedback = append(feedback, item)
+		},
+	}
+	result, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "relay-claude", Temperature: 0.3,
+		Messages: []Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "ok" || len(payloads) != 2 {
+		t.Fatalf("result=%#v payloads=%#v", result, payloads)
+	}
+	if _, ok := payloads[0]["temperature"]; !ok {
+		t.Fatalf("first request omitted temperature: %#v", payloads[0])
+	}
+	if _, ok := payloads[1]["temperature"]; ok {
+		t.Fatalf("retry retained temperature: %#v", payloads[1])
+	}
+	if len(feedback) != 1 || feedback[0].ProviderID != "relay" || feedback[0].ModelID != "relay-claude" || strings.Join(feedback[0].UnsupportedParameters, ",") != "temperature" {
+		t.Fatalf("feedback = %#v", feedback)
+	}
+	second, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "relay-claude", Temperature: 0.3,
+		Messages: []Message{{Role: "user", Content: "again"}},
+	})
+	if err != nil || second.Content != "ok" || len(payloads) != 3 {
+		t.Fatalf("second=%#v err=%v payloads=%d", second, err, len(payloads))
+	}
+	if _, ok := payloads[2]["temperature"]; ok {
+		t.Fatalf("same-task learned request retained temperature: %#v", payloads[2])
+	}
+}
+
+func TestAnthropicCompatibilityRetryIsStrictlyClassified(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		detail string
+		want   string
+	}{
+		{name: "deprecated temperature", status: 400, detail: "temperature is deprecated for this model", want: "temperature"},
+		{name: "unsupported effort", status: 400, detail: "output_config.effort is not supported", want: "output_config"},
+		{name: "thinking extra input", status: 422, detail: "thinking: extra inputs are not permitted", want: "thinking"},
+		{name: "unrelated bad request", status: 400, detail: "messages must not be empty"},
+		{name: "generic invalid effort", status: 400, detail: "effort has an invalid value"},
+		{name: "server error", status: 500, detail: "temperature is not supported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := strings.Join(anthropicUnsupportedParametersFromError(test.status, test.detail), ",")
+			if got != test.want {
+				t.Fatalf("parameters = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicCompleteDoesNotRetryUnrelatedBadRequest(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"messages must not be empty"}}`))
+	}))
+	defer server.Close()
+
+	provider := AnthropicProvider{BaseURL: server.URL, APIKey: "test-key"}
+	_, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "relay-claude", Temperature: 0.3,
+		Messages: []Message{{Role: "user", Content: "hello"}},
+	})
+	if err == nil || attempts != 1 {
+		t.Fatalf("err=%v attempts=%d, want one failed request", err, attempts)
+	}
+}
+
+func TestAnthropicCompleteHonorsPreviouslyLearnedCompatibility(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if _, present := payload["temperature"]; present {
+			t.Fatalf("learned request retained temperature: %#v", payload)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"content": []map[string]any{{"type": "text", "text": "ok"}},
+		})
+	}))
+	defer server.Close()
+
+	provider := AnthropicProvider{BaseURL: server.URL, APIKey: "test-key"}
+	result, err := provider.Complete(context.Background(), ChatRequest{
+		Model: "relay-claude", Temperature: 0.3,
+		ModelUnsupportedParameters: []string{"temperature"},
+		Messages:                   []Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "ok" || attempts != 1 {
+		t.Fatalf("result=%#v attempts=%d", result, attempts)
 	}
 }
 

@@ -1,6 +1,9 @@
 package protocol
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestResolveReasoningOptionsUsesModelSpecificOpenAIMaximum(t *testing.T) {
 	tests := []struct {
@@ -99,5 +102,72 @@ func TestResolveReasoningOptionsMapsNativeProviders(t *testing.T) {
 	xai := ResolveReasoningOptions("openai-compatible", "https://api.x.ai/v1", "grok-4.20-multi-agent", "max")
 	if xai.Effort != "xhigh" {
 		t.Fatalf("xAI ultra = %#v", xai)
+	}
+}
+
+func TestAnthropicReasoningUsesPerModelCapabilities(t *testing.T) {
+	tests := []struct {
+		name  string
+		model string
+		level string
+		want  ReasoningOptions
+	}{
+		{name: "fable required adaptive", model: "claude-fable-5", level: "max", want: ReasoningOptions{Mode: "adaptive", Effort: "max"}},
+		{name: "fable cannot be disabled", model: "claude-fable-5", level: "none", want: ReasoningOptions{}},
+		{name: "opus preserves xhigh", model: "anthropic/claude-opus-5", level: "xhigh", want: ReasoningOptions{Mode: "adaptive", Effort: "xhigh"}},
+		{name: "sonnet can disable", model: "claude-sonnet-5", level: "none", want: ReasoningOptions{Mode: "disabled"}},
+		{name: "dated opus alias", model: "claude-opus-5-20260724", level: "high", want: ReasoningOptions{Mode: "adaptive", Effort: "high"}},
+		{name: "new opus 4 adaptive", model: "claude-opus-4-8", level: "xhigh", want: ReasoningOptions{Mode: "adaptive", Effort: "xhigh"}},
+		{name: "legacy sonnet budget", model: "claude-sonnet-4-5-20250929", level: "max", want: ReasoningOptions{Mode: "enabled", BudgetTokens: 16_384}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := ResolveReasoningOptions("anthropic", DefaultAnthropicBaseURL, test.model, test.level)
+			if got != test.want {
+				t.Fatalf("options = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicReasoningMenuReflectsDisableAndEffortSupport(t *testing.T) {
+	tests := []struct {
+		model string
+		want  []string
+	}{
+		{model: "claude-fable-5", want: []string{"low", "medium", "high", "xhigh", "max"}},
+		{model: "claude-opus-5", want: []string{"none", "low", "medium", "high", "xhigh", "max"}},
+		{model: "claude-sonnet-4-5", want: []string{"none", "low", "medium", "high", "xhigh", "max"}},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			got := SupportedReasoningLevelsWithProfile("auto", "anthropic", DefaultAnthropicBaseURL, test.model)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("levels = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReportedAnthropicCapabilitiesDoNotInventDisabledThinking(t *testing.T) {
+	var unsupported anthropicReportedModelCapabilities
+	levels := anthropicReportedReasoningLevels("custom-no-thinking", &unsupported)
+	if !reflect.DeepEqual(levels, []string{"none"}) {
+		t.Fatalf("unsupported levels = %#v", levels)
+	}
+	if got := applyReportedAnthropicReasoning(
+		ReasoningOptions{Mode: "disabled"}, "none", levels, anthropicReportedThinkingModes(&unsupported),
+	); got != (ReasoningOptions{}) {
+		t.Fatalf("unsupported thinking request = %#v, want omitted field", got)
+	}
+
+	var adaptive anthropicReportedModelCapabilities
+	adaptive.Thinking.Supported = true
+	adaptive.Thinking.Types.Adaptive.Supported = true
+	adaptive.Effort.Supported = true
+	adaptive.Effort.Low.Supported = true
+	levels = anthropicReportedReasoningLevels("custom-required-thinking", &adaptive)
+	if !reflect.DeepEqual(levels, []string{"low"}) {
+		t.Fatalf("adaptive levels = %#v, want no invented none option", levels)
 	}
 }

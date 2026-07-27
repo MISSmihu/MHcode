@@ -59,6 +59,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 	secretVault := s.secretVault
 	builder := s.builder
 	mcpManager := s.mcpManager
+	pluginManager := s.pluginManager
 	usageStore := s.usageStore
 	usageLedger := s.usageLedger
 	planMode := s.planMode
@@ -67,6 +68,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 	baseSessionState := s.sessionState
 	teamState := cloneTeamState(s.teamState)
 	teamResume := cloneTeamRunCheckpoint(s.teamResume)
+	failureStrategy := s.failureStrategySnapshot()
 	snapshot := cloneWorkbenchState(s.stateSnapshot)
 	var notify func(ApprovalRequest)
 	if s.approvals != nil {
@@ -86,6 +88,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 			secretVault:     secretVault,
 			builder:         builder,
 			mcpManager:      mcpManager,
+			pluginManager:   pluginManager,
 			usageStore:      usageStore,
 			usageLedger:     usageLedger,
 			planMode:        planMode,
@@ -95,6 +98,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 			projectID:       projectID,
 			sessionMessages: baseMessages,
 			sessionState:    baseSessionState,
+			failureStrategy: failureStrategy,
 		}
 		runtime.approvals.SetNotify(notify)
 		runtime.teamState = teamState
@@ -130,6 +134,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 		secretVault:     secretVault,
 		builder:         builder,
 		mcpManager:      mcpManager,
+		pluginManager:   pluginManager,
 		usageStore:      usageStore,
 		usageLedger:     usageLedger,
 		planMode:        planMode,

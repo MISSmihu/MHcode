@@ -82,7 +82,7 @@ func TestGetSessionMessagesUpgradesLegacyWebSearchFailure(t *testing.T) {
 		t.Fatalf("history length = %d, want 1", len(history))
 	}
 	message := history[0]
-	for _, expected := range []string{"网络搜索已完成", "请通过链接核对关键细节", "宁波天气预警", "https://weather.example/warning"} {
+	for _, expected := range []string{"本轮未完成最终分析", "原始网络搜索记录", "宁波天气预警", "https://weather.example/warning"} {
 		if !strings.Contains(message.Content, expected) {
 			t.Fatalf("restored content missing %q: %s", expected, message.Content)
 		}
@@ -183,7 +183,7 @@ func TestNewServiceRestoresMigratedConversationContext(t *testing.T) {
 		t.Fatalf("restored user message is incorrect: %+v", reloaded.sessionMessages[0])
 	}
 	restored := reloaded.sessionMessages[1]
-	if restored.Role != "assistant" || !strings.Contains(restored.Content, "宁波天气预警") || strings.Contains(restored.Content, "整理结果时连接失败") {
+	if restored.Role != "assistant" || !strings.Contains(restored.Content, "本轮未完成最终分析") || !strings.Contains(restored.Content, "宁波天气预警") || strings.Contains(restored.Content, "整理结果时连接失败") {
 		t.Fatalf("restored assistant context was not migrated: %+v", restored)
 	}
 	if reloaded.sessionState.TurnCount != 1 {

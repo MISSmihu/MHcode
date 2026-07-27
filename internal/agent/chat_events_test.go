@@ -142,6 +142,94 @@ func TestCollectProviderStreamStopsWhileProviderOpenIsBlocked(t *testing.T) {
 	close(provider.release)
 }
 
+func TestCollectProviderStreamTimesOutWhileProviderOpenIsBlocked(t *testing.T) {
+	provider := &stalledOpenProvider{started: make(chan struct{}), release: make(chan struct{})}
+	startedAt := time.Now()
+	result, err := collectProviderStreamWithTiming(
+		context.Background(),
+		provider,
+		protocol.ChatRequest{Model: "slow-open"},
+		nil,
+		providerStreamTiming{
+			OpenTimeout:       35 * time.Millisecond,
+			IdleTimeout:       time.Second,
+			HeartbeatInterval: 10 * time.Millisecond,
+		},
+	)
+	close(provider.release)
+	if !errors.Is(err, ErrProviderStreamOpenTimeout) {
+		t.Fatalf("open timeout error = %v", err)
+	}
+	if result.Content != "" {
+		t.Fatalf("open timeout content = %q", result.Content)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("open timeout took %s", elapsed)
+	}
+}
+
+func TestCollectProviderStreamIdleTimeoutKeepsPartialOutputAndEmitsHeartbeat(t *testing.T) {
+	events := make(chan protocol.StreamEvent, 1)
+	events <- protocol.StreamEvent{Type: "delta", Delta: "partial answer"}
+	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
+	var statusEvents []ChatStreamEvent
+	result, err := collectProviderStreamWithTiming(
+		context.Background(),
+		provider,
+		protocol.ChatRequest{Model: "slow-stream"},
+		func(event ChatStreamEvent) {
+			if event.Type == "status" {
+				statusEvents = append(statusEvents, event)
+			}
+		},
+		providerStreamTiming{
+			OpenTimeout:       time.Second,
+			IdleTimeout:       55 * time.Millisecond,
+			HeartbeatInterval: 15 * time.Millisecond,
+		},
+	)
+	close(events)
+	if !errors.Is(err, ErrProviderStreamIdle) {
+		t.Fatalf("idle timeout error = %v", err)
+	}
+	if result.Content != "partial answer" {
+		t.Fatalf("partial content = %q", result.Content)
+	}
+	if len(statusEvents) == 0 || statusEvents[0].Status != "waiting" || statusEvents[0].Model != "slow-stream" {
+		t.Fatalf("heartbeat events = %#v", statusEvents)
+	}
+}
+
+func TestCollectProviderStreamActivityResetsIdleTimeout(t *testing.T) {
+	events := make(chan protocol.StreamEvent)
+	provider := &stalledStreamProvider{started: make(chan struct{}), events: events}
+	go func() {
+		defer close(events)
+		for _, value := range []string{"one", "two", "three"} {
+			events <- protocol.StreamEvent{Type: "delta", Delta: value}
+			time.Sleep(20 * time.Millisecond)
+		}
+		events <- protocol.StreamEvent{Type: "done"}
+	}()
+	result, err := collectProviderStreamWithTiming(
+		context.Background(),
+		provider,
+		protocol.ChatRequest{Model: "active-stream"},
+		nil,
+		providerStreamTiming{
+			OpenTimeout:       time.Second,
+			IdleTimeout:       45 * time.Millisecond,
+			HeartbeatInterval: 10 * time.Millisecond,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Content != "onetwothree" {
+		t.Fatalf("content = %q", result.Content)
+	}
+}
+
 func TestCollectProviderStreamStopsAfterSemanticFinishWithoutEOF(t *testing.T) {
 	events := make(chan protocol.StreamEvent, 2)
 	events <- protocol.StreamEvent{Type: "delta", Delta: "finished answer"}

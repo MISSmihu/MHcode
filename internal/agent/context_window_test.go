@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
+	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
 func TestCompressProtocolMessagesKeepsSystemAndRecentTail(t *testing.T) {
@@ -91,6 +93,103 @@ func TestCompressProtocolMessagesKeepsToolCallAndResultTogether(t *testing.T) {
 		if index+1 >= len(compressed) || compressed[index+1].Role != "tool" || compressed[index+1].ToolCallID != message.ToolCalls[0].ID {
 			t.Fatalf("tool protocol pair was split at index %d: %#v", index, compressed)
 		}
+	}
+}
+
+func TestCompressProtocolMessagesKeepsRecentArtifactIndex(t *testing.T) {
+	service := &Service{runtimeSettings: RuntimeSettings{WorkspaceRoot: t.TempDir()}}
+	artifactPath := filepath.Join(service.runtimeSettings.WorkspaceRoot, "exports", "report.xlsx")
+	messages := []protocol.Message{{Role: "system", Content: "stable-system"}}
+	messages = append(messages,
+		protocol.Message{Role: "user", Content: "create the report"},
+		service.protocolAssistantMessage("report created", []tools.ResultPart{{
+			Kind: tools.PartFile, Path: artifactPath, FileAction: "created", Created: true,
+		}}),
+	)
+	for index := 0; index < 10; index++ {
+		messages = append(messages,
+			protocol.Message{Role: "user", Content: strings.Repeat("follow-up ", 180)},
+			protocol.Message{Role: "assistant", Content: strings.Repeat("answer ", 180)},
+		)
+	}
+
+	compressed, removed := compressProtocolMessages(messages, contextBudget{InputLimitTokens: 5_000, TargetTokens: 2_500})
+	if removed == 0 {
+		t.Fatal("expected old messages to be compressed")
+	}
+	foundArtifactIndex := false
+	for _, message := range compressed {
+		if message.InternalKind == contextArtifactKind {
+			foundArtifactIndex = strings.Contains(message.Content, artifactPath)
+		}
+		if message.InternalKind == contextSummaryKind && strings.Contains(message.Content, localArtifactContextStart) {
+			t.Fatalf("artifact context was duplicated into conversation summary: %q", message.Content)
+		}
+	}
+	if !foundArtifactIndex {
+		t.Fatalf("compressed messages lost artifact path %q: %#v", artifactPath, compressed)
+	}
+}
+
+func TestCompressProtocolMessagesPreservesLatestExecutionCheckpoint(t *testing.T) {
+	service := &Service{planState: PlanState{
+		Revision: 2,
+		Status:   "cancelled",
+		Steps:    []tools.ProgressStep{{Title: "Retry with a different renderer", Status: "in_progress"}},
+	}}
+	exitCode := 1
+	checkpointed := service.protocolAssistantContent("work interrupted", []tools.ResultPart{{
+		Kind: tools.PartToolCall, Name: "run_command", Status: "error", ToolCallID: "render-2",
+		Input: "render workbook", Stderr: "renderer crashed", ExitCode: &exitCode,
+	}})
+
+	messages := []protocol.Message{{Role: "system", Content: "stable-system"}}
+	for index := 0; index < 10; index++ {
+		messages = append(messages,
+			protocol.Message{Role: "user", Content: strings.Repeat("old request ", 160)},
+			protocol.Message{Role: "assistant", Content: strings.Repeat("old answer ", 160)},
+		)
+	}
+	messages = append(messages,
+		protocol.Message{Role: "user", Content: "resume source"},
+		protocol.Message{Role: "assistant", Content: checkpointed},
+		protocol.Message{Role: "user", Content: requestContextStart + "\n[execution_state]\nresume\n" + requestContextEnd, InternalKind: contextRequestKind},
+		protocol.Message{Role: "user", Content: "continue"},
+	)
+
+	compressed, removed := compressProtocolMessages(messages, contextBudget{InputLimitTokens: 5_000, TargetTokens: 2_500})
+	if removed == 0 {
+		t.Fatal("expected compression to remove old history")
+	}
+	executionCount := 0
+	for _, message := range compressed {
+		if message.InternalKind == contextExecutionKind {
+			executionCount++
+			if !strings.Contains(message.Content, executionContextStart) || !strings.Contains(message.Content, "renderer crashed") || !strings.Contains(message.Content, executionContextEnd) {
+				t.Fatalf("execution checkpoint was truncated or changed: %q", message.Content)
+			}
+		}
+		if message.InternalKind == contextSummaryKind && strings.Contains(message.Content, executionContextStart) {
+			t.Fatalf("execution checkpoint leaked into compressed prose summary: %q", message.Content)
+		}
+	}
+	if executionCount != 1 {
+		t.Fatalf("execution checkpoint count = %d, want 1: %#v", executionCount, compressed)
+	}
+	last := compressed[len(compressed)-1]
+	if last.Role != "user" || last.Content != "continue" {
+		t.Fatalf("latest user request was not preserved: %#v", last)
+	}
+}
+
+func TestClipDelimitedContextKeepsMarkers(t *testing.T) {
+	content := requestContextStart + "\n" + strings.Repeat("private context ", 500) + "\n" + requestContextEnd
+	clipped := clipDelimitedContext(content, requestContextStart, requestContextEnd, 400)
+	if !strings.Contains(clipped, requestContextStart) || !strings.Contains(clipped, requestContextEnd) {
+		t.Fatalf("clipped context lost delimiters: %q", clipped)
+	}
+	if len([]rune(clipped)) > 430 {
+		t.Fatalf("clipped context is unexpectedly large: %d runes", len([]rune(clipped)))
 	}
 }
 

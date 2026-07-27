@@ -11,6 +11,8 @@ MHcode 是一个本地优先的 AI 编程 Agent 工作台。它把多模型协�
 - Agent：流式工具循环、低/中/高/超高推理档位、显式 Plan、任务进度、消息排队与运行中引导。
 - AI 团队：规划、实现、测试、审阅和汇总角色，可为每个角色选择供应商与模型。
 - 结构化工具：文件读取/搜索/写入/补丁/复制/删除、命令、Git、终端、网络搜索、远程仓库读取、浏览器和其他窗口操控。
+- 办公产物：无需安装 Office，可读取、创建和编辑 DOCX、XLS/XLSX 与 PPTX；XLSX 支持真实公式、样式、合并、宽高、冻结窗格、下拉验证和打印布局，`read_file` 自动解析并在右侧结构化预览，生成文件可由 Microsoft Office 打开。
+- 插件系统：独立进程 JSON-RPC/JSONL ABI、本地安装、逐项授权、超时/取消/输出限制，以及主 Agent、Plan、AI 团队和子代理统一注册。
 - 上下文：稳定前缀、MCP schema 快照、工具结果摘要、模型感知的自动上下文压缩及 tokens/缓存/费用观测。
 - 工作区：项目与会话持久化、长期记忆、checkpoint、rewind、对话分叉、Git 审阅和持久终端。
 - 桌面能力：Chromium 内核浏览器、网页检查与截图、文件预览、图片粘贴和预览、Windows 窗口控制。
@@ -80,6 +82,7 @@ Windows 默认数据目录为 `%AppData%\MHcode`：
 - `sessions/`：事件日志、checkpoint、分支和项目记忆。
 - `mhcode.db`：用量、供应商状态等 SQLite 数据。
 - `browser-profile/`：内置浏览器配置。
+- `plugins/`：本地安装的第三方插件；插件设置本身保存在 `runtime-settings.json`。
 
 API Key 和浏览器密码不写入 JSON 或 SQLite，Windows 下保存到 Credential Manager。移除最后一个项目后，应用会使用 `%USERPROFILE%\MHcodeProject` 作为临时工作区。
 
@@ -109,7 +112,10 @@ go vet ./...
 - [当前架构与开发工具链](docs/technical-stack.zh-CN.md)
 - [开发状态与发布门槛](docs/development-plan.zh-CN.md)
 - [Skills 与 Agent 核心维护](docs/skills-development.zh-CN.md)
-- [内置 Agent 规则](skills/mhcode-agent-core/SKILL.md)
+- [插件 ABI 与开发指南](docs/plugins-development.zh-CN.md)
+- [MHcode Agent 内核 Skill](skills/mhcode-agent-core/SKILL.md)
+- [办公产物 Skill](skills/mhcode-office-artifacts/SKILL.md)
+- [Agent 内部设计](docs/agent-internal-design.zh-CN.md)
 - [贡献与 Pull Request 流程](CONTRIBUTING.md)
 - [版本变更记录](CHANGELOG.md)
 

@@ -9,6 +9,7 @@ type IndexEntry struct {
 	Name        string `json:"name"`
 	Version     int    `json:"version"`
 	Trigger     string `json:"trigger"`
+	TriggerMode string `json:"triggerMode,omitempty"`
 	Summary     string `json:"summary"`
 	SHA256      string `json:"sha256"`
 	Description string `json:"description"`

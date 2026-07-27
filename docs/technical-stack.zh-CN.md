@@ -15,6 +15,8 @@ MHcode/
 │   ├── config/                    默认配置结构
 │   ├── eventlog/                  append-only 会话事件树与快照
 │   ├── mcp/                       MCP server、schema 快照和远程工具
+│   ├── artifacts/                 独立 DOCX、XLS/XLSX 与 PPTX 产物引擎
+│   ├── plugins/                   插件 Manifest、内置工具目录与外部宿主协议
 │   ├── project/                   项目/会话清单与临时工作区迁移
 │   ├── protocol/                  DeepSeek、OpenAI、Anthropic、Gemini 等协议
 │   ├── sandboxexec/                子进程 containment 与资源限制
@@ -77,11 +79,21 @@ type Tool interface {
 - \`read_repository\`、\`web_search\`
 - \`browser\`、\`computer\`
 - \`run_command\`、\`terminal\`
-- Git 工具及启用的 MCP 远程工具
+- Git 工具、启用的 MCP 远程工具及 `plugin__<id>__<tool>` 插件工具
 
 注册顺序是稳定前缀的一部分。新增工具时应在固定位置注册、为 schema 加测试，并确认只读 Plan 注册表不会意外得到写权限。
 
-文件操作默认走结构化工具。\`run_command\` 只用于构建、测试、编译器和确实需要执行的程序；Agent 不应使用 Shell 代替文件读取、搜索、写入、复制或删除。
+文件操作默认走结构化工具。\`run_command\` 只用于构建、测试、编译器和确实需要执行的程序；Agent 不应使用 Shell 代替文件读取、搜索、写入、复制或删除。单程序执行使用 `executable + args[]` 逐参数传递，只有管道等真实 Shell 语法才使用 `command` 字符串模式。
+
+## 插件与办公产物
+
+`internal/plugins` 提供独立进程插件 ABI。第三方插件通过严格的 `mhcode-plugin.json` 声明工具、JSON Schema、读写属性、路径参数和权限；运行时使用 JSON-RPC 2.0 JSONL 完成 `initialize` 与 `tools.call`。插件不会作为 DLL 或 Go package 注入主进程。
+
+插件工具按稳定名称 `plugin__<plugin-id>__<tool-name>` 注册到主 Agent、团队和子代理；Plan 只得到只读插件工具。写入型插件调用进入统一审批和工作区互斥，路径在启动进程前解析，生成文件在返回后再次校验并作为可打开产物显示。
+
+内置 `office-artifacts` 工具目录直接调用 `internal/artifacts`：DOCX 与 PPTX 通过受限 ZIP/XML 解析和标准模板生成，XLSX 由 Excelize 读写，旧版 XLS 支持只读解析与转换为 XLSX。`spreadsheet_create` 用声明式结构生成正式工作簿，支持真实公式、样式、合并区域、列宽行高、冻结窗格、下拉验证、打印区域和页面适配；`spreadsheet_write_range` 只负责现有工作簿的小范围修改。生成后 `spreadsheet_inspect` 会返回公式、合并、样式、数据验证与冻结窗格计数，Agent 必须据此做质量复核。
+
+这套能力不调用 COM、ADO 或系统 Office，也不需要 Python 运行时；生成文件已通过 Word、Excel、PowerPoint 兼容性验证。`read_file` 会自动提取办公产物正文，右侧栏使用文档、表格和幻灯片专用视图预览。Access 数据库当前不提供内置支持，后续必须选择独立兼容引擎后再接入，不能恢复为系统 Office 自动化。完整外部插件 ABI 见 [插件开发指南](plugins-development.zh-CN.md)。
 
 ## 权限、审批与沙箱
 
@@ -91,7 +103,7 @@ type Tool interface {
 - \`NetworkAccess\`、\`ShellAccess\`、破坏性操作开关。
 - 命令超时、内存、CPU 和进程数上限。
 - \`ApprovalPolicy\`：工具按请求、失败或策略自动审批。
-- Git、浏览器、电脑操控、MCP、团队和记忆设置。
+- Git、浏览器、电脑操控、MCP、插件、团队和记忆设置。
 
 Windows 使用 Job Object 管理命令进程树，可施加资源限制并尝试降低子进程权限。当前 \`Capabilities\` 明确报告：文件系统隔离和网络隔离为 \`false\`。因此这不是虚拟机或容器沙箱；任何危险操作仍必须依赖策略、路径校验和审批。
 
@@ -176,3 +188,5 @@ Windows 下优先使用 \`bun.cmd\`。Go 代码变更后至少运行 \`go test .
 - Windows Job Object 不是文件系统/网络隔离；生产环境仍需外部 OS 沙箱或容器方案才能提供更强边界。
 - 非 Windows 的浏览器原生表面、电脑操控和进程限制覆盖较少。
 - 模型上下文目录目前由 Go 和前端各维护一份，修改必须双写并测试；后续应改为单一生成源.
+- 办公产物会显示为可打开、可结构化预览的文件，但当前文本快照/rewind 不覆盖二进制文档内容。
+- 第三方插件默认停用且无权限；当前还没有签名市场，安装本地插件表示用户信任其代码。

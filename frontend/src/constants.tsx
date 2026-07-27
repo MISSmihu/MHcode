@@ -14,6 +14,7 @@ import {
   Monitor,
   Palette,
   Plug,
+	Blocks,
   Settings,
   SlidersHorizontal,
   Terminal,
@@ -223,6 +224,7 @@ export const settingsGroups: Array<{
     title: "集成",
     items: [
       { id: "mcp", label: "MCP 服务器", icon: () => <Plug size={15} /> },
+		{ id: "plugins", label: "插件", icon: () => <Blocks size={15} /> },
       { id: "browser", label: "浏览器", icon: () => <Globe2 size={15} /> },
       { id: "computer", label: "电脑操控", icon: () => <Monitor size={15} /> },
     ],

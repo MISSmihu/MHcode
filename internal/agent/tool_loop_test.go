@@ -33,11 +33,85 @@ type failingBrowserTool struct{ calls *int }
 
 type staticRepositoryTool struct{}
 
+type staticSearchEvidenceTool struct{}
+
+type staticWebpageTool struct{}
+
 type longTaskStepTool struct{ calls *int }
 
 type cycleProbeTool struct {
 	calls    *int
 	changing bool
+}
+
+type streamingProgressTool struct{}
+
+type imageAttachmentTool struct{}
+
+type deterministicFailureTool struct{ calls *int }
+
+type namedSuccessTool struct {
+	name  string
+	calls *int
+}
+
+func (t deterministicFailureTool) Name() string { return "run_command" }
+func (t deterministicFailureTool) Description() string {
+	return "fails deterministically for retry tests"
+}
+func (t deterministicFailureTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (t deterministicFailureTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	(*t.calls)++
+	exitCode := 1
+	return tools.Result{
+		Summary: "python exited with code 1",
+		IsError: true,
+		Parts: []tools.ResultPart{{
+			Kind: tools.PartToolCall, Name: "run_command", Status: "error",
+			Stderr: "SyntaxError: unterminated string literal", Output: "SyntaxError: unterminated string literal", ExitCode: &exitCode,
+		}},
+	}, nil
+}
+
+func (t namedSuccessTool) Name() string        { return t.name }
+func (t namedSuccessTool) Description() string { return "succeeds as an alternative strategy" }
+func (t namedSuccessTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (t namedSuccessTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	(*t.calls)++
+	return tools.Result{Summary: t.name + " completed"}, nil
+}
+
+func (streamingProgressTool) Name() string        { return "stream_probe" }
+func (streamingProgressTool) Description() string { return "streams structured output for a test" }
+func (streamingProgressTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (streamingProgressTool) Execute(ctx context.Context, _ json.RawMessage) (tools.Result, error) {
+	tools.EmitProgress(ctx, tools.ResultPart{Kind: tools.PartToolCall, Status: "waiting", Output: "waiting for probe", WorkingDirectory: "workspace"})
+	tools.EmitProgress(ctx, tools.ResultPart{Kind: tools.PartToolCall, Status: "running", Stdout: "first", Output: "first", WorkingDirectory: "workspace"})
+	tools.EmitProgress(ctx, tools.ResultPart{Kind: tools.PartToolCall, Status: "running", Stdout: "first\nsecond", Output: "first\nsecond", WorkingDirectory: "workspace"})
+	exitCode := 0
+	return tools.Result{Summary: "probe complete", Parts: []tools.ResultPart{{
+		Kind: tools.PartToolCall, Status: "ok", Stdout: "first\nsecond", Output: "first\nsecond", WorkingDirectory: "workspace", ExitCode: &exitCode,
+	}}}, nil
+}
+
+func (imageAttachmentTool) Name() string        { return "capture_image" }
+func (imageAttachmentTool) Description() string { return "returns a screenshot for visual inspection" }
+func (imageAttachmentTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (imageAttachmentTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	return tools.Result{
+		Summary: "screenshot captured",
+		Attachments: []tools.Attachment{{
+			Name: "capture.png", MIMEType: "image/png", Data: "aGVsbG8=",
+		}},
+	}, nil
 }
 
 func (t longTaskStepTool) Name() string        { return "long_task_step" }
@@ -76,6 +150,43 @@ func (staticRepositoryTool) Execute(context.Context, json.RawMessage) (tools.Res
 		Parts: []tools.ResultPart{{
 			Kind: tools.PartToolCall, Name: "read_repository", Status: "ok",
 			Input: "https://github.com/MISSmihu/MHcode", Output: output,
+		}},
+	}, nil
+}
+
+func (staticSearchEvidenceTool) Name() string        { return "web_search" }
+func (staticSearchEvidenceTool) Description() string { return "returns discovery-only search evidence" }
+func (staticSearchEvidenceTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (staticSearchEvidenceTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	return tools.Result{
+		Summary: "found official documentation candidate: CCSwitch official repository https://github.com/example/ccswitch",
+		Parts: []tools.ResultPart{{
+			Kind:  tools.PartWebSearch,
+			Query: "CCSwitch official repository",
+			Sources: []tools.SearchSource{{
+				Title: "CCSwitch official repository",
+				URL:   "https://github.com/example/ccswitch",
+			}},
+		}},
+	}, nil
+}
+
+func (staticWebpageTool) Name() string        { return "read_webpage" }
+func (staticWebpageTool) Description() string { return "reads verified official documentation" }
+func (staticWebpageTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (staticWebpageTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	return tools.Result{
+		Summary: "official documentation read",
+		Parts: []tools.ResultPart{{
+			Kind:   tools.PartToolCall,
+			Name:   "read_webpage",
+			Status: "ok",
+			Input:  "https://github.com/example/ccswitch",
+			Output: "Official configuration path: %APPDATA%/CCSwitch/config.json",
 		}},
 	}, nil
 }
@@ -535,6 +646,9 @@ func TestBrowserUseExplicitlyRequested(t *testing.T) {
 	if browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "不要打开网页，只列出链接"}}) {
 		t.Fatal("negated browser request should remain disabled")
 	}
+	if !browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "去官网下载适合 Windows x64 的最新版安装包到 D 盘"}}) {
+		t.Fatal("official website download should authorize browser discovery for a dynamic asset")
+	}
 }
 
 func TestSearchQueriesSimilarKeepsSiteRefinementsDistinct(t *testing.T) {
@@ -619,7 +733,7 @@ func TestWebSearchToolLoopRetriesFinalSynthesisWithoutRepeatingSearch(t *testing
 	}
 }
 
-func TestWebSearchFailureFallsBackToSourceSummaries(t *testing.T) {
+func TestWebSearchEvidenceCannotCompleteFailedTurn(t *testing.T) {
 	outcome := toolLoopOutcome{Parts: []tools.ResultPart{{
 		Kind:  tools.PartWebSearch,
 		Query: "宁波 台风预警",
@@ -629,17 +743,137 @@ func TestWebSearchFailureFallsBackToSourceSummaries(t *testing.T) {
 		},
 	}}}
 	if !hasWebSearchSources(outcome.Parts) {
-		t.Fatal("search sources should make the partial result usable")
+		t.Fatal("structured search sources should remain available as activity evidence")
+	}
+	if hasUsablePartialToolResult(outcome.Parts) {
+		t.Fatal("search snippets are discovery evidence, not a usable completed result")
 	}
 	content := partialToolFailureContent(outcome)
-	for _, expected := range []string{"网络搜索已完成", "请通过链接核对关键细节", "宁波天气预警", "宁波市气象台发布最新预警", "https://weather.example/warning"} {
+	for _, expected := range []string{"工具结果已经保留", "尚未形成可用结论"} {
 		if !strings.Contains(content, expected) {
-			t.Fatalf("fallback missing %q: %s", expected, content)
+			t.Fatalf("failure message missing %q: %s", expected, content)
 		}
 	}
-	emptyCompletion := emptyToolCompletionContent(outcome.Parts)
-	if emptyCompletion != content {
-		t.Fatalf("empty completion fallback differs from provider failure fallback:\nempty: %s\nerror: %s", emptyCompletion, content)
+	for _, forbidden := range []string{"网络搜索已完成", "宁波天气预警", "宁波市气象台发布最新预警", "https://weather.example/warning"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("search evidence was promoted into a failed turn answer via %q: %s", forbidden, content)
+		}
+	}
+}
+
+func TestToolLoopContinuesInvestigationAfterEmptySearchCompletion(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	registry := tools.NewRegistry(staticSearchEvidenceTool{}, staticWebpageTool{})
+	completionCalls := 0
+	complete := func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		switch completionCalls {
+		case 1:
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "search-1", Type: "function", Function: protocol.ToolCallFunction{
+					Name: "web_search", Arguments: json.RawMessage(`{"query":"CCSwitch official repository"}`),
+				},
+			}}}, nil
+		case 2:
+			if !strings.Contains(request.Messages[len(request.Messages)-1].Content, "https://github.com/example/ccswitch") {
+				t.Fatalf("search evidence was not returned to the model: %+v", request.Messages)
+			}
+			return protocol.CompletionResult{}, nil
+		case 3:
+			last := request.Messages[len(request.Messages)-1]
+			if last.InternalKind != toolResultRecoveryKind || !strings.Contains(last.Content, "Continue investigating") {
+				t.Fatalf("first empty completion did not request further investigation: %+v", last)
+			}
+			if len(request.Tools) == 0 || request.ToolChoice == "none" {
+				t.Fatalf("tools were disabled before the model could verify the source: %+v", request)
+			}
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "page-1", Type: "function", Function: protocol.ToolCallFunction{
+					Name: "read_webpage", Arguments: json.RawMessage(`{"url":"https://github.com/example/ccswitch"}`),
+				},
+			}}}, nil
+		default:
+			if !strings.Contains(request.Messages[len(request.Messages)-1].Content, "Official configuration path") {
+				t.Fatalf("verified webpage evidence was not returned to the model: %+v", request.Messages)
+			}
+			return protocol.CompletionResult{Content: "已读取官方资料，接下来需要检查本机配置。"}, nil
+		}
+	}
+
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "检查我的 CCSwitch 配置"}},
+	}, complete, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completionCalls != 4 || !strings.Contains(outcome.Content, "已读取官方资料") || !hasSuccessfulWebpageRead(outcome.Parts) {
+		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
+	}
+}
+
+func TestToolLoopUsesToolFreeFinalSynthesisAfterRepeatedEmptyCompletion(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	registry := tools.NewRegistry(staticSearchEvidenceTool{})
+	completionCalls := 0
+	complete := func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		switch completionCalls {
+		case 1:
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "search-1", Type: "function", Function: protocol.ToolCallFunction{Name: "web_search", Arguments: json.RawMessage(`{}`)},
+			}}}, nil
+		case 2:
+			return protocol.CompletionResult{}, nil
+		case 3:
+			if len(request.Tools) == 0 || request.ToolChoice == "none" {
+				t.Fatalf("investigation tools were disabled on the first recovery request: %+v", request)
+			}
+			return protocol.CompletionResult{}, nil
+		default:
+			last := request.Messages[len(request.Messages)-1]
+			if request.ToolChoice != "none" || len(request.Tools) != 0 || last.InternalKind != toolResultRecoveryKind || !strings.Contains(last.Content, "Produce the final user-facing answer") {
+				t.Fatalf("final synthesis request is not tool-free: request=%+v last=%+v", request, last)
+			}
+			return protocol.CompletionResult{Content: "目前只有搜索候选，尚未读取本机配置，需要授权后继续。"}, nil
+		}
+	}
+
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "检查我的 CCSwitch 配置"}},
+	}, complete, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completionCalls != 4 || !strings.Contains(outcome.Content, "需要授权") {
+		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
+	}
+}
+
+func TestToolLoopFailsWhenFinalToolResultSynthesisIsEmpty(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	registry := tools.NewRegistry(staticSearchEvidenceTool{})
+	completionCalls := 0
+	complete := func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if completionCalls == 1 {
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "search-1", Type: "function", Function: protocol.ToolCallFunction{Name: "web_search", Arguments: json.RawMessage(`{}`)},
+			}}}, nil
+		}
+		return protocol.CompletionResult{}, nil
+	}
+
+	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "检查我的 CCSwitch 配置"}},
+	}, complete, nil)
+	if !errors.Is(err, errEmptyToolResultSynthesis) {
+		t.Fatalf("error=%v, want %v", err, errEmptyToolResultSynthesis)
+	}
+	if completionCalls != 4 || !hasWebSearchSources(outcome.Parts) {
+		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
+	}
+	if strings.Contains(outcome.Content, "CCSwitch official repository") || strings.Contains(outcome.Content, "https://github.com/example/ccswitch") {
+		t.Fatalf("raw search evidence became a successful answer: %q", outcome.Content)
 	}
 }
 
@@ -670,6 +904,9 @@ func TestWebSearchFallbackIncludesEverySource(t *testing.T) {
 		})
 	}
 	content := webSearchFallbackContent(tools.ResultPart{Kind: tools.PartWebSearch, Sources: sources})
+	if !strings.Contains(content, "本轮未完成最终分析") || !strings.Contains(content, "原始网络搜索记录") {
+		t.Fatalf("legacy migration must mark search-only content as incomplete: %s", content)
+	}
 	if !strings.Contains(content, "Source 7") || !strings.Contains(content, "https://example.com/source-7") {
 		t.Fatalf("fallback omitted later sources: %s", content)
 	}
@@ -715,9 +952,6 @@ func TestRepositoryReadFailureFallsBackToReadableRepositoryContent(t *testing.T)
 		if !strings.Contains(content, expected) {
 			t.Fatalf("repository fallback missing %q: %s", expected, content)
 		}
-	}
-	if empty := emptyToolCompletionContent(outcome.Parts); empty != content {
-		t.Fatalf("empty completion fallback differs from provider failure fallback:\nempty: %s\nerror: %s", empty, content)
 	}
 }
 
@@ -827,6 +1061,80 @@ func TestToolLoopEmitsAndPersistsTaskProgressWithDiffStats(t *testing.T) {
 	}
 }
 
+func TestToolLoopForwardsLiveStructuredToolOutput(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	registry := tools.NewRegistry(streamingProgressTool{})
+	completionCalls := 0
+	events := make([]ChatStreamEvent, 0, 5)
+	outcome, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "run probe"}},
+	}, func(_ context.Context, _ protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if completionCalls == 1 {
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "probe-call", Type: "function", Function: protocol.ToolCallFunction{Name: "stream_probe", Arguments: json.RawMessage(`{}`)},
+			}}}, nil
+		}
+		return protocol.CompletionResult{Content: "done"}, nil
+	}, func(event ChatStreamEvent) {
+		if event.Type == "tool" {
+			events = append(events, event)
+		}
+	})
+	if err != nil || outcome.Content != "done" {
+		t.Fatalf("outcome = %#v, err = %v", outcome, err)
+	}
+	if len(events) < 4 {
+		t.Fatalf("tool events = %#v, want start, two output updates, and completion", events)
+	}
+	for _, event := range events {
+		if event.ToolCallID != "probe-call" {
+			t.Fatalf("tool event lost call identity: %#v", event)
+		}
+	}
+	foundLiveOutput := false
+	foundWaiting := false
+	foundCompletedMetadata := false
+	for _, event := range events {
+		for _, part := range event.Parts {
+			foundWaiting = foundWaiting || (event.Status == "waiting" && part.Status == "waiting" && event.Message == "waiting for probe")
+			foundLiveOutput = foundLiveOutput || (event.Status == "running" && strings.Contains(part.Stdout, "second"))
+			foundCompletedMetadata = foundCompletedMetadata || (event.Status == "completed" && part.ExitCode != nil && part.CompletedAt != "" && part.DurationMs > 0)
+		}
+	}
+	if !foundWaiting || !foundLiveOutput || !foundCompletedMetadata {
+		t.Fatalf("waiting=%v live=%v completed=%v events=%#v", foundWaiting, foundLiveOutput, foundCompletedMetadata, events)
+	}
+}
+
+func TestToolLoopFeedsScreenshotAttachmentToNextModelCall(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	registry := tools.NewRegistry(imageAttachmentTool{})
+	completionCalls := 0
+	outcome, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "vision-model", Messages: []protocol.Message{{Role: "user", Content: "inspect the screenshot"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if completionCalls == 1 {
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "image-call", Type: "function", Function: protocol.ToolCallFunction{Name: "capture_image", Arguments: json.RawMessage(`{}`)},
+			}}}, nil
+		}
+		last := request.Messages[len(request.Messages)-1]
+		if last.Role != "tool" || last.ToolCallID != "image-call" || len(last.Attachments) != 1 {
+			t.Fatalf("screenshot was not attached to tool feedback: %#v", last)
+		}
+		attachment := last.Attachments[0]
+		if attachment.Name != "capture.png" || attachment.MIMEType != "image/png" || attachment.Data != "aGVsbG8=" {
+			t.Fatalf("attachment = %#v", attachment)
+		}
+		return protocol.CompletionResult{Content: "image inspected"}, nil
+	}, nil)
+	if err != nil || outcome.Content != "image inspected" || completionCalls != 2 {
+		t.Fatalf("outcome = %#v, calls = %d, err = %v", outcome, completionCalls, err)
+	}
+}
+
 func TestToolLoopPersistsSnapshotBeforeFinalCompletion(t *testing.T) {
 	workspace := t.TempDir()
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
@@ -891,6 +1199,97 @@ func TestToolLoopPersistsSnapshotBeforeFinalCompletion(t *testing.T) {
 	}
 	if _, err := os.Stat(generated); !os.IsNotExist(err) {
 		t.Fatalf("rewind 应删除失败轮次新建的文件，stat err=%v", err)
+	}
+}
+
+func TestToolLoopFallsBackWithoutToolsForExplicitCompatibilityError(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	toolCalls := 0
+	completionCalls := 0
+	var events []ChatStreamEvent
+	registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls})
+	outcome, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "answer even without tools"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		switch completionCalls {
+		case 1:
+			if len(request.Tools) == 0 || request.ToolChoice == "none" {
+				t.Fatal("initial request did not expose the registered tools")
+			}
+			return protocol.CompletionResult{}, protocol.NewProviderError(protocol.ProviderErrorInfo{
+				HTTPStatus: http.StatusBadRequest,
+				Type:       "invalid_request_error",
+				Code:       "unknown_parameter",
+				Message:    `Unknown parameter: "tools"`,
+			})
+		case 2:
+			if len(request.Tools) != 0 || request.ToolChoice != "none" {
+				t.Fatalf("compatibility retry still exposed tools: %#v", request)
+			}
+			return protocol.CompletionResult{Content: "plain response"}, nil
+		default:
+			t.Fatalf("unexpected completion call %d", completionCalls)
+			return protocol.CompletionResult{}, nil
+		}
+	}, func(event ChatStreamEvent) { events = append(events, event) })
+	if err != nil || outcome.Content != "plain response" || completionCalls != 2 || toolCalls != 0 {
+		t.Fatalf("outcome=%#v calls=%d toolCalls=%d err=%v", outcome, completionCalls, toolCalls, err)
+	}
+	foundNotice := false
+	for _, event := range events {
+		if event.Status == "retrying" && strings.Contains(event.Message, "不支持工具调用") {
+			foundNotice = true
+			break
+		}
+	}
+	if !foundNotice {
+		t.Fatalf("tool compatibility downgrade was not observable: %#v", events)
+	}
+}
+
+func TestToolLoopDoesNotDisableToolsForUnrelatedInitialErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF},
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "policy", err: protocol.NewProviderError(protocol.ProviderErrorInfo{
+			HTTPStatus: http.StatusInternalServerError,
+			Type:       "invalid_request",
+			Code:       "cyber_policy",
+			Message:    "request blocked by policy",
+		})},
+		{name: "unrelated bad request", err: protocol.NewProviderError(protocol.ProviderErrorInfo{
+			HTTPStatus: http.StatusBadRequest,
+			Type:       "invalid_request_error",
+			Code:       "invalid_prompt",
+			Message:    "prompt is invalid",
+		})},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+			toolCalls := 0
+			completionCalls := 0
+			registry := tools.NewRegistry(cycleProbeTool{calls: &toolCalls})
+			_, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+				Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "run a tool"}},
+			}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+				completionCalls++
+				if len(request.Tools) == 0 || request.ToolChoice == "none" {
+					t.Fatal("initial failure was incorrectly retried with tools disabled")
+				}
+				return protocol.CompletionResult{}, test.err
+			}, nil)
+			if err == nil {
+				t.Fatal("initial provider failure was swallowed")
+			}
+			if completionCalls != 1 || toolCalls != 0 {
+				t.Fatalf("completionCalls=%d toolCalls=%d err=%v", completionCalls, toolCalls, err)
+			}
+		})
 	}
 }
 
@@ -1075,6 +1474,138 @@ func TestToolLoopGuardStopsAfterSecretCapture(t *testing.T) {
 	}}}, &protocol.Message{})
 	if !guard.objectiveSatisfied || !guard.forceFinalResponse {
 		t.Fatalf("secret capture did not close discovery: %#v", guard)
+	}
+}
+
+func TestToolLoopGuardBlocksSecondEquivalentFailureBeforeExecution(t *testing.T) {
+	guard := toolLoopGuard{turnIndex: 1, resolvedFailures: map[string]bool{}, blockedFailures: map[string]int{}}
+	arguments := []json.RawMessage{
+		json.RawMessage(`{"command":"deploy --target \"D:\\Site\""}`),
+		json.RawMessage(`{"command":"deploy --target 'D:\\Site'"}`),
+		json.RawMessage(`{"command":"deploy --target D:\\Site"}`),
+	}
+	first := protocol.ToolCall{ID: "failed-1", Function: protocol.ToolCallFunction{Name: "run_command", Arguments: arguments[0]}}
+	message := protocol.Message{Role: "tool", Content: "Access is denied."}
+	guard.after(first, tools.Result{
+		Summary: "$ deploy\nexit code 1", IsError: true,
+		Parts: []tools.ResultPart{{Kind: tools.PartToolCall, Name: "run_command", Status: "error", Output: "Access is denied."}},
+	}, &message)
+	if guard.forceFinalResponse || !strings.Contains(message.Content, "mhcode_tool_retry_diagnostic") {
+		t.Fatalf("first failure diagnosis = force:%v message:%q", guard.forceFinalResponse, message.Content)
+	}
+
+	second := protocol.ToolCall{ID: "failed-2", Function: protocol.ToolCallFunction{Name: "run_command", Arguments: arguments[1]}}
+	result, toolMessage, blocked, hidden := guard.before(second)
+	if !blocked || hidden || !result.IsError || guard.forceFinalResponse {
+		t.Fatalf("second equivalent retry = blocked:%v hidden:%v force:%v result:%#v", blocked, hidden, guard.forceFinalResponse, result)
+	}
+	if !strings.Contains(toolMessage.Content, "blocked_equivalent_retry") || !strings.Contains(toolMessage.Content, "必须先发生实质变化") {
+		t.Fatalf("blocked retry diagnosis = %q", toolMessage.Content)
+	}
+
+	third := protocol.ToolCall{ID: "failed-3", Function: protocol.ToolCallFunction{Name: "run_command", Arguments: arguments[2]}}
+	_, _, blocked, _ = guard.before(third)
+	if !blocked || !guard.forceFinalResponse {
+		t.Fatalf("repeated blocked retry did not stop the loop: %#v", guard)
+	}
+}
+
+func TestToolLoopSwitchesFromFailedShellToStructuredOfficeTool(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	service.runtimeSettings.ApprovalPolicy = "never"
+	shellCalls := 0
+	officeCalls := 0
+	registry := tools.NewRegistry(
+		deterministicFailureTool{calls: &shellCalls},
+		namedSuccessTool{name: "spreadsheet_inspect", calls: &officeCalls},
+	)
+	completionCalls := 0
+	outcome, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "repair report.xlsx"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		switch completionCalls {
+		case 1:
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "shell-1", Function: protocol.ToolCallFunction{Name: "run_command", Arguments: json.RawMessage(`{"command":"python -c \"repair('report.xlsx')\""}`)},
+			}}}, nil
+		case 2:
+			last := request.Messages[len(request.Messages)-1].Content
+			if !strings.Contains(last, "spreadsheet_inspect") || !strings.Contains(last, "change_strategy_before_retry") {
+				t.Fatalf("first failure did not recommend structured Office tools: %s", last)
+			}
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "shell-2", Function: protocol.ToolCallFunction{Name: "run_command", Arguments: json.RawMessage(`{"command":"python -c 'repair(\"report.xlsx\")'"}`)},
+			}}}, nil
+		case 3:
+			last := request.Messages[len(request.Messages)-1].Content
+			if !strings.Contains(last, "blocked_equivalent_retry") {
+				t.Fatalf("equivalent retry was not blocked before execution: %s", last)
+			}
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "office-1", Function: protocol.ToolCallFunction{Name: "spreadsheet_inspect", Arguments: json.RawMessage(`{"path":"report.xlsx"}`)},
+			}}}, nil
+		default:
+			return protocol.CompletionResult{Content: "switched to structured inspection"}, nil
+		}
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shellCalls != 1 || officeCalls != 1 || completionCalls != 4 {
+		t.Fatalf("calls: shell=%d office=%d completion=%d", shellCalls, officeCalls, completionCalls)
+	}
+	if outcome.Content != "switched to structured inspection" {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+}
+
+func TestToolLoopStopsProviderThatKeepsRepeatingBlockedFailure(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	service.runtimeSettings.ApprovalPolicy = "never"
+	shellCalls := 0
+	registry := tools.NewRegistry(deterministicFailureTool{calls: &shellCalls})
+	completionCalls := 0
+	outcome, err := service.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
+		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "run the failing command"}},
+	}, func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+		completionCalls++
+		if request.ToolChoice == "none" {
+			return protocol.CompletionResult{Content: "The original strategy is blocked; no safe alternative was available."}, nil
+		}
+		return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+			ID: fmt.Sprintf("repeat-%d", completionCalls),
+			Function: protocol.ToolCallFunction{
+				Name:      "run_command",
+				Arguments: json.RawMessage(`{"command":"python -c \"broken('report.xlsx')\""}`),
+			},
+		}}}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shellCalls != 1 || completionCalls != 4 {
+		t.Fatalf("repeating provider was not stopped: shell=%d completion=%d", shellCalls, completionCalls)
+	}
+	if !strings.Contains(outcome.Content, "strategy is blocked") {
+		t.Fatalf("safe final response = %q", outcome.Content)
+	}
+}
+
+func TestToolLoopGuardDoesNotMergeDifferentFailedOperations(t *testing.T) {
+	guard := toolLoopGuard{}
+	for index, target := range []string{"one", "two", "three", "four"} {
+		rawArgs, _ := json.Marshal(map[string]string{"command": "deploy --target " + target})
+		message := protocol.Message{}
+		guard.after(protocol.ToolCall{
+			ID:       fmt.Sprintf("failed-%d", index),
+			Function: protocol.ToolCallFunction{Name: "run_command", Arguments: rawArgs},
+		}, tools.Result{IsError: true, Parts: []tools.ResultPart{{
+			Kind: tools.PartToolCall, Name: "run_command", Status: "error", Output: "Access is denied.",
+		}}}, &message)
+	}
+	if guard.forceFinalResponse {
+		t.Fatal("different operations were incorrectly treated as one repeated failure")
 	}
 }
 

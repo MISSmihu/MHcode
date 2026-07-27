@@ -22,6 +22,9 @@ func EmitProgress(ctx context.Context, part ResultPart) {
 	if ctx == nil {
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	sink, _ := ctx.Value(progressSinkKey{}).(ProgressSink)
 	if sink != nil {
 		sink(part)

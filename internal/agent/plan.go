@@ -185,7 +185,7 @@ func (s *Service) runPlanPhase(
 	route chatRoute,
 	sink ChatEventSink,
 ) (string, toolLoopOutcome, error) {
-	reg := s.buildReadOnlyRegistry()
+	reg := s.buildReadOnlyRegistryForContext(ctx)
 
 	planReq := baseRequest
 	planReq.Metadata = make(map[string]string, len(baseRequest.Metadata)+1)

@@ -197,13 +197,75 @@ func compressProtocolMessages(messages []protocol.Message, budget contextBudget)
 	result = append(result, messages[0])
 	start := 1
 	existingSummary := ""
-	if len(messages) > 1 && messages[1].InternalKind == contextSummaryKind {
-		existingSummary = messages[1].Content
-		start = 2
+	existingArtifacts := ""
+	existingFailures := ""
+	existingExecution := ""
+	for start < len(messages) {
+		switch messages[start].InternalKind {
+		case contextSummaryKind:
+			existingSummary = messages[start].Content
+		case contextArtifactKind:
+			existingArtifacts = messages[start].Content
+		case contextFailureStrategyKind:
+			existingFailures = messages[start].Content
+		case contextExecutionKind:
+			existingExecution = messages[start].Content
+		default:
+			goto internalMessagesRead
+		}
+		start++
 	}
+
+internalMessagesRead:
 	body := cloneProtocolMessages(messages[start:])
+	filteredBody := make([]protocol.Message, 0, len(body))
+	removedFailureContexts := 0
+	removedExecutionContexts := 0
+	latestRequestContext := -1
+	for index := range body {
+		if body[index].InternalKind == contextRequestKind {
+			latestRequestContext = index
+		}
+	}
+	removedRequestContexts := 0
+	for index, message := range body {
+		if message.InternalKind == contextFailureStrategyKind {
+			existingFailures = message.Content
+			removedFailureContexts++
+			continue
+		}
+		if message.InternalKind == contextRequestKind && index != latestRequestContext {
+			removedRequestContexts++
+			continue
+		}
+		if message.InternalKind == contextExecutionKind {
+			existingExecution = message.Content
+			removedExecutionContexts++
+			continue
+		}
+		if message.Role == "assistant" {
+			if checkpoint := extractExecutionCheckpoint(message.Content); checkpoint != "" {
+				existingExecution = checkpoint
+				message.Content = stripExecutionCheckpoint(message.Content)
+			}
+		}
+		filteredBody = append(filteredBody, message)
+	}
+	body = filteredBody
 	if len(body) == 0 {
-		return result, 0
+		if existingSummary != "" {
+			result = append(result, protocol.Message{Role: "system", Content: existingSummary, InternalKind: contextSummaryKind})
+		}
+		if references := recentLocalArtifactReferences(existingArtifacts); len(references) > 0 {
+			result = append(result, protocol.Message{Role: "system", Content: formatLocalArtifactContext(references, artifactContextRuneBudget(budget)), InternalKind: contextArtifactKind})
+		}
+		if strings.TrimSpace(existingFailures) != "" {
+			result = append(result, protocol.Message{Role: "system", Content: existingFailures, InternalKind: contextFailureStrategyKind})
+		}
+		if strings.TrimSpace(existingExecution) != "" {
+			result = append(result, protocol.Message{Role: "user", Content: existingExecution, InternalKind: contextExecutionKind})
+		}
+		return result, removedFailureContexts + removedRequestContexts + removedExecutionContexts
 	}
 	groups := groupProtocolMessages(body)
 
@@ -225,7 +287,7 @@ func compressProtocolMessages(messages []protocol.Message, budget contextBudget)
 
 	oldMessages := flattenProtocolMessageGroups(groups[:tailStart])
 	recentMessages := flattenProtocolMessageGroups(groups[tailStart:])
-	removed := len(oldMessages)
+	removed := len(oldMessages) + removedFailureContexts + removedRequestContexts + removedExecutionContexts
 	if existingSummary != "" || len(oldMessages) > 0 {
 		summaryTokens := budget.TargetTokens / 4
 		if summaryTokens < 512 {
@@ -240,10 +302,47 @@ func compressProtocolMessages(messages []protocol.Message, budget contextBudget)
 			InternalKind: contextSummaryKind,
 		})
 	}
+	artifactContents := make([]string, 0, len(body)+1)
+	artifactContents = append(artifactContents, existingArtifacts)
+	for _, message := range body {
+		artifactContents = append(artifactContents, message.Content)
+	}
+	if references := recentLocalArtifactReferences(artifactContents...); len(references) > 0 {
+		result = append(result, protocol.Message{
+			Role:         "system",
+			Content:      formatLocalArtifactContext(references, artifactContextRuneBudget(budget)),
+			InternalKind: contextArtifactKind,
+		})
+	}
+	if strings.TrimSpace(existingFailures) != "" {
+		result = append(result, protocol.Message{
+			Role:         "system",
+			Content:      existingFailures,
+			InternalKind: contextFailureStrategyKind,
+		})
+	}
+	if strings.TrimSpace(existingExecution) != "" {
+		result = append(result, protocol.Message{
+			Role:         "user",
+			Content:      existingExecution,
+			InternalKind: contextExecutionKind,
+		})
+	}
 	result = append(result, recentMessages...)
 
 	clipProtocolMessagesToBudget(result, budget.TargetTokens)
 	return result, removed
+}
+
+func artifactContextRuneBudget(budget contextBudget) int {
+	limit := budget.TargetTokens * 3 / 5
+	if limit < 750 {
+		return 750
+	}
+	if limit > 6_000 {
+		return 6_000
+	}
+	return limit
 }
 
 func groupProtocolMessages(messages []protocol.Message) [][]protocol.Message {
@@ -286,6 +385,14 @@ func clipProtocolMessagesToBudget(messages []protocol.Message, targetTokens int)
 		}
 		for index := 1; index < len(messages); index++ {
 			message := &messages[index]
+			if message.InternalKind == contextRequestKind {
+				message.Content = clipDelimitedContext(message.Content, requestContextStart, requestContextEnd, maxRunes)
+				continue
+			}
+			if message.InternalKind == contextExecutionKind {
+				message.Content = clipDelimitedContext(message.Content, executionContextStart, executionContextEnd, maxRunes)
+				continue
+			}
 			if message.InternalKind == contextSummaryKind || message.Role == "tool" || (message.Role == "assistant" && len(message.ToolCalls) == 0) {
 				message.Content = clipContextText(message.Content, maxRunes)
 			}
@@ -301,15 +408,18 @@ func buildContextSummary(existing string, messages []protocol.Message, maxTokens
 	var lines []string
 	lines = append(lines, "[MHcode compressed conversation memory]")
 	if strings.TrimSpace(existing) != "" {
-		memory := strings.TrimPrefix(existing, "[MHcode compressed conversation memory]")
+		memory := strings.TrimPrefix(stripPrivateAssistantContext(existing), "[MHcode compressed conversation memory]")
 		lines = append(lines, "Previous memory: "+compactContextLine(memory, maxRunes/3))
 	}
 	for _, message := range messages {
+		if message.InternalKind == contextRequestKind || message.InternalKind == contextExecutionKind {
+			continue
+		}
 		role := message.Role
 		if role == "tool" && message.Name != "" {
 			role = "tool:" + message.Name
 		}
-		line := role + ": " + compactContextLine(message.Content, 1_200)
+		line := role + ": " + compactContextLine(stripPrivateAssistantContext(message.Content), 1_200)
 		if len(message.Attachments) > 0 {
 			names := make([]string, 0, len(message.Attachments))
 			for _, attachment := range message.Attachments {

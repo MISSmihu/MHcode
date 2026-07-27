@@ -8,12 +8,14 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/MISSmihu/MHcode/internal/artifacts"
 	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
 const (
 	maxWorkspacePreviewFileBytes = 16 << 20
+	maxArtifactPreviewFileBytes  = 64 << 20
 	maxWorkspacePreviewBytes     = 2 << 20
 	maxWorkspacePreviewLines     = 5000
 	maxWorkspaceDirectoryEntries = 1000
@@ -30,6 +32,7 @@ type WorkspaceFilePreview struct {
 	Truncated  bool   `json:"truncated"`
 	Binary     bool   `json:"binary"`
 	TooLarge   bool   `json:"tooLarge"`
+	Artifact   *artifacts.Preview `json:"artifact,omitempty"`
 }
 
 type WorkspaceDirectoryListing struct {
@@ -188,6 +191,28 @@ func (s *Service) ReadWorkspaceFile(path string) (WorkspaceFilePreview, error) {
 		Path: displayPath,
 		Name: filepath.Base(abs),
 		Size: info.Size(),
+	}
+	if _, _, supported := artifacts.Detect(abs); supported {
+		preview.Binary = true
+		if info.Size() > maxArtifactPreviewFileBytes {
+			preview.Truncated = true
+			preview.TooLarge = true
+			return preview, nil
+		}
+		artifact, artifactErr := artifacts.PreviewFile(abs, artifacts.DefaultPreviewOptions())
+		if artifactErr != nil {
+			return WorkspaceFilePreview{}, fmt.Errorf("读取办公产物失败: %w", artifactErr)
+		}
+		preview.Artifact = &artifact
+		switch artifact.Kind {
+		case artifacts.KindDocument:
+			preview.Truncated = artifact.Document != nil && artifact.Document.Truncated
+		case artifacts.KindSpreadsheet:
+			preview.Truncated = artifact.Spreadsheet != nil && artifact.Spreadsheet.Truncated
+		case artifacts.KindPresentation:
+			preview.Truncated = artifact.Presentation != nil && artifact.Presentation.Truncated
+		}
+		return preview, nil
 	}
 	if info.Size() > maxWorkspacePreviewFileBytes {
 		preview.Truncated = true

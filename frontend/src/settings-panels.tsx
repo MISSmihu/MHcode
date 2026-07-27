@@ -5,7 +5,7 @@ import { Portal } from "solid-js/web";
 import {
   AlertTriangle, Archive, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Bot, Braces,
   Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Command, Cpu, Database, Download, ExternalLink, Eye, FileCode2, FileText,
-  Folder, FolderOpen, Gauge, GitBranch, Globe2, Hash, HardDrive, Keyboard, KeyRound, LayoutList,
+  Blocks, Folder, FolderOpen, Gauge, GitBranch, Globe2, Hash, HardDrive, Keyboard, KeyRound, LayoutList,
   ListFilter, LockKeyhole, MessageSquarePlus, Monitor, Moon, Network, Palette, Plug,
   Play, Plus, RefreshCw, Save, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles,
   Square, Sun, Terminal, Trash2, User, WrapText, Wrench, X, Zap,
@@ -19,6 +19,7 @@ import type {
   DeepSeekSessionState,
   MCPServerSetting,
   ModelProviderSetting,
+  OpenSourceLicense,
   ProjectNode,
   ReasoningLevel,
   RuntimeSettings,
@@ -47,9 +48,9 @@ import {
 } from "./format";
 import { inferModelContextWindow, contextWindowSourceLabel } from "./model-context";
 import {
-  browserClearData, checkForUpdates, deleteAutomationTask, deleteBrowserCredential, downloadUpdate, getAppInfo,
+  browserClearData, checkForUpdates, deleteAutomationTask, deleteBrowserCredential, downloadUpdate, getAppInfo, getOpenSourceLicenses,
   getAutomationState, getUpdateState, installUpdate, onAutomationState, onUpdateState, openAppRepositoryPage,
-  openUpdateReleasePage, revealAppConfigFile, revealAppExecutable, runAutomationTaskNow, saveAutomationTask,
+  openUpdateReleasePage, openURLInSystemBrowser, revealAppConfigFile, revealAppExecutable, runAutomationTaskNow, saveAutomationTask,
   saveBrowserCredential, setAutomationTaskEnabled, stopAutomationTask, openSkillFile, readSkillDetail, revealSkillFile,
 } from "./services/workbench";
 import type { ConfirmationRequest } from "./components/ConfirmDialog";
@@ -92,6 +93,12 @@ export type SettingsCenterProps = {
   profile: WorkbenchState["reasoning"];
   refreshMCPServer: (serverID: string) => Promise<void> | void;
   refreshingMCPID: string;
+	plugins: WorkbenchState["plugins"];
+	pluginBusy: string;
+	installPlugin: () => Promise<void> | void;
+	refreshPlugins: () => Promise<void> | void;
+	revealPlugin: (id: string) => Promise<void> | void;
+	uninstallPlugin: (id: string) => Promise<void> | void;
   providerKeyDrafts: Record<string, string>;
   reasoningOptions: WorkbenchState["reasoningOptions"];
   runtimeDraft: RuntimeSettings;
@@ -224,6 +231,23 @@ export function SettingsCenter(props: SettingsCenterProps) {
               updateRuntimeDraft={props.updateRuntimeDraft}
             />
           </Match>
+			<Match when={props.activeCategory === "plugins"}>
+				<PluginSettingsPanel
+					confirmAction={props.confirmAction}
+					installPlugin={props.installPlugin}
+					pluginBusy={props.pluginBusy}
+					plugins={props.plugins}
+					refreshPlugins={props.refreshPlugins}
+					resetRuntimeDraft={props.resetRuntimeDraft}
+					revealPlugin={props.revealPlugin}
+					runtimeDirty={props.runtimeDirty}
+					runtimeDraft={props.runtimeDraft}
+					saveRuntime={props.saveRuntime}
+					savingRuntime={props.savingRuntime}
+					uninstallPlugin={props.uninstallPlugin}
+					updateRuntimeDraft={props.updateRuntimeDraft}
+				/>
+			</Match>
           <Match when={props.activeCategory === "browser"}>
             <BrowserSettingsPanel
               confirmAction={props.confirmAction}
@@ -2208,6 +2232,8 @@ function builtinToolDescription(name: string): string {
     case "delete_file": return "删除文本文件并记录 rewind 快照";
     case "open_file": return "使用内置预览或系统应用打开文件";
     case "read_repository": return "读取真实 Git 仓库树和源码";
+	case "download_file": return "下载 HTTP(S) 文件并原子保存为会话产物";
+	case "git_repository": return "结构化 clone、fetch 或 pull 真实本地仓库";
     case "web_search": return "联网搜索并保留来源链接";
     case "browser": return "操作 MHcode 内置浏览器";
     case "computer": return "操作获准的其他桌面窗口";
@@ -2241,6 +2267,218 @@ function mcpStatusTone(state?: string): "good" | "bad" | "watch" | "neutral" {
     case "idle": return "watch";
     default: return "neutral";
   }
+}
+
+function pluginStatusLabel(state?: string) {
+	switch (state) {
+		case "ready": return "可用";
+		case "error": return "加载失败";
+		case "disabled": return "已停用";
+		case "unavailable": return "不可用";
+		default: return "等待刷新";
+	}
+}
+
+function pluginStatusTone(state?: string): "good" | "bad" | "watch" | "neutral" {
+	switch (state) {
+		case "ready": return "good";
+		case "error": return "bad";
+		case "unavailable": return "watch";
+		default: return "neutral";
+	}
+}
+
+const pluginPermissionRows = [
+	{key: "fileRead", label: "读取工作区文件", description: "插件可读取当前工作区和额外授权目录中的文件"},
+	{key: "fileWrite", label: "修改工作区文件", description: "写入仍受沙箱路径与 Agent 审批策略约束"},
+	{key: "network", label: "网络访问", description: "同时要求环境设置中的网络访问已开启"},
+] as const;
+
+export function PluginSettingsPanel(props: {
+	confirmAction: (request: ConfirmationRequest) => Promise<boolean>;
+	installPlugin: () => Promise<void> | void;
+	pluginBusy: string;
+	plugins: WorkbenchState["plugins"];
+	refreshPlugins: () => Promise<void> | void;
+	resetRuntimeDraft: () => void;
+	revealPlugin: (id: string) => Promise<void> | void;
+	runtimeDirty: boolean;
+	runtimeDraft: RuntimeSettings;
+	saveRuntime: () => void;
+	savingRuntime: boolean;
+	uninstallPlugin: (id: string) => Promise<void> | void;
+	updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
+}) {
+	const [activePluginID, setActivePluginID] = createSignal(props.plugins[0]?.id || "office-artifacts");
+	createEffect(() => {
+		if (!props.plugins.some((plugin) => plugin.id === activePluginID())) {
+			setActivePluginID(props.plugins[0]?.id || "");
+		}
+	});
+	const activePlugin = createMemo(() => props.plugins.find((plugin) => plugin.id === activePluginID()));
+	const pluginSetting = (id: string) => props.runtimeDraft.plugins.entries.find((entry) => entry.id === id);
+	const updatePluginSetting = (id: string, patch: Partial<RuntimeSettings["plugins"]["entries"][number]>) => {
+		const current = pluginSetting(id) ?? {
+			id,
+			enabled: false,
+			permissions: {fileRead: false, fileWrite: false, network: false},
+		};
+		const entries = props.runtimeDraft.plugins.entries.filter((entry) => entry.id !== id);
+		entries.push({...current, ...patch, id});
+		entries.sort((left, right) => left.id.localeCompare(right.id));
+		props.updateRuntimeDraft({plugins: {...props.runtimeDraft.plugins, entries}});
+	};
+	const updatePermission = (id: string, key: keyof RuntimeSettings["plugins"]["entries"][number]["permissions"], value: boolean) => {
+		const current = pluginSetting(id) ?? {
+			id,
+			enabled: false,
+			permissions: {fileRead: false, fileWrite: false, network: false},
+		};
+		updatePluginSetting(id, {permissions: {...current.permissions, [key]: value}});
+	};
+	const permissionSummary = (plugin: WorkbenchState["plugins"][number]) => {
+		const granted = pluginSetting(plugin.id)?.permissions ?? plugin.grantedPermissions;
+		const count = pluginPermissionRows.filter((row) => plugin.permissions[row.key] && granted[row.key]).length;
+		const total = pluginPermissionRows.filter((row) => plugin.permissions[row.key]).length;
+		return `${count}/${total} 项权限`;
+	};
+
+	return (
+		<div class="settings-page-body plugin-settings-page">
+			<SettingsSection
+				class="plugin-list-section"
+				title="已发现插件"
+				action={
+					<div class="settings-row-actions">
+						<IconButton title="刷新插件目录" disabled={Boolean(props.pluginBusy)} onClick={() => void props.refreshPlugins()}>
+							<RefreshCw size={14} classList={{spinning: props.pluginBusy === "refresh"}} />
+						</IconButton>
+						<IconButton title="安装本地插件" disabled={Boolean(props.pluginBusy)} onClick={() => void props.installPlugin()}>
+							<Plus size={15} />
+						</IconButton>
+					</div>
+				}
+			>
+				<div class="plugin-list">
+					<For each={props.plugins} fallback={<p class="settings-empty-box">尚未发现插件</p>}>
+						{(plugin) => (
+							<button
+								class="plugin-list-option"
+								classList={{active: activePluginID() === plugin.id}}
+								type="button"
+								onClick={() => setActivePluginID(plugin.id)}
+							>
+								<span class="plugin-mark"><Blocks size={15} /></span>
+								<span class="plugin-list-copy">
+									<strong>{plugin.name}</strong>
+									<small>{plugin.source === "builtin" ? "MHcode 内置" : "本地安装"} · {plugin.version}</small>
+								</span>
+								<span class={`plugin-state-dot ${plugin.state}`} title={pluginStatusLabel(plugin.state)} />
+							</button>
+						)}
+					</For>
+				</div>
+			</SettingsSection>
+
+			<SettingsSection class="plugin-detail-section" title="插件详情">
+				<Show when={activePlugin()} fallback={<p class="settings-empty-box">选择插件后查看详情</p>}>
+					{(plugin) => {
+						const setting = () => pluginSetting(plugin().id);
+						return (
+							<div class="plugin-detail">
+								<div class="plugin-detail-head">
+									<div>
+										<strong>{plugin().name}</strong>
+										<span>{plugin().description}</span>
+									</div>
+									<div class="settings-row-actions">
+										<StatusPill
+											icon={plugin().state === "ready" ? <CheckCircle2 size={13} /> : <Blocks size={13} />}
+											label={pluginStatusLabel(plugin().state)}
+											tone={pluginStatusTone(plugin().state)}
+										/>
+										<SwitchControl
+											checked={Boolean(setting()?.enabled)}
+											label={`启用 ${plugin().name}`}
+											onChange={(enabled) => updatePluginSetting(plugin().id, {enabled})}
+										/>
+									</div>
+								</div>
+								<div class="plugin-runtime-message" classList={{error: plugin().state === "error"}}>
+									<span>{plugin().message}</span>
+									<code>{plugin().availableToolCount}/{plugin().toolCount} tools</code>
+								</div>
+
+								<SettingsCard>
+									<SettingsRow title="来源" description={plugin().source === "builtin" ? "随 MHcode 提供的受控工作进程" : plugin().path || "MHcode 插件目录"} control={<span class="settings-muted-value">{plugin().source === "builtin" ? "内置" : "已安装"}</span>} />
+									<SettingsRow title="开发者" description={`${plugin().author || "未知"} · Manifest v${plugin().manifestSchema} · ABI ${plugin().protocolVersion}`} control={<span class="settings-muted-value">{plugin().id}</span>} />
+								</SettingsCard>
+
+								<div class="plugin-subsection-head">
+									<strong>权限</strong>
+									<span>{permissionSummary(plugin())}</span>
+								</div>
+								<SettingsCard>
+									<For each={pluginPermissionRows.filter((row) => plugin().permissions[row.key])}>
+										{(permission) => (
+											<SettingsRow
+												title={permission.label}
+												description={permission.description}
+												control={<SwitchControl checked={Boolean(setting()?.permissions?.[permission.key])} label={permission.label} onChange={(value) => updatePermission(plugin().id, permission.key, value)} />}
+											/>
+										)}
+									</For>
+								</SettingsCard>
+
+								<div class="plugin-subsection-head">
+									<strong>Agent 工具</strong>
+									<span>{plugin().toolCount} 个声明</span>
+								</div>
+								<div class="plugin-tool-list">
+									<For each={plugin().tools} fallback={<p class="settings-empty-box">刷新桌面运行时后显示工具明细</p>}>
+										{(tool) => (
+											<div class="plugin-tool-row">
+												<span classList={{mutating: !tool.readOnly}}>{tool.readOnly ? <Eye size={13} /> : <Save size={13} />}</span>
+												<div>
+													<strong>{tool.name}</strong>
+													<small>{tool.description}</small>
+												</div>
+												<code>{tool.readOnly ? "只读" : "需审批"}</code>
+											</div>
+										)}
+									</For>
+								</div>
+
+								<Show when={plugin().source === "installed"}>
+									<div class="plugin-actions">
+										<button class="settings-soft-button" type="button" disabled={Boolean(props.pluginBusy)} onClick={() => void props.revealPlugin(plugin().id)}><FolderOpen size={14} />打开目录</button>
+										<button
+											class="settings-danger-button"
+											type="button"
+											disabled={Boolean(props.pluginBusy)}
+											onClick={async () => {
+												const confirmed = await props.confirmAction({title: "卸载插件？", message: `“${plugin().name}”将从 MHcode 插件目录中删除。`, detail: "插件配置会同步移除；项目文件不会被删除。", confirmLabel: "卸载", tone: "danger"});
+												if (confirmed) void props.uninstallPlugin(plugin().id);
+											}}
+										><Trash2 size={14} />卸载插件</button>
+									</div>
+								</Show>
+							</div>
+						);
+					}}
+				</Show>
+			</SettingsSection>
+
+			<SettingsSection class="plugin-host-section" title="运行边界">
+				<SettingsCard>
+					<SettingsRow title="单次执行超时" description="超时或停止会话时，MHcode 会终止插件进程树" control={<div class="settings-row-stack"><input class="settings-input row-control numeric" type="number" min="5" max="3600" value={props.runtimeDraft.plugins.maxExecutionSeconds} onInput={(event) => props.updateRuntimeDraft({plugins: {...props.runtimeDraft.plugins, maxExecutionSeconds: Number(event.currentTarget.value)}})} /><span class="settings-muted-value">秒</span></div>} />
+					<SettingsRow title="输出上限" description="限制单条 JSON-RPC 响应进入 Agent 上下文的大小" control={<select class="settings-select" value={props.runtimeDraft.plugins.maxOutputBytes} onChange={(event) => props.updateRuntimeDraft({plugins: {...props.runtimeDraft.plugins, maxOutputBytes: Number(event.currentTarget.value)}})}><option value={262144}>256 KB</option><option value={1048576}>1 MB</option><option value={4194304}>4 MB</option><option value={16777216}>16 MB</option></select>} />
+				</SettingsCard>
+				<p class="plugin-security-note"><ShieldCheck size={14} />第三方插件是已安装的可信组件。MHcode 提供进程树终止、资源上限、权限声明和路径校验，但当前 Windows 沙箱不承诺完整的文件系统或网络隔离。</p>
+				<RuntimeSaveActions dirty={props.runtimeDirty} reset={props.resetRuntimeDraft} save={props.saveRuntime} saving={props.savingRuntime} />
+			</SettingsSection>
+		</div>
+	);
 }
 
 export function McpSettingsPanel(props: {
@@ -2971,6 +3209,34 @@ export function ComputerControlSettingsPanel(props: {
             control={<SwitchControl checked={props.runtimeDraft.allowDestructiveOps} onChange={(value) => props.updateRuntimeDraft({ allowDestructiveOps: value })} />}
           />
           <SettingsRow
+            title="工具执行超时"
+            description="任何单个 Agent 工具允许运行的最长时间；超时后会取消当前工具并忽略迟到结果"
+            control={
+              <input
+                class="settings-input numeric"
+                type="number"
+                min="5"
+                max="3600"
+                value={props.runtimeDraft.toolTimeoutSeconds}
+                onInput={(event) => props.updateRuntimeDraft({ toolTimeoutSeconds: Number(event.currentTarget.value) })}
+              />
+            }
+          />
+          <SettingsRow
+            title="任务空闲超时"
+            description="模型、工具或子任务持续没有任何活动时结束本轮，避免会话永久显示运行中"
+            control={
+              <input
+                class="settings-input numeric"
+                type="number"
+                min="15"
+                max="7200"
+                value={props.runtimeDraft.taskIdleTimeoutSeconds}
+                onInput={(event) => props.updateRuntimeDraft({ taskIdleTimeoutSeconds: Number(event.currentTarget.value) })}
+              />
+            }
+          />
+          <SettingsRow
             title="命令超时"
             description="单个命令允许运行的最长时间"
             control={
@@ -3008,6 +3274,8 @@ export function CommandSettingsPanel(props: {
           items={[
             ["Shell", props.runtimeDraft.shellAccess ? "允许" : "关闭"],
             ["网络", props.runtimeDraft.networkAccess ? "允许" : "关闭"],
+            ["工具超时", `${props.runtimeDraft.toolTimeoutSeconds}s`],
+            ["任务空闲", `${props.runtimeDraft.taskIdleTimeoutSeconds}s`],
             ["命令超时", `${props.runtimeDraft.maxCommandSeconds}s`],
             ["内存上限", `${props.runtimeDraft.maxCommandMemoryMb} MB`],
             ["进程上限", `${props.runtimeDraft.maxCommandProcesses}`],
@@ -3516,6 +3784,7 @@ export function AboutSettingsPanel(props: {
   updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
 }) {
   const [info, setInfo] = createSignal<AppInfo>();
+  const [licenses, setLicenses] = createSignal<OpenSourceLicense[]>([]);
   const [update, setUpdate] = createSignal<UpdateState>();
   const [busyAction, setBusyAction] = createSignal<"check" | "download" | "install" | "">("");
   const [actionError, setActionError] = createSignal("");
@@ -3523,10 +3792,11 @@ export function AboutSettingsPanel(props: {
 
   onMount(() => {
     unsubscribeUpdate = onUpdateState((state) => setUpdate(state));
-    void Promise.all([getAppInfo(), getUpdateState()])
-      .then(([appInfo, state]) => {
+    void Promise.all([getAppInfo(), getUpdateState(), getOpenSourceLicenses()])
+      .then(([appInfo, state, notices]) => {
         setInfo(appInfo);
         setUpdate(state);
+        setLicenses(notices);
       })
       .catch((error) => setActionError(error instanceof Error ? error.message : String(error)));
   });
@@ -3670,6 +3940,39 @@ export function AboutSettingsPanel(props: {
             description={info()?.repositoryUrl || "https://github.com/MISSmihu/MHcode"}
             control={<button class="settings-square-button" type="button" title="打开项目主页" onClick={() => void openAppRepositoryPage()}><ExternalLink size={15} /></button>}
           />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title="开源许可">
+        <SettingsCard>
+          <div class="about-license-intro">
+            <FileText size={18} aria-hidden="true" />
+            <div>
+              <strong>许可证正文已内置</strong>
+              <span>MHcode 与办公产物引擎的许可可离线查看，发布包无需附带散落文件。</span>
+            </div>
+          </div>
+          <div class="about-license-list">
+            <For each={licenses()}>{(notice) => (
+              <details class="about-license-item">
+                <summary>
+                  <div class="about-license-name">
+                    <strong>{notice.name}</strong>
+                    <span>{[notice.version, notice.description].filter(Boolean).join(" · ")}</span>
+                  </div>
+                  <span class="about-license-badge">{notice.license}</span>
+                  <ChevronDown size={15} class="about-license-chevron" aria-hidden="true" />
+                </summary>
+                <div class="about-license-body">
+                  <button class="settings-soft-button" type="button" onClick={() => void openURLInSystemBrowser(notice.url)}>
+                    <ExternalLink size={14} />
+                    项目主页
+                  </button>
+                  <pre>{notice.text}</pre>
+                </div>
+              </details>
+            )}</For>
+          </div>
         </SettingsCard>
       </SettingsSection>
     </div>
@@ -4137,6 +4440,15 @@ export function ContextPanel(props: { contextPreview: WorkbenchState["contextPre
     <div class="settings-page-body">
       <PanelSection icon={<Hash size={16} />} title="前缀">
         <code class="hash-box">{shortHash(props.contextPreview?.prefixHash)}</code>
+      </PanelSection>
+      <PanelSection icon={<Zap size={16} />} title="本轮 Skill 注入">
+        <MetricGrid
+          items={[
+            ["触发技能", props.contextPreview?.triggeredSkillNames?.join("、") || "无"],
+            ["注入体积", `${formatInteger(props.contextPreview?.triggeredSkillCharacters ?? 0)} 字符`],
+            ["估算 Token", `${formatInteger(props.contextPreview?.triggeredSkillTokens ?? 0)} tok`],
+          ]}
+        />
       </PanelSection>
       <PanelSection icon={<Braces size={16} />} title="稳定区">
         <ContextList sections={props.contextPreview?.stablePrefix ?? []} />

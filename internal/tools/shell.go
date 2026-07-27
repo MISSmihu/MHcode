@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,47 +25,66 @@ type RunCommandTool struct{ Policy SandboxPolicy }
 
 func (t RunCommandTool) Name() string { return "run_command" }
 func (t RunCommandTool) Description() string {
-	return "在工作区内执行 build、test、编译器或程序命令。文本读取、目录列表、搜索、写入、复制和删除会被拒绝，必须使用结构化文件工具。Windows 控制台使用 UTF-8，输出仍会自动识别 UTF-16/GB18030。"
+	return "在工作区内执行 build、test、编译器或程序。优先使用 executable + args 逐参数启动，尤其是 python -c、中文路径或含引号参数；只有管道等 Shell 语法才使用 command。两种模式互斥。文本读取、目录列表、搜索、写入、复制和删除必须使用结构化文件工具。"
 }
 func (t RunCommandTool) InputSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":                 "object",
+		"description":          "必须且只能提供 command 或 executable 其中一种执行模式",
+		"additionalProperties": false,
 		"properties": map[string]any{
-			"command": map[string]any{"type": "string", "description": "要执行的命令行"},
+			"command":    map[string]any{"type": "string", "description": "Shell 命令字符串；仅在需要管道、条件执行等 Shell 语法时使用，不能与 executable 同时提供"},
+			"executable": map[string]any{"type": "string", "description": "直接启动的程序名或路径；参数不会经过 Shell 解析，不能与 command 同时提供"},
+			"args": map[string]any{
+				"type":        "array",
+				"description": "直接逐项传给 executable 的参数；仅用于结构化进程模式",
+				"items":       map[string]any{"type": "string"},
+			},
+			"working_directory": map[string]any{"type": "string", "description": "可选工作目录，必须位于工作区或额外允许根内；默认当前工作区"},
 		},
-		"required": []string{"command"},
 	}
 }
 
+type runCommandArguments struct {
+	Command          string   `json:"command,omitempty"`
+	Executable       string   `json:"executable,omitempty"`
+	Args             []string `json:"args,omitempty"`
+	WorkingDirectory string   `json:"working_directory,omitempty"`
+}
+
 func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (Result, error) {
-	var args struct {
-		Command string `json:"command"`
-	}
+	var args runCommandArguments
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return errorResult("参数解析失败: " + err.Error()), nil
 	}
-	if strings.TrimSpace(args.Command) == "" {
-		return errorResult("command 不能为空"), nil
+	commandMode := strings.TrimSpace(args.Command) != ""
+	directMode := strings.TrimSpace(args.Executable) != ""
+	if commandMode == directMode {
+		return errorResult("必须且只能提供 command 或 executable 其中一种执行模式"), nil
+	}
+	if commandMode && len(args.Args) > 0 {
+		return errorResult("Shell command 模式不能提供 args；请改用 executable + args"), nil
 	}
 	if err := t.Policy.CheckShell(); err != nil {
 		return errorResult(err.Error()), nil
 	}
-	if err := t.Policy.ValidateCommand(args.Command); err != nil {
-		return errorResult(err.Error()), nil
+	displayCommand := runCommandDisplay(args)
+	if directMode {
+		if err := validateDirectProcessArguments(args.Executable, args.Args); err != nil {
+			return errorResult(err.Error()), nil
+		}
+		if err := t.Policy.ValidateDirectCommand(args.Executable, args.Args); err != nil {
+			return errorResult(err.Error()), nil
+		}
+	} else {
+		if err := t.Policy.ValidateCommand(args.Command); err != nil {
+			return errorResult(err.Error()), nil
+		}
 	}
 
-	// 工作目录固定为工作区根，避免命令逃逸到区外。
-	workDir := strings.TrimSpace(t.Policy.WorkspaceRoot)
-	if workDir == "" {
-		return errorResult(ErrNoWorkspaceRoot.Error()), nil
-	}
-	workDir, err := filepath.Abs(workDir)
+	workDir, err := resolveCommandWorkingDirectory(t.Policy, args.WorkingDirectory)
 	if err != nil {
-		return errorResult("invalid workspace root: " + err.Error()), nil
-	}
-	info, err := os.Stat(workDir)
-	if err != nil || !info.IsDir() {
-		return errorResult("workspace root is not an accessible directory"), nil
+		return errorResult(err.Error()), nil
 	}
 
 	timeout := time.Duration(t.Policy.MaxCommandSeconds) * time.Second
@@ -75,7 +94,12 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := buildShellCommand(runCtx, args.Command)
+	var cmd *exec.Cmd
+	if commandMode {
+		cmd = buildShellCommand(runCtx, args.Command)
+	} else {
+		cmd = buildDirectCommand(runCtx, args.Executable, args.Args)
+	}
 	cmd.Dir = workDir
 	cmd.Env = safeCommandEnvironment()
 
@@ -85,7 +109,7 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 	startedAt := time.Now()
 	reporter := &commandProgressReporter{
 		ctx:         ctx,
-		command:     args.Command,
+		command:     displayCommand,
 		workDir:     workDir,
 		startedAt:   startedAt,
 		stdout:      &stdout,
@@ -127,7 +151,7 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 		}
 	}
 
-	summary := fmt.Sprintf("$ %s\n退出码 %d", args.Command, exitCode)
+	summary := fmt.Sprintf("$ %s\n退出码 %d", displayCommand, exitCode)
 	return Result{
 		Summary: summary,
 		IsError: status == "error",
@@ -136,7 +160,7 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 				Kind:             PartToolCall,
 				Name:             t.Name(),
 				Status:           status,
-				Input:            args.Command,
+				Input:            displayCommand,
 				Output:           output,
 				Stdout:           stdoutOutput,
 				Stderr:           stderrOutput,
@@ -148,6 +172,68 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 			},
 		},
 	}, nil
+}
+
+// RunCommandInputForDisplay returns the command label used by approval prompts
+// and live tool cards. It is display-only and never reconstructs argv for use
+// as an executable command line.
+func RunCommandInputForDisplay(rawArgs json.RawMessage) string {
+	var args runCommandArguments
+	if json.Unmarshal(rawArgs, &args) != nil {
+		return ""
+	}
+	return runCommandDisplay(args)
+}
+
+func runCommandDisplay(args runCommandArguments) string {
+	if command := strings.TrimSpace(args.Command); command != "" {
+		return command
+	}
+	return formatDirectCommand(args.Executable, args.Args)
+}
+
+func formatDirectCommand(executable string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, commandTokenForDisplay(strings.TrimSpace(executable)))
+	for _, argument := range args {
+		parts = append(parts, commandTokenForDisplay(argument))
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+func commandTokenForDisplay(value string) string {
+	if value != "" && !strings.ContainsAny(value, " \t\r\n\"'`") {
+		return value
+	}
+	return strconv.Quote(value)
+}
+
+func validateDirectProcessArguments(executable string, args []string) error {
+	if strings.ContainsRune(executable, '\x00') {
+		return fmt.Errorf("executable 包含无效的 NUL 字符")
+	}
+	for index, argument := range args {
+		if strings.ContainsRune(argument, '\x00') {
+			return fmt.Errorf("args[%d] 包含无效的 NUL 字符", index)
+		}
+	}
+	return nil
+}
+
+func resolveCommandWorkingDirectory(policy SandboxPolicy, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		requested = "."
+	}
+	workDir, err := policy.ResolveReadPath(requested)
+	if err != nil {
+		return "", fmt.Errorf("invalid working_directory: %w", err)
+	}
+	info, err := os.Stat(workDir)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("working_directory is not an accessible directory: %s", workDir)
+	}
+	return workDir, nil
 }
 
 func intPointer(value int) *int {
@@ -204,13 +290,15 @@ func (w *cappedCommandOutput) Dropped() int {
 }
 
 type commandProgressReporter struct {
-	ctx         context.Context
-	command     string
-	workDir     string
-	startedAt   time.Time
-	stdout      *cappedCommandOutput
-	stderr      *cappedCommandOutput
-	minInterval time.Duration
+	ctx          context.Context
+	toolName     string
+	command      string
+	workDir      string
+	startedAt    time.Time
+	stdout       *cappedCommandOutput
+	stderr       *cappedCommandOutput
+	minInterval  time.Duration
+	outputFilter func(string) string
 
 	mu       sync.Mutex
 	lastEmit time.Time
@@ -236,9 +324,17 @@ func (r *commandProgressReporter) publish(force bool) {
 
 	stdout := DecodeCommandOutput(r.stdout.Bytes())
 	stderr := DecodeCommandOutput(r.stderr.Bytes())
+	if r.outputFilter != nil {
+		stdout = r.outputFilter(stdout)
+		stderr = r.outputFilter(stderr)
+	}
+	toolName := strings.TrimSpace(r.toolName)
+	if toolName == "" {
+		toolName = "run_command"
+	}
 	EmitProgress(r.ctx, ResultPart{
 		Kind:             PartToolCall,
-		Name:             "run_command",
+		Name:             toolName,
 		Status:           "running",
 		Input:            r.command,
 		Output:           commandOutputForDisplay(stdout, stderr),
@@ -315,5 +411,11 @@ func buildShellCommand(ctx context.Context, command string) *exec.Cmd {
 		cmd = exec.CommandContext(ctx, "sh", "-c", command)
 	}
 	hideConsoleWindow(cmd) // Windows 上隐藏弹出的 cmd 黑框
+	return cmd
+}
+
+func buildDirectCommand(ctx context.Context, executable string, args []string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, strings.TrimSpace(executable), args...)
+	hideConsoleWindow(cmd)
 	return cmd
 }

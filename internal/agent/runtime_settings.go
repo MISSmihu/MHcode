@@ -8,39 +8,43 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/MISSmihu/MHcode/internal/plugins"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
 type RuntimeSettings struct {
-	SchemaVersion        int                     `json:"schemaVersion"`
-	SandboxMode          string                  `json:"sandboxMode"`
-	FilesystemAccess     string                  `json:"filesystemAccess"`
-	NetworkAccess        bool                    `json:"networkAccess"`
-	ShellAccess          bool                    `json:"shellAccess"`
-	ApprovalPolicy       string                  `json:"approvalPolicy"`
-	WorkspaceRoot        string                  `json:"workspaceRoot"`
-	ExtraWritableRoots   []string                `json:"extraWritableRoots"`
-	MaxCommandSeconds    int                     `json:"maxCommandSeconds"`
-	MaxCommandMemoryMB   int                     `json:"maxCommandMemoryMb"`
-	MaxCommandCPUPercent int                     `json:"maxCommandCpuPercent"`
-	MaxCommandProcesses  int                     `json:"maxCommandProcesses"`
-	AllowDestructiveOps  bool                    `json:"allowDestructiveOps"`
-	ToolResultPolicy     string                  `json:"toolResultPolicy"`
-	StablePrefixPolicy   string                  `json:"stablePrefixPolicy"`
-	CacheTargetPercent   float64                 `json:"cacheTargetPercent"`
-	Git                  GitSettings             `json:"git"`
-	Browser              BrowserSettings         `json:"browser"`
-	ComputerControl      ComputerControlSettings `json:"computerControl"`
-	MCP                  MCPSettings             `json:"mcp"`
-	Model                ModelSettings           `json:"model"`
-	Team                 TeamSettings            `json:"team"`
-	Skills               SkillsSettings          `json:"skills"`
-	Update               UpdateSettings          `json:"update"`
-	Workspace            WorkspaceSettings       `json:"workspace"`
-	Memory               MemorySettings          `json:"memory"`
+	SchemaVersion          int                     `json:"schemaVersion"`
+	SandboxMode            string                  `json:"sandboxMode"`
+	FilesystemAccess       string                  `json:"filesystemAccess"`
+	NetworkAccess          bool                    `json:"networkAccess"`
+	ShellAccess            bool                    `json:"shellAccess"`
+	ApprovalPolicy         string                  `json:"approvalPolicy"`
+	WorkspaceRoot          string                  `json:"workspaceRoot"`
+	ExtraWritableRoots     []string                `json:"extraWritableRoots"`
+	ToolTimeoutSeconds     int                     `json:"toolTimeoutSeconds"`
+	TaskIdleTimeoutSeconds int                     `json:"taskIdleTimeoutSeconds"`
+	MaxCommandSeconds      int                     `json:"maxCommandSeconds"`
+	MaxCommandMemoryMB     int                     `json:"maxCommandMemoryMb"`
+	MaxCommandCPUPercent   int                     `json:"maxCommandCpuPercent"`
+	MaxCommandProcesses    int                     `json:"maxCommandProcesses"`
+	AllowDestructiveOps    bool                    `json:"allowDestructiveOps"`
+	ToolResultPolicy       string                  `json:"toolResultPolicy"`
+	StablePrefixPolicy     string                  `json:"stablePrefixPolicy"`
+	CacheTargetPercent     float64                 `json:"cacheTargetPercent"`
+	Git                    GitSettings             `json:"git"`
+	Browser                BrowserSettings         `json:"browser"`
+	ComputerControl        ComputerControlSettings `json:"computerControl"`
+	MCP                    MCPSettings             `json:"mcp"`
+	Plugins                plugins.Settings        `json:"plugins"`
+	Model                  ModelSettings           `json:"model"`
+	Team                   TeamSettings            `json:"team"`
+	Skills                 SkillsSettings          `json:"skills"`
+	Update                 UpdateSettings          `json:"update"`
+	Workspace              WorkspaceSettings       `json:"workspace"`
+	Memory                 MemorySettings          `json:"memory"`
 }
 
-const runtimeSettingsSchemaVersion = 8
+const runtimeSettingsSchemaVersion = 12
 
 type SkillsSettings struct {
 	Disabled []string `json:"disabled"`
@@ -187,11 +191,15 @@ type ModelProviderSetting struct {
 }
 
 type ProviderModel struct {
-	ID                  string `json:"id"`
-	DisplayName         string `json:"displayName"`
-	Provider            string `json:"provider"`
-	ContextWindowTokens int    `json:"contextWindowTokens"`
-	ContextWindowSource string `json:"contextWindowSource,omitempty"`
+	ID                    string   `json:"id"`
+	DisplayName           string   `json:"displayName"`
+	Provider              string   `json:"provider"`
+	ContextWindowTokens   int      `json:"contextWindowTokens"`
+	ContextWindowSource   string   `json:"contextWindowSource,omitempty"`
+	MaxOutputTokens       int      `json:"maxOutputTokens,omitempty"`
+	ReasoningLevels       []string `json:"reasoningLevels,omitempty"`
+	ThinkingModes         []string `json:"thinkingModes,omitempty"`
+	UnsupportedParameters []string `json:"unsupportedParameters,omitempty"`
 }
 
 type WorkspaceSettings struct {
@@ -204,22 +212,24 @@ type WorkspaceSettings struct {
 func DefaultRuntimeSettings() RuntimeSettings {
 	workspaceRoot := defaultWorkspaceRoot()
 	return RuntimeSettings{
-		SchemaVersion:        runtimeSettingsSchemaVersion,
-		SandboxMode:          "workspace-write",
-		FilesystemAccess:     "workspace-write",
-		NetworkAccess:        true,
-		ShellAccess:          true,
-		ApprovalPolicy:       "on-request",
-		WorkspaceRoot:        workspaceRoot,
-		ExtraWritableRoots:   []string{},
-		MaxCommandSeconds:    120,
-		MaxCommandMemoryMB:   4096,
-		MaxCommandCPUPercent: 100,
-		MaxCommandProcesses:  128,
-		AllowDestructiveOps:  false,
-		ToolResultPolicy:     "summary-first",
-		StablePrefixPolicy:   "strict-stable-prefix",
-		CacheTargetPercent:   96,
+		SchemaVersion:          runtimeSettingsSchemaVersion,
+		SandboxMode:            "workspace-write",
+		FilesystemAccess:       "workspace-write",
+		NetworkAccess:          true,
+		ShellAccess:            true,
+		ApprovalPolicy:         "on-request",
+		WorkspaceRoot:          workspaceRoot,
+		ExtraWritableRoots:     []string{},
+		ToolTimeoutSeconds:     180,
+		TaskIdleTimeoutSeconds: 300,
+		MaxCommandSeconds:      120,
+		MaxCommandMemoryMB:     4096,
+		MaxCommandCPUPercent:   100,
+		MaxCommandProcesses:    128,
+		AllowDestructiveOps:    false,
+		ToolResultPolicy:       "summary-first",
+		StablePrefixPolicy:     "strict-stable-prefix",
+		CacheTargetPercent:     96,
 		Git: GitSettings{
 			BranchPrefix:           "mhcode/",
 			MergeMethod:            "merge",
@@ -265,6 +275,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 				},
 			},
 		},
+		Plugins: plugins.DefaultSettings(),
 		Model: ModelSettings{
 			SelectedProviderID: "deepseek",
 			SelectedModelID:    "",
@@ -429,6 +440,24 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 		settings.WorkspaceRoot = defaults.WorkspaceRoot
 	}
 	settings.ExtraWritableRoots = cleanStringList(settings.ExtraWritableRoots)
+	if settings.ToolTimeoutSeconds <= 0 {
+		settings.ToolTimeoutSeconds = defaults.ToolTimeoutSeconds
+	}
+	if settings.ToolTimeoutSeconds < 5 {
+		settings.ToolTimeoutSeconds = 5
+	}
+	if settings.ToolTimeoutSeconds > 3600 {
+		settings.ToolTimeoutSeconds = 3600
+	}
+	if settings.TaskIdleTimeoutSeconds <= 0 {
+		settings.TaskIdleTimeoutSeconds = defaults.TaskIdleTimeoutSeconds
+	}
+	if settings.TaskIdleTimeoutSeconds < 15 {
+		settings.TaskIdleTimeoutSeconds = 15
+	}
+	if settings.TaskIdleTimeoutSeconds > 7200 {
+		settings.TaskIdleTimeoutSeconds = 7200
+	}
 	if settings.MaxCommandSeconds < 5 {
 		settings.MaxCommandSeconds = 5
 	}
@@ -464,6 +493,7 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	settings.Browser = normalizeBrowserSettings(settings.Browser, defaults.Browser)
 	settings.ComputerControl = normalizeComputerControlSettings(settings.ComputerControl, defaults.ComputerControl)
 	settings.MCP = normalizeMCPSettings(settings.MCP, defaults.MCP)
+	settings.Plugins = plugins.NormalizeSettings(settings.Plugins)
 	settings.Model = normalizeModelSettings(settings.Model, defaults.Model)
 	settings.Team = normalizeTeamSettings(settings.Team, defaults.Team, settings.Model)
 	settings.Skills = normalizeSkillsSettings(settings.Skills, defaults.Skills)
@@ -518,11 +548,28 @@ func loadRuntimeSettings(path string) (RuntimeSettings, bool) {
 }
 
 func migrateRuntimeSettings(stored RuntimeSettings) RuntimeSettings {
+	if stored.SchemaVersion < 9 {
+		stored.Plugins = plugins.DefaultSettings()
+	}
 	if stored.SchemaVersion < 8 {
 		stored.Skills = DefaultRuntimeSettings().Skills
 	}
 	if stored.SchemaVersion < 7 {
 		stored.Update = DefaultRuntimeSettings().Update
+	}
+	if stored.SchemaVersion < 12 {
+		for providerIndex := range stored.Model.Providers {
+			provider := &stored.Model.Providers[providerIndex]
+			for modelIndex := range provider.Models {
+				model := &provider.Models[modelIndex]
+				if !unverifiedAnthropicCatalogContext(model.ID) || model.ContextWindowTokens != 1_000_000 ||
+					normalizeContextWindowSource(model.ContextWindowSource) != ContextWindowSourceCatalog {
+					continue
+				}
+				model.ContextWindowTokens = 0
+				model.ContextWindowSource = ""
+			}
+		}
 	}
 	if stored.SchemaVersion >= 6 {
 		return stored
@@ -1033,6 +1080,12 @@ func normalizeProviderModels(models []ProviderModel, providerID string) []Provid
 		if model.ContextWindowTokens < 0 {
 			model.ContextWindowTokens = 0
 		}
+		if model.MaxOutputTokens < 0 {
+			model.MaxOutputTokens = 0
+		}
+		model.ReasoningLevels = normalizeProviderReasoningLevels(model.ReasoningLevels)
+		model.ThinkingModes = normalizeProviderThinkingModes(model.ThinkingModes)
+		model.UnsupportedParameters = normalizeProviderUnsupportedParameters(model.UnsupportedParameters)
 		model.ContextWindowSource = normalizeContextWindowSource(model.ContextWindowSource)
 		if model.ContextWindowTokens == 0 {
 			model.ContextWindowSource = ""
@@ -1043,6 +1096,35 @@ func normalizeProviderModels(models []ProviderModel, providerID string) []Provid
 		cleaned = append(cleaned, model)
 	}
 	return cleaned
+}
+
+func normalizeProviderReasoningLevels(levels []string) []string {
+	allowed := map[string]bool{"none": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+	return normalizeUniqueValues(levels, allowed)
+}
+
+func normalizeProviderThinkingModes(modes []string) []string {
+	allowed := map[string]bool{"adaptive": true, "enabled": true, "disabled": true}
+	return normalizeUniqueValues(modes, allowed)
+}
+
+func normalizeProviderUnsupportedParameters(parameters []string) []string {
+	allowed := map[string]bool{"temperature": true, "thinking": true, "output_config": true}
+	return normalizeUniqueValues(parameters, allowed)
+}
+
+func normalizeUniqueValues(values []string, allowed map[string]bool) []string {
+	result := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if !allowed[value] || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
 }
 
 func normalizeContextWindowSource(source string) string {

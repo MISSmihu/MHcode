@@ -50,6 +50,24 @@ type providerStreamOpenResult struct {
 
 const providerFinishGracePeriod = 1500 * time.Millisecond
 
+const (
+	providerStreamOpenTimeout = 45 * time.Second
+	providerStreamIdleTimeout = 2 * time.Minute
+	providerHeartbeatInterval = 8 * time.Second
+)
+
+var (
+	ErrProviderStreamOpenTimeout = errors.New("provider stream did not open before the timeout")
+	ErrProviderStreamIdle        = errors.New("provider stream became idle")
+)
+
+type providerStreamTiming struct {
+	FinishGrace       time.Duration
+	OpenTimeout       time.Duration
+	IdleTimeout       time.Duration
+	HeartbeatInterval time.Duration
+}
+
 func emitChatEvent(sink ChatEventSink, event ChatStreamEvent) {
 	if sink != nil {
 		sink(event)
@@ -84,8 +102,27 @@ func collectProviderStreamWithFinishGrace(
 	sink ChatEventSink,
 	finishGrace time.Duration,
 ) (protocol.CompletionResult, error) {
-	if finishGrace <= 0 {
-		finishGrace = providerFinishGracePeriod
+	return collectProviderStreamWithTiming(ctx, provider, request, sink, providerStreamTiming{FinishGrace: finishGrace})
+}
+
+func collectProviderStreamWithTiming(
+	ctx context.Context,
+	provider protocol.Provider,
+	request protocol.ChatRequest,
+	sink ChatEventSink,
+	timing providerStreamTiming,
+) (protocol.CompletionResult, error) {
+	if timing.FinishGrace <= 0 {
+		timing.FinishGrace = providerFinishGracePeriod
+	}
+	if timing.OpenTimeout <= 0 {
+		timing.OpenTimeout = providerStreamOpenTimeout
+	}
+	if timing.IdleTimeout <= 0 {
+		timing.IdleTimeout = providerStreamIdleTimeout
+	}
+	if timing.HeartbeatInterval <= 0 {
+		timing.HeartbeatInterval = providerHeartbeatInterval
 	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
@@ -96,18 +133,42 @@ func collectProviderStreamWithFinishGrace(
 	}()
 
 	var events <-chan protocol.StreamEvent
-	select {
-	case <-ctx.Done():
-		go drainLateProviderStream(opened)
-		return protocol.CompletionResult{}, ctx.Err()
-	case result := <-opened:
-		if result.err != nil {
-			return protocol.CompletionResult{}, result.err
+	openStartedAt := time.Now()
+	openTimer := time.NewTimer(timing.OpenTimeout)
+	openHeartbeat := time.NewTicker(timing.HeartbeatInterval)
+	openComplete := false
+	for !openComplete {
+		select {
+		case <-ctx.Done():
+			cancelStream()
+			go drainLateProviderStream(opened)
+			openTimer.Stop()
+			openHeartbeat.Stop()
+			return protocol.CompletionResult{}, ctx.Err()
+		case <-openTimer.C:
+			cancelStream()
+			go drainLateProviderStream(opened)
+			openHeartbeat.Stop()
+			return protocol.CompletionResult{}, fmt.Errorf("%w after %s", ErrProviderStreamOpenTimeout, timing.OpenTimeout)
+		case <-openHeartbeat.C:
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "status",
+				Message: fmt.Sprintf("上游模型仍在建立连接（已等待 %s）", roundedWaitDuration(time.Since(openStartedAt))),
+				Model:   request.Model,
+				Status:  "waiting",
+			})
+		case result := <-opened:
+			openTimer.Stop()
+			openHeartbeat.Stop()
+			if result.err != nil {
+				return protocol.CompletionResult{}, result.err
+			}
+			if result.events == nil {
+				return protocol.CompletionResult{}, errors.New("provider returned a nil event stream")
+			}
+			events = result.events
+			openComplete = true
 		}
-		if result.events == nil {
-			return protocol.CompletionResult{}, errors.New("provider returned a nil event stream")
-		}
-		events = result.events
 	}
 
 	var content strings.Builder
@@ -122,6 +183,9 @@ func collectProviderStreamWithFinishGrace(
 	var finishTimer *time.Timer
 	var finishDeadline <-chan time.Time
 	finishSeen := false
+	idleTimer := time.NewTimer(timing.IdleTimeout)
+	heartbeat := time.NewTicker(timing.HeartbeatInterval)
+	lastProviderEventAt := time.Now()
 	stopFinishTimer := func() {
 		if finishTimer != nil && !finishTimer.Stop() {
 			select {
@@ -131,6 +195,18 @@ func collectProviderStreamWithFinishGrace(
 		}
 	}
 	defer stopFinishTimer()
+	defer idleTimer.Stop()
+	defer heartbeat.Stop()
+	resetIdleTimer := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(timing.IdleTimeout)
+		lastProviderEventAt = time.Now()
+	}
 	for {
 		var event protocol.StreamEvent
 		var ok bool
@@ -139,6 +215,17 @@ func collectProviderStreamWithFinishGrace(
 			cancelStream()
 			go drainProviderStream(events)
 			return partialResult(), ctx.Err()
+		case <-idleTimer.C:
+			cancelStream()
+			go drainProviderStream(events)
+			return partialResult(), fmt.Errorf("%w for %s", ErrProviderStreamIdle, timing.IdleTimeout)
+		case <-heartbeat.C:
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "status",
+				Message: fmt.Sprintf("上游模型仍在处理（%s 未收到新数据）", roundedWaitDuration(time.Since(lastProviderEventAt))),
+				Model:   request.Model,
+				Status:  "waiting",
+			})
 		case <-finishDeadline:
 			// Some OpenAI-compatible relays send finish_reason but never send
 			// [DONE] or close the response body. Keep a short window for the
@@ -153,6 +240,7 @@ func collectProviderStreamWithFinishGrace(
 				}
 				return partialResult(), nil
 			}
+			resetIdleTimer()
 		}
 		switch event.Type {
 		case "delta":
@@ -192,7 +280,7 @@ func collectProviderStreamWithFinishGrace(
 		case "finish":
 			if !finishSeen {
 				finishSeen = true
-				finishTimer = time.NewTimer(finishGrace)
+				finishTimer = time.NewTimer(timing.FinishGrace)
 				finishDeadline = finishTimer.C
 			}
 		case "done":
@@ -210,6 +298,13 @@ func collectProviderStreamWithFinishGrace(
 			return partialResult(), errors.New(event.Error)
 		}
 	}
+}
+
+func roundedWaitDuration(duration time.Duration) time.Duration {
+	if duration < time.Second {
+		return time.Second
+	}
+	return duration.Round(time.Second)
 }
 
 func mergeTokenUsage(current, next *protocol.TokenUsage) *protocol.TokenUsage {

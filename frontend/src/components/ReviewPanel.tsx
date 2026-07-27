@@ -34,6 +34,7 @@ import type {
   WorkspaceFileRequest,
   WorkspaceFileView,
 } from "../types";
+import { ArtifactViewer } from "./ArtifactViewer";
 
 const CodeViewer = lazy(async () => {
   const module = await import("./CodeViewer");
@@ -377,6 +378,9 @@ export function ReviewPanel(props: ReviewPanelProps) {
                         )}
                       </For>
                     </div>
+                  </Match>
+                  <Match when={preview()?.artifact}>
+                    {(artifact) => <ArtifactViewer artifact={artifact()} />}
                   </Match>
                   <Match when={preview()?.binary}>
                     <PreviewUnavailable title="这是二进制文件" detail="文本查看器无法安全显示它，请使用系统应用打开。" onOpen={() => void runFileAction("open")} onReveal={() => void runFileAction("reveal")} />

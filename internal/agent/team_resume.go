@@ -112,7 +112,7 @@ func (s *Service) runTeamTurn(
 		)
 		resultParts := append(append([]tools.ResultPart(nil), parts...), tools.ResultPart{Kind: tools.PartText, Text: answer})
 		s.metrics = aggregate
-		s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+		s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, resultParts)
 		s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 		s.sessionState.MessageCount = len(s.sessionMessages)
 		s.recordTeamPauseMessage(answer, model, resultParts, chatTurnDurationMs(ctx))
@@ -225,7 +225,7 @@ func (s *Service) runTeamTurn(
 					if err := syncCheckpoint("cancelled", teamStageFinalize, 1); err != nil {
 						return failRun(err)
 					}
-					s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+					s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 					s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 					s.sessionState.MessageCount = len(s.sessionMessages)
 					s.sessionState.TurnCount++
@@ -356,7 +356,7 @@ func (s *Service) runTeamTurn(
 			if err := syncCheckpoint("completed", teamStageFinalize, 1); err != nil {
 				return failRun(err)
 			}
-			s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+			s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 			s.sessionState.MessageCount = len(s.sessionMessages)
 			s.sessionState.TurnCount++

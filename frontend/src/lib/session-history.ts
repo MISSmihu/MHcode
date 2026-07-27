@@ -50,6 +50,9 @@ export function reconcileSessionMessages(
     durationMs: message.durationMs,
 	failed: message.status === "failed",
 	cancelled: message.status === "cancelled",
+	interrupted: message.status === "interrupted",
+	status: message.status === "interrupted" ? "上次运行中断" : undefined,
+	statusKind: message.status === "interrupted" ? "failed" : undefined,
   }));
 }
 

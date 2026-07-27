@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/MISSmihu/MHcode/internal/artifacts"
 )
 
 // 只读工具：read_file / list_dir / search。全部走编码安全层与沙盒守卫。
@@ -28,7 +30,7 @@ type ReadFileTool struct{ Policy SandboxPolicy }
 
 func (t ReadFileTool) Name() string { return "read_file" }
 func (t ReadFileTool) Description() string {
-	return "读取当前工作区内的文本文件。支持 start_line/end_line 分段、可选行号，并返回 sha256、编码和行尾；编辑前优先读取相关行，避免使用 shell。"
+	return "读取当前工作区内的文本或办公产物。DOCX、XLS/XLSX、PPTX 会自动结构化解析；文本支持 start_line/end_line 分段、可选行号，并返回 sha256、编码和行尾。"
 }
 func (t ReadFileTool) InputSchema() map[string]any {
 	return map[string]any{
@@ -63,6 +65,22 @@ func (t ReadFileTool) Execute(_ context.Context, rawArgs json.RawMessage) (Resul
 	}
 	if info.IsDir() {
 		return errorResult("目标是目录，请使用 list_dir"), nil
+	}
+	if _, _, supportedArtifact := artifacts.Detect(abs); supportedArtifact {
+		if info.Size() > 64<<20 {
+			return errorResult(fmt.Sprintf("办公产物过大（%d 字节），超过解析上限 %d", info.Size(), 64<<20)), nil
+		}
+		content, artifactErr := artifacts.ArtifactText(abs, 256<<10)
+		if artifactErr != nil {
+			return errorResult("办公产物读取失败: " + artifactErr.Error()), nil
+		}
+		return Result{
+			Summary: fmt.Sprintf("已结构化读取办公产物 %s\n%s", args.Path, content),
+			Parts: []ResultPart{
+				{Kind: PartToolCall, Name: t.Name(), Status: "ok", Input: args.Path, Output: content},
+				{Kind: PartFile, Path: args.Path, FileAction: "available"},
+			},
+		}, nil
 	}
 	if info.Size() > maxReadBytes {
 		return errorResult(fmt.Sprintf("文件过大（%d 字节），超过读取上限 %d", info.Size(), maxReadBytes)), nil

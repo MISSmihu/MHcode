@@ -10,15 +10,19 @@
 
 仓库随项目分发的 Skill 位于：
 
-``text
+```text
 skills/
-└── mhcode-agent-core/
+├── mhcode-agent-core/
+│   ├── SKILL.md
+│   └── agents/
+│       └── openai.yaml
+└── mhcode-office-artifacts/
     ├── SKILL.md
     └── agents/
         └── openai.yaml
-``
+```
 
-当前只有一个内置核心 Skill，避免推理、缓存、工具和协议规则分别触发而互相冲突。以后新增 Skill 必须有清晰边界，不要把同一套 Agent 规则复制到多个目录。
+`mhcode-agent-core` 只在明确修改 MHcode 自身 Agent 内核时触发；`mhcode-office-artifacts` 只负责办公产物质量。以后新增 Skill 必须有清晰边界，不要把内部开发说明、通用系统规则或同一套约束复制到多个 Skill。
 
 ## 加载生命周期
 
@@ -26,8 +30,8 @@ skills/
 
 1. 扫描 Skill 目录并解析 frontmatter。
 2. 生成稳定的 Skill 索引，只把名称、版本、触发条件和能力摘要放入常规上下文。
-3. 任务真正触发时再加载完整 `SKILL.md`。
-4. 记录名称、版本和 hash，同一会话优先复用已加载摘要。
+3. MHcode 专用触发条件放在 `agents/mhcode.yaml`；显式 `trigger` 按 `|`、逗号或分号分隔的完整短语匹配，任务真正命中时才加载完整 `SKILL.md`。
+4. 记录名称、版本、hash、注入字符数和估算 token，便于发现误触发和上下文膨胀。
 5. 目录或内容变化时刷新索引，避免每轮重复注入长文本。
 
 修改 loader 时必须验证：目录缺失、frontmatter 无效、重复名称、文件变更、hash 稳定性和并发读取。
@@ -94,9 +98,9 @@ Plan 是显式能力，不应默认让每轮请求翻倍。高/超高档位且�
 
 团队模式的角色顺序和权限边界是：
 
-``text
+```text
 planner → implementer → tester / reviewer → synthesizer
-``
+```
 
 实现者可以修改工作区；测试者和审阅者默认只读；审阅意见触发有限轮次修订；取消、角色失败和费用上限必须让整次运行进入明确终态。
 
@@ -129,19 +133,23 @@ planner → implementer → tester / reviewer → synthesizer
 5. 更新 `SKILL.md` 或本文档，删除已经不适用的旧描述。
 6. 运行完整检查：
 
-``powershell
+```powershell
 cd frontend
 bun.cmd run check
 cd ..
 go test ./... -count=1
 go vet ./...
-``
+```
 
 涉及 Wails API、平台代码或浏览器原生表面时追加 `wails build -clean`。
 
 ## Skill 编写规则
 
 - frontmatter 必须有小写 `name` 和清楚的 `description`。
+- `SKILL.md` frontmatter 只使用标准 `name` 和 `description`；不要加入 MHcode 私有字段。
+- 自动触发的 Skill 必须在 `agents/mhcode.yaml` 提供显式 `trigger`，多个短语使用 `|` 分隔；`activation: manual` 表示只接受完整 Skill 名称显式调用。
+- 触发短语必须描述清晰任务边界，禁止使用孤立的 `agent`、`plan`、`文档`、`缓存` 等高频泛词。
+- 完整 Skill 名称始终可以显式触发；运行时不会再把名称拆成 `agent`、`core` 等碎片进行模糊匹配。
 - 正文使用命令式规则，避免把项目历史、营销文案和长教程塞给 Agent。
 - 稳定规则优先写入 Skill；具体 API 细节放代码和测试。
 - 超过约 500 行时拆到 `references/`，不要让每轮加载变长。
@@ -152,8 +160,8 @@ go vet ./...
 
 本地可使用 Codex Skill Creator 的校验脚本（路径随安装位置变化）：
 
-``powershell
+```powershell
 python -X utf8 "$env:USERPROFILE\.codex\skills\.system\skill-creator\scripts\quick_validate.py" ".\skills\mhcode-agent-core"
-``
+```
 
 另外应运行 `go test ./internal/skills/...`，确认 Skill 索引和 hash 行为没有回归。

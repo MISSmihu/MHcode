@@ -4,6 +4,9 @@ package vault
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -140,5 +143,12 @@ func wrapCredError(op string, err error) error {
 
 // NewOSVault 返回当前平台的默认持久化 Vault（Windows 用凭据管理器）。
 func NewOSVault() Vault {
-	return NewWinCredVault()
+	configDir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(configDir) == "" {
+		return NewWinCredVault()
+	}
+	return newResilientWindowsVault(
+		NewWinCredVault(),
+		newDPAPIFileVault(filepath.Join(configDir, "MHcode", "secrets.dpapi.json")),
+	)
 }

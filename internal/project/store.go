@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,20 +27,22 @@ type Session struct {
 
 // Project 是一个项目：一个工作区根 + 其下的一组会话。
 type Project struct {
-	ID                 string    `json:"id"`
-	Name               string    `json:"name"`
-	WorkspaceRoot      string    `json:"workspaceRoot"`
-	ExtraWritableRoots []string  `json:"extraWritableRoots"`
-	CreatedAt          string    `json:"createdAt"`
-	Pinned             bool      `json:"pinned,omitempty"`
-	Sessions           []Session `json:"sessions"`
+	ID                  string    `json:"id"`
+	Name                string    `json:"name"`
+	WorkspaceRoot       string    `json:"workspaceRoot"`
+	ExtraWritableRoots  []string  `json:"extraWritableRoots"`
+	CreatedAt           string    `json:"createdAt"`
+	Pinned              bool      `json:"pinned,omitempty"`
+	LastActiveSessionID string    `json:"lastActiveSessionId,omitempty"`
+	Sessions            []Session `json:"sessions"`
 }
 
 // Manifest 是整个持久化文件的根结构。
 type Manifest struct {
-	Projects        []Project `json:"projects"`
-	ActiveProjectID string    `json:"activeProjectId"`
-	ActiveSessionID string    `json:"activeSessionId"`
+	Projects         []Project `json:"projects"`
+	DetachedProjects []Project `json:"detachedProjects,omitempty"`
+	ActiveProjectID  string    `json:"activeProjectId"`
+	ActiveSessionID  string    `json:"activeSessionId"`
 }
 
 // Store 读写 projects.json，并发安全。
@@ -94,33 +97,44 @@ func (s *Store) EnsureBootstrap(defaultWorkspaceRoot, defaultProjectName string)
 	defer s.mu.Unlock()
 
 	if len(s.manifest.Projects) == 0 {
-		proj := Project{
-			ID:            genID("proj"),
-			Name:          defaultProjectName,
-			WorkspaceRoot: defaultWorkspaceRoot,
-			CreatedAt:     nowRFC3339(),
-		}
 		sess := newSession("新对话")
-		proj.Sessions = []Session{sess}
+		proj := Project{
+			ID:                  genID("proj"),
+			Name:                defaultProjectName,
+			WorkspaceRoot:       defaultWorkspaceRoot,
+			CreatedAt:           nowRFC3339(),
+			LastActiveSessionID: sess.ID,
+			Sessions:            []Session{sess},
+		}
 		s.manifest.Projects = []Project{proj}
 		s.manifest.ActiveProjectID = proj.ID
 		s.manifest.ActiveSessionID = sess.ID
 		return true, s.save()
 	}
 
+	changed := false
 	// 已有项目但活动指针缺失 → 修正。
 	if s.findProject(s.manifest.ActiveProjectID) == nil {
 		s.manifest.ActiveProjectID = s.manifest.Projects[0].ID
+		changed = true
 	}
 	active := s.findProject(s.manifest.ActiveProjectID)
 	if len(active.Sessions) == 0 {
 		sess := newSession("新对话")
 		active.Sessions = append(active.Sessions, sess)
 		s.manifest.ActiveSessionID = sess.ID
+		active.LastActiveSessionID = sess.ID
 		return true, s.save()
 	}
 	if active.findSession(s.manifest.ActiveSessionID) == nil {
-		s.manifest.ActiveSessionID = active.Sessions[0].ID
+		s.manifest.ActiveSessionID = ensureProjectActiveSession(active)
+		changed = true
+	}
+	if active.LastActiveSessionID != s.manifest.ActiveSessionID {
+		active.LastActiveSessionID = s.manifest.ActiveSessionID
+		changed = true
+	}
+	if changed {
 		return true, s.save()
 	}
 	return false, nil
@@ -163,6 +177,12 @@ func cloneManifest(m Manifest) Manifest {
 		cp.ExtraWritableRoots = append([]string{}, p.ExtraWritableRoots...)
 		cp.Sessions = append([]Session{}, p.Sessions...)
 		out.Projects = append(out.Projects, cp)
+	}
+	for _, p := range m.DetachedProjects {
+		cp := p
+		cp.ExtraWritableRoots = append([]string{}, p.ExtraWritableRoots...)
+		cp.Sessions = append([]Session{}, p.Sessions...)
+		out.DetachedProjects = append(out.DetachedProjects, cp)
 	}
 	return out
 }
@@ -239,19 +259,93 @@ func (s *Store) ActiveIDs() (projectID, sessionID string) {
 func (s *Store) CreateProject(name, workspaceRoot string, extraRoots []string) (Project, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	original := cloneManifest(s.manifest)
+	workspaceRoot = strings.TrimSpace(workspaceRoot)
+	s.rememberActiveSession()
+	for index := range s.manifest.Projects {
+		project := &s.manifest.Projects[index]
+		if !sameWorkspaceRoot(project.WorkspaceRoot, workspaceRoot) {
+			continue
+		}
+		s.manifest.ActiveProjectID = project.ID
+		s.manifest.ActiveSessionID = ensureProjectActiveSession(project)
+		if err := s.save(); err != nil {
+			s.manifest = original
+			return Project{}, err
+		}
+		return cloneManifest(Manifest{Projects: []Project{*project}}).Projects[0], nil
+	}
+	for index := range s.manifest.DetachedProjects {
+		project := s.manifest.DetachedProjects[index]
+		if !sameWorkspaceRoot(project.WorkspaceRoot, workspaceRoot) {
+			continue
+		}
+		s.manifest.DetachedProjects = append(s.manifest.DetachedProjects[:index], s.manifest.DetachedProjects[index+1:]...)
+		if strings.TrimSpace(project.Name) == "" {
+			project.Name = name
+		}
+		project.WorkspaceRoot = workspaceRoot
+		if len(extraRoots) > 0 {
+			project.ExtraWritableRoots = append([]string(nil), extraRoots...)
+		}
+		if len(project.Sessions) == 0 {
+			project.Sessions = []Session{newSession("新对话")}
+		}
+		s.manifest.Projects = append(s.manifest.Projects, project)
+		restored := &s.manifest.Projects[len(s.manifest.Projects)-1]
+		s.manifest.ActiveProjectID = restored.ID
+		s.manifest.ActiveSessionID = ensureProjectActiveSession(restored)
+		if err := s.save(); err != nil {
+			s.manifest = original
+			return Project{}, err
+		}
+		return cloneManifest(Manifest{Projects: []Project{*restored}}).Projects[0], nil
+	}
 	sess := newSession("新对话")
 	proj := Project{
-		ID:                 genID("proj"),
-		Name:               name,
-		WorkspaceRoot:      workspaceRoot,
-		ExtraWritableRoots: extraRoots,
-		CreatedAt:          nowRFC3339(),
-		Sessions:           []Session{sess},
+		ID:                  genID("proj"),
+		Name:                name,
+		WorkspaceRoot:       workspaceRoot,
+		ExtraWritableRoots:  extraRoots,
+		CreatedAt:           nowRFC3339(),
+		LastActiveSessionID: sess.ID,
+		Sessions:            []Session{sess},
 	}
 	s.manifest.Projects = append(s.manifest.Projects, proj)
 	s.manifest.ActiveProjectID = proj.ID
 	s.manifest.ActiveSessionID = sess.ID
-	return proj, s.save()
+	if err := s.save(); err != nil {
+		s.manifest = original
+		return Project{}, err
+	}
+	return proj, nil
+}
+
+func sameWorkspaceRoot(left, right string) bool {
+	left = canonicalWorkspaceRoot(left)
+	right = canonicalWorkspaceRoot(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func canonicalWorkspaceRoot(root string) string {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return ""
+	}
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	root = filepath.Clean(root)
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = filepath.Clean(resolved)
+	}
+	return root
 }
 
 // SetProjectPinned persists whether a project should be sorted before regular projects.
@@ -321,6 +415,7 @@ func (s *Store) SetProjectSessionsArchived(projectID string, archived bool) (act
 		replacement := newSession("新对话")
 		p.Sessions = append(p.Sessions, replacement)
 		s.manifest.ActiveSessionID = replacement.ID
+		p.LastActiveSessionID = replacement.ID
 		activeChanged = true
 	}
 	if err := s.save(); err != nil {
@@ -358,9 +453,6 @@ func (s *Store) removeProject(projectID string, fallback *Project) (removed Proj
 	if removeIndex < 0 {
 		return Project{}, false, fmt.Errorf("项目不存在: %s", projectID)
 	}
-
-	original := cloneManifest(s.manifest)
-	removed = cloneManifest(Manifest{Projects: []Project{s.manifest.Projects[removeIndex]}}).Projects[0]
 	if len(s.manifest.Projects) == 1 {
 		if fallback == nil {
 			return Project{}, false, fmt.Errorf("至少需要保留一个项目")
@@ -368,14 +460,24 @@ func (s *Store) removeProject(projectID string, fallback *Project) (removed Proj
 		if fallback.Name == "" || fallback.WorkspaceRoot == "" {
 			return Project{}, false, fmt.Errorf("临时项目名称和目录不能为空")
 		}
+	}
+
+	original := cloneManifest(s.manifest)
+	s.rememberActiveSession()
+	removed = cloneManifest(Manifest{Projects: []Project{s.manifest.Projects[removeIndex]}}).Projects[0]
+	if !isGeneratedBootstrapProject(removed) {
+		detachProject(&s.manifest.DetachedProjects, removed)
+	}
+	if len(s.manifest.Projects) == 1 {
 		session := newSession("新对话")
 		replacement := Project{
-			ID:                 genID("proj"),
-			Name:               fallback.Name,
-			WorkspaceRoot:      fallback.WorkspaceRoot,
-			ExtraWritableRoots: append([]string(nil), fallback.ExtraWritableRoots...),
-			CreatedAt:          nowRFC3339(),
-			Sessions:           []Session{session},
+			ID:                  genID("proj"),
+			Name:                fallback.Name,
+			WorkspaceRoot:       fallback.WorkspaceRoot,
+			ExtraWritableRoots:  append([]string(nil), fallback.ExtraWritableRoots...),
+			CreatedAt:           nowRFC3339(),
+			LastActiveSessionID: session.ID,
+			Sessions:            []Session{session},
 		}
 		s.manifest.Projects = []Project{replacement}
 		s.manifest.ActiveProjectID = replacement.ID
@@ -405,20 +507,40 @@ func (s *Store) removeProject(projectID string, fallback *Project) (removed Proj
 	return removed, activeChanged, nil
 }
 
+func detachProject(detached *[]Project, project Project) {
+	for index := range *detached {
+		candidate := &(*detached)[index]
+		if candidate.ID == project.ID || sameWorkspaceRoot(candidate.WorkspaceRoot, project.WorkspaceRoot) {
+			*candidate = project
+			return
+		}
+	}
+	*detached = append(*detached, project)
+}
+
 // SwitchProject 切换活动项目，活动会话设为该项目最近的未归档会话（或新建）。
 func (s *Store) SwitchProject(projectID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	original := cloneManifest(s.manifest)
 	p := s.findProject(projectID)
 	if p == nil {
 		return fmt.Errorf("项目不存在: %s", projectID)
 	}
+	s.rememberActiveSession()
 	s.manifest.ActiveProjectID = projectID
 	s.manifest.ActiveSessionID = ensureProjectActiveSession(p)
-	return s.save()
+	if err := s.save(); err != nil {
+		s.manifest = original
+		return err
+	}
+	return nil
 }
 
 func ensureProjectActiveSession(p *Project) string {
+	if session := p.findSession(strings.TrimSpace(p.LastActiveSessionID)); session != nil && !session.Archived {
+		return session.ID
+	}
 	pick := -1
 	for i := range p.Sessions {
 		if p.Sessions[i].Archived {
@@ -429,17 +551,28 @@ func ensureProjectActiveSession(p *Project) string {
 		}
 	}
 	if pick >= 0 {
-		return p.Sessions[pick].ID
+		p.LastActiveSessionID = p.Sessions[pick].ID
+		return p.LastActiveSessionID
 	}
 	replacement := newSession("新对话")
 	p.Sessions = append(p.Sessions, replacement)
-	return replacement.ID
+	p.LastActiveSessionID = replacement.ID
+	return p.LastActiveSessionID
+}
+
+func (s *Store) rememberActiveSession() {
+	project := s.findProject(s.manifest.ActiveProjectID)
+	if project == nil || project.findSession(s.manifest.ActiveSessionID) == nil {
+		return
+	}
+	project.LastActiveSessionID = s.manifest.ActiveSessionID
 }
 
 // NewSession 在活动项目下新建会话并切为活动。返回新会话。
 func (s *Store) NewSession(title string) (Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	original := cloneManifest(s.manifest)
 	p := s.findProject(s.manifest.ActiveProjectID)
 	if p == nil {
 		return Session{}, fmt.Errorf("无活动项目")
@@ -450,7 +583,12 @@ func (s *Store) NewSession(title string) (Session, error) {
 	sess := newSession(title)
 	p.Sessions = append(p.Sessions, sess)
 	s.manifest.ActiveSessionID = sess.ID
-	return sess, s.save()
+	p.LastActiveSessionID = sess.ID
+	if err := s.save(); err != nil {
+		s.manifest = original
+		return Session{}, err
+	}
+	return sess, nil
 }
 
 // SwitchSession 切换活动会话（须属于活动项目）。
@@ -473,11 +611,13 @@ func (s *Store) SwitchProjectSession(projectID, sessionID string) error {
 	if p.findSession(sessionID) == nil {
 		return fmt.Errorf("会话不存在: %s", sessionID)
 	}
-	originalProjectID, originalSessionID := s.manifest.ActiveProjectID, s.manifest.ActiveSessionID
+	original := cloneManifest(s.manifest)
+	s.rememberActiveSession()
 	s.manifest.ActiveProjectID = projectID
 	s.manifest.ActiveSessionID = sessionID
+	p.LastActiveSessionID = sessionID
 	if err := s.save(); err != nil {
-		s.manifest.ActiveProjectID, s.manifest.ActiveSessionID = originalProjectID, originalSessionID
+		s.manifest = original
 		return err
 	}
 	return nil
@@ -535,6 +675,7 @@ func (s *Store) TouchActiveSession() error {
 		return nil
 	}
 	sess.UpdatedAt = nowRFC3339()
+	p.LastActiveSessionID = sess.ID
 	return s.save()
 }
 
@@ -619,25 +760,12 @@ func (s *Store) DeleteProjectSession(projectID, sessionID string) (activeChanged
 
 		activeChanged = project.ID == s.manifest.ActiveProjectID && sessionID == s.manifest.ActiveSessionID
 		project.Sessions = append(project.Sessions[:sessionIndex], project.Sessions[sessionIndex+1:]...)
+		if project.LastActiveSessionID == sessionID {
+			project.LastActiveSessionID = ""
+		}
 
 		if activeChanged {
-			pick := -1
-			for index := range project.Sessions {
-				candidate := project.Sessions[index]
-				if candidate.Archived {
-					continue
-				}
-				if pick == -1 || candidate.UpdatedAt > project.Sessions[pick].UpdatedAt {
-					pick = index
-				}
-			}
-			if pick == -1 {
-				replacement := newSession("新对话")
-				project.Sessions = append(project.Sessions, replacement)
-				s.manifest.ActiveSessionID = replacement.ID
-			} else {
-				s.manifest.ActiveSessionID = project.Sessions[pick].ID
-			}
+			s.manifest.ActiveSessionID = ensureProjectActiveSession(project)
 		}
 
 		if saveErr := s.save(); saveErr != nil {

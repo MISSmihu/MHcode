@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MISSmihu/MHcode/internal/artifacts"
 )
 
 func TestResolveWorkspaceFile(t *testing.T) {
@@ -85,6 +87,52 @@ func TestReadWorkspaceFileReturnsSafeTextPreview(t *testing.T) {
 	}
 	if preview.Binary || preview.Truncated || preview.Encoding != "utf-8" {
 		t.Fatalf("unexpected preview metadata: %+v", preview)
+	}
+}
+
+func TestReadWorkspaceFileReturnsStructuredOfficePreviews(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name   string
+		path   string
+		kind   artifacts.Kind
+		create func(string) error
+	}{
+		{
+			name: "document", path: "report.docx", kind: artifacts.KindDocument,
+			create: func(path string) error {
+				return artifacts.CreateDocument(path, artifacts.DocumentSpec{Title: "Report"})
+			},
+		},
+		{
+			name: "spreadsheet", path: "report.xlsx", kind: artifacts.KindSpreadsheet,
+			create: func(path string) error {
+				return artifacts.WriteSpreadsheetRange(path, "Report", "A1", [][]any{{"Status", "Ready"}})
+			},
+		},
+		{
+			name: "presentation", path: "report.pptx", kind: artifacts.KindPresentation,
+			create: func(path string) error {
+				return artifacts.CreatePresentation(path, []artifacts.SlideSpec{{Title: "Review", Body: "Ready"}})
+			},
+		},
+	}
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	svc.runtimeSettings.WorkspaceRoot = root
+	svc.runtimeSettings.FilesystemAccess = "read-only"
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.create(filepath.Join(root, test.path)); err != nil {
+				t.Fatal(err)
+			}
+			preview, err := svc.ReadWorkspaceFile(test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !preview.Binary || preview.Artifact == nil || preview.Artifact.Kind != test.kind {
+				t.Fatalf("preview = %#v", preview)
+			}
+		})
 	}
 }
 

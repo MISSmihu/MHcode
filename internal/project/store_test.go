@@ -223,3 +223,57 @@ func TestRemoveProjectSwitchesActiveAndKeepsWorkspace(t *testing.T) {
 		t.Fatalf("fallback project = %#v", manifest.Projects)
 	}
 }
+
+func TestReattachProjectAfterRestartRestoresLastActiveSession(t *testing.T) {
+	base := t.TempDir()
+	manifestPath := filepath.Join(base, "projects.json")
+	workspace := filepath.Join(base, "workspace")
+	fallback := filepath.Join(base, "fallback")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fallback, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.EnsureBootstrap(workspace, "workspace"); err != nil {
+		t.Fatal(err)
+	}
+	projectID, firstSessionID := store.ActiveIDs()
+	selected, err := store.NewSession("selected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.NewSession("newer but not selected"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SwitchProjectSession(projectID, selected.ID); err != nil {
+		t.Fatal(err)
+	}
+	if selected.ID == firstSessionID {
+		t.Fatal("test setup did not create a distinct selected session")
+	}
+	if _, _, err := store.RemoveProjectWithFallback(projectID, "fallback", fallback, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := Open(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := restarted.CreateProject("workspace", workspace, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredProjectID, restoredSessionID := restarted.ActiveIDs()
+	if restored.ID != projectID || restoredProjectID != projectID {
+		t.Fatalf("restored project identity = %q/%q, want %q", restored.ID, restoredProjectID, projectID)
+	}
+	if restoredSessionID != selected.ID {
+		t.Fatalf("restored session = %q, want last active %q", restoredSessionID, selected.ID)
+	}
+}

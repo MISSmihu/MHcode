@@ -119,13 +119,18 @@ func (s *Service) recordTurnTerminal(status, content, model string, parts []tool
 	if s.eventStore == nil {
 		return nil
 	}
+	if err := s.recordMessageArtifacts(parts); err != nil {
+		return fmt.Errorf("记录任务终态产物失败: %w", err)
+	}
+	parts = s.mergeTurnTimelineParts(parts, content, status)
 	_, err := s.eventStore.Append(eventlog.EventPayload{
-		Role:       "assistant",
-		Content:    redactSensitiveText(content),
-		Model:      model,
-		DurationMs: durationMs,
-		Parts:      toEventParts(parts),
-		Status:     status,
+		Role:         "assistant",
+		Content:      redactSensitiveText(content),
+		Model:        model,
+		DurationMs:   durationMs,
+		Parts:        toEventParts(parts),
+		Status:       status,
+		FailureState: toEventFailureStrategyState(s.failureStrategySnapshot()),
 	}, eventlog.EventTurnTerminal)
 	if err != nil {
 		return fmt.Errorf("记录任务终止状态失败: %w", err)
@@ -184,16 +189,22 @@ func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []to
 	if s.eventStore == nil {
 		return
 	}
+	parts = s.mergeTurnTimelineParts(parts, content, "completed")
+	// Backfill provider- or test-produced file parts that did not pass through
+	// executeToolCall. Normal tool results are already registered and skipped by
+	// tool-call ID plus canonical path.
+	_ = s.recordMessageArtifacts(parts)
 	durationMs := int64(0)
 	if len(durations) > 0 && durations[0] > 0 {
 		durationMs = durations[0]
 	}
 	_, _ = s.eventStore.Append(eventlog.EventPayload{
-		Role:       "assistant",
-		Content:    content,
-		Model:      model,
-		DurationMs: durationMs,
-		Parts:      toEventParts(parts),
+		Role:         "assistant",
+		Content:      content,
+		Model:        model,
+		DurationMs:   durationMs,
+		Parts:        toEventParts(parts),
+		FailureState: toEventFailureStrategyState(s.failureStrategySnapshot()),
 	}, eventlog.EventAssistantMessage)
 	_, _ = s.eventStore.Append(eventlog.EventPayload{
 		Label:     truncateLabel(content),
@@ -482,6 +493,9 @@ func (s *Service) rebuildSessionFromEvents() {
 	if s.eventStore == nil {
 		return
 	}
+	events := s.eventStore.Events()
+	artifactRecords := artifactRecordsFromEvents(events, s.projectID, s.sessionID)
+	hasArtifactRegistry := len(artifactRecords) > 0
 	var systemMsg *protocol.Message
 	if len(s.sessionMessages) > 0 && s.sessionMessages[0].Role == "system" {
 		m := s.sessionMessages[0]
@@ -492,12 +506,25 @@ func (s *Service) rebuildSessionFromEvents() {
 	if systemMsg != nil {
 		rebuilt = append(rebuilt, *systemMsg)
 	}
+	appendAssistant := func(content string, parts []tools.ResultPart) {
+		if !hasArtifactRegistry {
+			rebuilt = s.appendProtocolAssistantMessage(rebuilt, content, parts)
+			return
+		}
+		message := s.protocolAssistantMessage(stripPrivateAssistantContext(content), parts)
+		message.Content = stripLocalArtifactContext(message.Content)
+		rebuilt = append(rebuilt, message)
+		if context := formatFailureStrategyContext(s.failureStrategySnapshot()); context != "" {
+			rebuilt = append(rebuilt, protocol.Message{Role: "system", Content: context, InternalKind: contextFailureStrategyKind})
+		}
+	}
 	turns := 0
 	pendingUser := false
 	s.planState = PlanState{}
+	s.replaceFailureStrategyState(failureStrategyState{})
 	s.teamResume = nil
 	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
-	for _, ev := range s.eventStore.Events() {
+	for _, ev := range events {
 		switch ev.Type {
 		case eventlog.EventUserMessage:
 			rebuilt = append(rebuilt, protocol.Message{
@@ -505,15 +532,21 @@ func (s *Service) rebuildSessionFromEvents() {
 			})
 			pendingUser = true
 		case eventlog.EventAssistantMessage:
-			content, _ := restoredAssistantMessage(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
-			rebuilt = append(rebuilt, protocol.Message{Role: "assistant", Content: content})
+			if failureState, ok := fromEventFailureStrategyState(ev.Payload.FailureState); ok {
+				s.replaceFailureStrategyState(failureState)
+			}
+			content, parts := restoredAssistantMessage(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
+			appendAssistant(content, parts)
 			pendingUser = false
 		case eventlog.EventTurnTerminal:
+			if failureState, ok := fromEventFailureStrategyState(ev.Payload.FailureState); ok {
+				s.replaceFailureStrategyState(failureState)
+			}
 			// A retained interrupted turn has its user event on the branch. A
 			// zero-output failure is rolled back before the terminal marker, so it
 			// must not become an orphan assistant message in future model context.
 			if pendingUser {
-				rebuilt = append(rebuilt, protocol.Message{Role: "assistant", Content: ev.Payload.Content})
+				appendAssistant(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
 				pendingUser = false
 				turns++
 			}
@@ -551,6 +584,18 @@ func (s *Service) rebuildSessionFromEvents() {
 			} else {
 				s.teamResume = nil
 			}
+		}
+	}
+	if hasArtifactRegistry {
+		context := formatLocalArtifactContext(artifactReferencesFromRecords(artifactRecords), 0)
+		if context != "" {
+			index := 0
+			if len(rebuilt) > 0 && rebuilt[0].Role == "system" && rebuilt[0].InternalKind == "" {
+				index = 1
+			}
+			rebuilt = append(rebuilt, protocol.Message{})
+			copy(rebuilt[index+1:], rebuilt[index:len(rebuilt)-1])
+			rebuilt[index] = protocol.Message{Role: "system", Content: context, InternalKind: contextArtifactKind}
 		}
 	}
 	s.sessionMessages = rebuilt

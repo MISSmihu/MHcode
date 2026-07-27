@@ -91,6 +91,56 @@ func TestChatTaskRunnerTracksSessionsIndependently(t *testing.T) {
 	}
 }
 
+func TestChatTaskStateTracksStructuredWaitingAndRetrying(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	task := &chatTask{id: "task-status", projectID: "project", sessionID: "session", status: "running", cancel: cancel}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{task.id: task}
+	app.chat.active = task
+
+	app.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "tool", Status: "waiting"})
+	if state := app.GetActiveChatTask(); state == nil || state.Status != "waiting" {
+		t.Fatalf("waiting state = %#v", state)
+	}
+	app.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "status", Status: "retrying"})
+	if state := app.GetActiveChatTask(); state == nil || state.Status != "retrying" {
+		t.Fatalf("retrying state = %#v", state)
+	}
+	app.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "tool", Status: "completed"})
+	if state := app.GetActiveChatTask(); state == nil || state.Status != "running" {
+		t.Fatalf("post-tool state = %#v", state)
+	}
+}
+
+func TestActiveChatTaskRestoresStructuredRuntimeSnapshot(t *testing.T) {
+	service := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	if err := service.StartTaskRuntime("task-snapshot", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordTaskStreamEvent("task-snapshot", agent.ChatStreamEvent{Type: "status", Message: "正在核验项目", Status: "waiting", Model: "test-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordTaskStreamEvent("task-snapshot", agent.ChatStreamEvent{Type: "delta", Delta: "partial"}); err != nil {
+		t.Fatal(err)
+	}
+	task := &chatTask{
+		id: "task-snapshot", projectID: "project", sessionID: "session", service: service,
+		startedAt: "2026-07-27T01:02:03Z", status: "waiting",
+	}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{task.id: task}
+	app.chat.active = task
+
+	state := app.GetActiveChatTask()
+	if state == nil || state.Status != "waiting" || state.Message != "正在核验项目" || state.Model != "test-model" || state.Content != "partial" {
+		t.Fatalf("active task snapshot = %#v", state)
+	}
+	if len(state.Parts) != 1 || state.Parts[0].Kind != "timeline_note" {
+		t.Fatalf("active task timeline = %#v", state.Parts)
+	}
+}
+
 func TestProjectSessionIdleCheckDistinguishesDuplicateSessionIDs(t *testing.T) {
 	_, cancelA := context.WithCancel(context.Background())
 	_, cancelB := context.WithCancel(context.Background())

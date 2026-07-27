@@ -19,6 +19,7 @@ const (
 	PartSubagent       PartKind = "subagent"
 	PartProviderNotice PartKind = "provider_notice"
 	PartSecretResult   PartKind = "secret_result"
+	PartTimelineNote   PartKind = "timeline_note"
 )
 
 type ProgressStep struct {
@@ -64,7 +65,7 @@ type ResultPart struct {
 
 	// tool_call
 	Name       string `json:"name,omitempty"`
-	Status     string `json:"status,omitempty"` // running | ok | error
+	Status     string `json:"status,omitempty"` // running | waiting | retrying | ok | error
 	Input      string `json:"input,omitempty"`
 	Output     string `json:"output,omitempty"`
 	ToolCallID string `json:"toolCallId,omitempty"`

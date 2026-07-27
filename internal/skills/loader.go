@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -60,7 +61,7 @@ func (l Loader) Index() ([]IndexEntry, error) {
 		if err != nil {
 			return err
 		}
-		entry := parseSkillData(path, data)
+		entry := l.applyRuntimeMetadata(path, parseSkillData(path, data))
 		entry.Source = l.origin
 		entry.Path = filepath.ToSlash(path)
 		entries = append(entries, entry)
@@ -108,7 +109,7 @@ func (l Loader) Load(name string) (LoadedSkill, error) {
 		if err != nil {
 			return err
 		}
-		entry := parseSkillData(path, data)
+		entry := l.applyRuntimeMetadata(path, parseSkillData(path, data))
 		entry.Source = l.origin
 		entry.Path = filepath.ToSlash(path)
 		if entry.Name != name {
@@ -179,10 +180,37 @@ func parseSkillData(path string, data []byte) IndexEntry {
 		Name:        name,
 		Version:     1,
 		Trigger:     summarizeTrigger(description),
+		TriggerMode: "description",
 		Summary:     summarizeSkill(name),
 		SHA256:      "sha256:" + hex.EncodeToString(sum[:]),
 		Description: description,
 	}
+}
+
+// applyRuntimeMetadata reads MHcode-specific activation metadata from a
+// product sidecar without adding non-standard keys to SKILL.md frontmatter.
+func (l Loader) applyRuntimeMetadata(skillPath string, entry IndexEntry) IndexEntry {
+	if l.source == nil {
+		return entry
+	}
+	metadataPath := pathpkg.Join(pathpkg.Dir(skillPath), "agents", "mhcode.yaml")
+	data, err := fs.ReadFile(l.source, metadataPath)
+	if err != nil {
+		return entry
+	}
+	metadata := parseKeyValueData(string(data))
+	activation := strings.ToLower(strings.TrimSpace(metadata["activation"]))
+	trigger := strings.TrimSpace(metadata["trigger"])
+	if activation == "manual" || strings.EqualFold(trigger, "manual") {
+		entry.Trigger = "manual"
+		entry.TriggerMode = "manual"
+		return entry
+	}
+	if trigger != "" {
+		entry.Trigger = trigger
+		entry.TriggerMode = "explicit"
+	}
+	return entry
 }
 
 func parseFrontmatter(content string) map[string]string {
@@ -205,6 +233,23 @@ func parseFrontmatter(content string) map[string]string {
 	return meta
 }
 
+func parseKeyValueData(content string) map[string]string {
+	metadata := map[string]string{}
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		metadata[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return metadata
+}
+
 func summarizeTrigger(description string) string {
 	if description == "" {
 		return "manual"
@@ -220,7 +265,9 @@ func summarizeTrigger(description string) string {
 func summarizeSkill(name string) string {
 	switch name {
 	case "mhcode-agent-core":
-		return "统一管理推理强度、Skills、MCP、工具调用、缓存命中和成本控制"
+		return "修改 MHcode 自身 Agent 内核时使用的架构与验证约束"
+	case "mhcode-office-artifacts":
+		return "创建和修改 DOCX、XLSX、PPTX 办公产物时使用的质量约束"
 	default:
 		return "按需加载 Skill 正文并生成稳定索引"
 	}

@@ -109,7 +109,10 @@ func SupportedReasoningLevelsWithProfile(profile, providerProtocol, baseURL, mod
 	case "deepseek":
 		return []string{"none", "high", "max"}
 	case "anthropic":
-		return []string{"none", "low", "medium", "high", "max"}
+		if levels := anthropicReasoningLevels(modelID); len(levels) > 0 {
+			return levels
+		}
+		return allReasoningLevels()
 	case "gemini":
 		return []string{"none", "low", "medium", "high"}
 	case "none":
@@ -125,7 +128,10 @@ func SupportedReasoningLevelsWithProfile(profile, providerProtocol, baseURL, mod
 	case "deepseek", "deepseek-official":
 		return []string{"none", "high", "max"}
 	case "anthropic", "anthropic-compatible":
-		return []string{"none", "low", "medium", "high", "max"}
+		if levels := anthropicReasoningLevels(modelID); len(levels) > 0 {
+			return levels
+		}
+		return allReasoningLevels()
 	case "gemini":
 		return []string{"none", "low", "medium", "high"}
 	case "openai-compatible", "local":
@@ -266,28 +272,20 @@ func xAIReasoningMaximum(modelID string) string {
 }
 
 func anthropicReasoningOptions(modelID, level string) ReasoningOptions {
-	if !anthropicModelSupportsThinking(modelID) {
+	capability, known := anthropicModelCapabilities(modelID)
+	if !known || capability.Thinking == anthropicThinkingUnsupported {
 		return ReasoningOptions{}
 	}
 	if level == "none" {
-		return ReasoningOptions{Mode: "disabled"}
-	}
-	if anthropicModelSupportsAdaptiveThinking(modelID) {
-		effort := effortForProductLevel(level, "max")
-		if effort == "xhigh" {
-			effort = "high"
+		if capability.AllowsDisabled {
+			return ReasoningOptions{Mode: "disabled"}
 		}
-		return ReasoningOptions{Mode: "adaptive", Effort: effort}
+		return ReasoningOptions{}
 	}
-
-	budgets := map[string]int{
-		"low":    1024,
-		"medium": 4096,
-		"high":   8192,
-		"xhigh":  12288,
-		"max":    16384,
+	if capability.Thinking == anthropicThinkingAdaptive {
+		return ReasoningOptions{Mode: "adaptive", Effort: effortForProductLevel(level, capability.MaximumEffort)}
 	}
-	return ReasoningOptions{Mode: "enabled", BudgetTokens: budgets[level]}
+	return ReasoningOptions{Mode: "enabled", BudgetTokens: anthropicBudgetForEffort(level)}
 }
 
 func geminiReasoningOptions(modelID, level string) ReasoningOptions {
@@ -318,20 +316,6 @@ func geminiReasoningOptions(modelID, level string) ReasoningOptions {
 		}
 	}
 	return ReasoningOptions{ThinkingLevel: thinkingLevel}
-}
-
-func anthropicModelSupportsThinking(modelID string) bool {
-	return strings.Contains(modelID, "claude-3-7") ||
-		strings.Contains(modelID, "claude-opus-4") ||
-		strings.Contains(modelID, "claude-sonnet-4") ||
-		strings.Contains(modelID, "claude-haiku-4") ||
-		strings.Contains(modelID, "claude-mythos")
-}
-
-func anthropicModelSupportsAdaptiveThinking(modelID string) bool {
-	return strings.Contains(modelID, "claude-mythos") ||
-		strings.Contains(modelID, "-4-6") ||
-		strings.Contains(modelID, "-4.6")
 }
 
 func effortForProductLevel(level, maximum string) string {

@@ -45,6 +45,31 @@ func TestFSLoaderLoadsFullSkillBody(t *testing.T) {
 	}
 }
 
+func TestLoaderParsesExplicitAndManualTriggers(t *testing.T) {
+	loader := NewFSLoader(fstest.MapFS{
+		"skills/auto/SKILL.md":             &fstest.MapFile{Data: []byte("---\nname: office-artifacts\ndescription: Office documents\n---\n# Office\n")},
+		"skills/auto/agents/mhcode.yaml":   &fstest.MapFile{Data: []byte("activation: auto\ntrigger: .xlsx | excel workbook\n")},
+		"skills/manual/SKILL.md":           &fstest.MapFile{Data: []byte("---\nname: manual-helper\ndescription: Manual helper\n---\n# Manual\n")},
+		"skills/manual/agents/mhcode.yaml": &fstest.MapFile{Data: []byte("activation: manual\n")},
+	}, "skills")
+	index, err := loader.Index()
+	if err != nil || len(index) != 2 {
+		t.Fatalf("index = %#v, err = %v", index, err)
+	}
+	entries := map[string]IndexEntry{}
+	for _, entry := range index {
+		entries[entry.Name] = entry
+	}
+	explicit := entries["office-artifacts"]
+	if explicit.Trigger != ".xlsx | excel workbook" || explicit.TriggerMode != "explicit" {
+		t.Fatalf("explicit trigger entry = %#v", explicit)
+	}
+	manual := entries["manual-helper"]
+	if manual.TriggerMode != "manual" {
+		t.Fatalf("manual trigger entry = %#v", manual)
+	}
+}
+
 func TestDiskLoaderExposesOnlyContainedSkillPath(t *testing.T) {
 	root := t.TempDir()
 	writeSkill(t, root, "disk-skill", "disk-skill", "disk trigger")

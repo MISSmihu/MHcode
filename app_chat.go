@@ -36,6 +36,7 @@ type chatTask struct {
 	sessionID         string
 	service           *agent.Service
 	startedAt         string
+	status            string
 	cancel            context.CancelFunc
 	acceptingGuidance bool
 	guidance          []chatGuidance
@@ -53,10 +54,18 @@ type chatGuidance struct {
 }
 
 type ChatTaskState struct {
-	TaskID    string `json:"taskId"`
-	StartedAt string `json:"startedAt"`
-	ProjectID string `json:"projectId,omitempty"`
-	SessionID string `json:"sessionId,omitempty"`
+	TaskID     string             `json:"taskId"`
+	StartedAt  string             `json:"startedAt"`
+	UpdatedAt  string             `json:"updatedAt,omitempty"`
+	ProjectID  string             `json:"projectId,omitempty"`
+	SessionID  string             `json:"sessionId,omitempty"`
+	Status     string             `json:"status"`
+	Message    string             `json:"message,omitempty"`
+	Model      string             `json:"model,omitempty"`
+	Content    string             `json:"content,omitempty"`
+	Reasoning  string             `json:"reasoning,omitempty"`
+	DurationMs int64              `json:"durationMs,omitempty"`
+	Parts      []tools.ResultPart `json:"parts,omitempty"`
 }
 
 type ChatTaskEvent struct {
@@ -171,6 +180,7 @@ func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessio
 		sessionID:         sessionID,
 		service:           runtime,
 		startedAt:         time.Now().Format(time.RFC3339Nano),
+		status:            "running",
 		cancel:            cancel,
 		acceptingGuidance: true,
 		done:              make(chan struct{}),
@@ -280,7 +290,6 @@ func (a *App) GuideChatMessageWithAttachments(taskID, guidanceID, prompt string,
 
 func (a *App) GetActiveChatTask() *ChatTaskState {
 	a.chat.mu.Lock()
-	defer a.chat.mu.Unlock()
 	task := a.chat.active
 	if task == nil {
 		for _, candidate := range a.chat.tasks {
@@ -289,22 +298,70 @@ func (a *App) GetActiveChatTask() *ChatTaskState {
 		}
 	}
 	if task == nil {
+		a.chat.mu.Unlock()
 		return nil
 	}
-	return &ChatTaskState{TaskID: task.id, StartedAt: task.startedAt, ProjectID: task.projectID, SessionID: task.sessionID}
+	status := task.status
+	a.chat.mu.Unlock()
+	return chatTaskState(task, status)
 }
 
 func (a *App) GetActiveChatTasks() []*ChatTaskState {
 	a.chat.mu.Lock()
-	defer a.chat.mu.Unlock()
-	states := make([]*ChatTaskState, 0, len(a.chat.tasks))
+	tasks := make([]struct {
+		task   *chatTask
+		status string
+	}, 0, len(a.chat.tasks)+1)
 	for _, task := range a.chat.tasks {
-		states = append(states, &ChatTaskState{TaskID: task.id, StartedAt: task.startedAt, ProjectID: task.projectID, SessionID: task.sessionID})
+		tasks = append(tasks, struct {
+			task   *chatTask
+			status string
+		}{task: task, status: task.status})
 	}
-	if len(states) == 0 && a.chat.active != nil {
-		states = append(states, &ChatTaskState{TaskID: a.chat.active.id, StartedAt: a.chat.active.startedAt, ProjectID: a.chat.active.projectID, SessionID: a.chat.active.sessionID})
+	if len(tasks) == 0 && a.chat.active != nil {
+		tasks = append(tasks, struct {
+			task   *chatTask
+			status string
+		}{task: a.chat.active, status: a.chat.active.status})
+	}
+	a.chat.mu.Unlock()
+	states := make([]*ChatTaskState, 0, len(tasks))
+	for _, entry := range tasks {
+		states = append(states, chatTaskState(entry.task, entry.status))
 	}
 	return states
+}
+
+func chatTaskState(task *chatTask, status string) *ChatTaskState {
+	if task == nil {
+		return nil
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = "running"
+	}
+	state := &ChatTaskState{
+		TaskID: task.id, StartedAt: task.startedAt, ProjectID: task.projectID,
+		SessionID: task.sessionID, Status: status,
+	}
+	if task.service != nil {
+		if snapshot, ok := task.service.TaskRuntimeSnapshot(); ok {
+			state.UpdatedAt = snapshot.UpdatedAt
+			state.Message = snapshot.Message
+			state.Model = snapshot.Model
+			state.Content = snapshot.Content
+			state.Reasoning = snapshot.Reasoning
+			state.DurationMs = snapshot.DurationMs
+			state.Parts = snapshot.Parts
+			if state.StartedAt == "" {
+				state.StartedAt = snapshot.StartedAt
+			}
+			if status == "running" && snapshot.Status != "" {
+				state.Status = snapshot.Status
+			}
+		}
+	}
+	return state
 }
 
 func (a *App) requireIdleChat(action string) error {
@@ -350,8 +407,10 @@ func chatSessionKey(projectID, sessionID string) string {
 
 func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, attachments []agent.ChatAttachment) {
 	defer task.markDone()
+	_ = task.service.StartTaskRuntime(task.id, task.startedAt)
 	a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "started", Message: "正在准备上下文"})
 	emitProgress := func(progress agent.ChatStreamEvent) {
+		_ = task.service.RecordTaskStreamEvent(task.id, progress)
 		a.emitChatTaskEvent(ChatTaskEvent{
 			TaskID:      task.id,
 			Type:        progress.Type,
@@ -402,6 +461,7 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 			Attachments: append([]agent.ChatAttachment(nil), guidance.attachments...),
 			Result:      &completedResult,
 		})
+		_ = task.service.StartGuidedTaskRuntime(task.id, "已收到引导，正在调整当前任务", result.Model)
 		currentPrompt = guidance.prompt
 		currentAttachments = guidance.attachments
 		guidanceTurn = true
@@ -434,6 +494,13 @@ func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 		return
 	}
 	task.terminalOnce.Do(func() {
+		result := agent.ChatResult{}
+		if event.Result != nil {
+			result = *event.Result
+		}
+		if task.service != nil {
+			_ = task.service.FinishTaskRuntime(task.id, event.Type, event.Message, result)
+		}
 		a.finishChatTask(task)
 		if task.cancel != nil {
 			task.cancel()
@@ -515,6 +582,7 @@ func (a *App) cancelActiveChatTask(taskID string) *chatTask {
 		return nil
 	}
 	task.acceptingGuidance = false
+	task.status = "cancelled"
 	a.chat.mu.Unlock()
 	if task.cancel != nil {
 		task.cancel()
@@ -584,6 +652,9 @@ func (a *App) emitChatTaskEvent(event ChatTaskEvent) {
 	if event.TaskID != "" {
 		a.chat.mu.Lock()
 		if task := a.chat.tasks[event.TaskID]; task != nil {
+			if status := chatTaskStatusFromEvent(event); status != "" {
+				task.status = status
+			}
 			if event.ProjectID == "" {
 				event.ProjectID = task.projectID
 			}
@@ -612,5 +683,28 @@ func (a *App) emitChatTaskEvent(event ChatTaskEvent) {
 	}
 	if a.ctx != nil {
 		wruntime.EventsEmit(a.ctx, "chat:task", event)
+	}
+}
+
+func chatTaskStatusFromEvent(event ChatTaskEvent) string {
+	switch event.Type {
+	case "failed", "cancelled", "completed":
+		return event.Type
+	case "status", "started":
+		if status := strings.TrimSpace(event.Status); status != "" {
+			return status
+		}
+		return "running"
+	case "tool":
+		switch event.Status {
+		case "waiting", "retrying":
+			return event.Status
+		default:
+			return "running"
+		}
+	case "context_compression", "delta", "reasoning", "provider_notice", "subagent", "progress", "team", "guidance":
+		return "running"
+	default:
+		return ""
 	}
 }

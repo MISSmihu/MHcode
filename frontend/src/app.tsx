@@ -85,6 +85,11 @@ import {
   resetDeepSeekSession,
   refreshModelProviderModels,
   refreshMCPServer,
+	refreshPlugins,
+	selectPluginDirectory,
+	installPlugin,
+	uninstallPlugin,
+	revealPlugin,
   saveDeepSeekAPIKey,
   saveModelProviderAPIKey,
   startChatMessageForSession,
@@ -313,6 +318,7 @@ function App() {
   const [syncingProviderID, setSyncingProviderID] = createSignal("");
   const [deletingProviderID, setDeletingProviderID] = createSignal("");
   const [refreshingMCPID, setRefreshingMCPID] = createSignal("");
+	const [pluginBusy, setPluginBusy] = createSignal("");
   const [promptDraft, setPromptDraft] = createSignal("");
   const [composerTailDraft, setComposerTailDraftSignal] = createSignal("");
   const [composerAttachments, setComposerAttachments] = createSignal<ChatAttachment[]>([]);
@@ -424,6 +430,7 @@ function App() {
   const snapshots = createMemo(() => state()?.mcpSnapshots ?? []);
   const builtinToolCount = createMemo(() => snapshots().find((snapshot) => snapshot.server === "builtin")?.tools.length ?? 0);
   const mcpServers = createMemo(() => state()?.mcpServers ?? []);
+	const pluginStatuses = createMemo(() => state()?.plugins ?? []);
   const skillsIndex = createMemo(() => state()?.skillsIndex ?? []);
   const contextPreview = createMemo(() => state()?.contextPreview);
   const runtimeSettings = createMemo(() => state()?.runtimeSettings ?? fallbackRuntimeSettings());
@@ -1037,11 +1044,18 @@ function App() {
     switch (event.type) {
       case "started":
       case "status":
-        updateSessionStreamingMessage(projectID, sessionID, (message) => ({ ...message, status: event.message || "正在思考", statusKind: undefined, compressionStatus: undefined }));
+		updateSessionStreamingMessage(projectID, sessionID, (message) => ({
+		  ...message,
+		  parts: updateLiveTimelineParts(message.parts, event),
+		  status: event.message || "正在思考",
+		  statusKind: streamStatusKind(event.status),
+		  compressionStatus: undefined,
+		}));
         break;
       case "context_compression":
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
+		  parts: updateLiveTimelineParts(message.parts, event),
           status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
           statusKind: "compression",
           compressionStatus: event.compression?.status === "completed" ? "completed" : event.compression?.status === "error" ? "error" : "running",
@@ -1067,7 +1081,8 @@ function App() {
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
           parts: mergeLiveToolResultParts(updateLiveToolParts(message.parts, event), event.parts),
-          status: event.status === "running" ? `正在运行 ${event.toolName || "工具"}` : event.status === "error" ? `${event.toolName || "工具"} 执行失败` : `${event.toolName || "工具"} 已完成`,
+          status: toolEventMessage(event),
+          statusKind: toolEventStatusKind(event.status),
         }));
         break;
       case "subagent":
@@ -1280,11 +1295,18 @@ function App() {
     switch (event.type) {
       case "started":
       case "status":
-        updateStreamingMessage((message) => ({ ...message, status: event.message || "正在思考", statusKind: undefined, compressionStatus: undefined }));
+		updateStreamingMessage((message) => ({
+		  ...message,
+		  parts: updateLiveTimelineParts(message.parts, event),
+		  status: event.message || "正在思考",
+		  statusKind: streamStatusKind(event.status),
+		  compressionStatus: undefined,
+		}));
         break;
       case "context_compression":
         updateStreamingMessage((message) => ({
           ...message,
+		  parts: updateLiveTimelineParts(message.parts, event),
           status: event.message || (event.compression?.status === "error" ? "自动压缩上下文失败" : "正在自动压缩上下文"),
           statusKind: "compression",
           compressionStatus: event.compression?.status === "completed"
@@ -1334,12 +1356,8 @@ function App() {
         updateStreamingMessage((message) => ({
           ...message,
           parts: mergeLiveToolResultParts(updateLiveToolParts(message.parts, event), event.parts),
-          status: event.status === "running"
-            ? `正在运行 ${event.toolName || "工具"}`
-            : event.status === "error"
-              ? `${event.toolName || "工具"} 执行失败`
-              : `${event.toolName || "工具"} 已完成`,
-          statusKind: undefined,
+          status: toolEventMessage(event),
+          statusKind: toolEventStatusKind(event.status),
           compressionStatus: undefined,
         }));
         break;
@@ -1837,6 +1855,68 @@ function App() {
       setRefreshingMCPID("");
     }
   };
+
+	const refreshPluginRuntime = async () => {
+		setPluginBusy("refresh");
+		setError("");
+		try {
+			if (runtimeDraft()) {
+				setState(await saveRuntimeSettings(activeRuntimeDraft()));
+				setRuntimeDraft(undefined);
+			}
+			setState(await refreshPlugins());
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			setPluginBusy("");
+		}
+	};
+
+	const installLocalPlugin = async () => {
+		setPluginBusy("install");
+		setError("");
+		try {
+			const source = await selectPluginDirectory();
+			if (!source.trim()) return;
+			if (runtimeDraft()) {
+				setState(await saveRuntimeSettings(activeRuntimeDraft()));
+				setRuntimeDraft(undefined);
+			}
+			setState(await installPlugin(source));
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			setPluginBusy("");
+		}
+	};
+
+	const removeInstalledPlugin = async (id: string) => {
+		setPluginBusy(`uninstall:${id}`);
+		setError("");
+		try {
+			if (runtimeDraft()) {
+				setState(await saveRuntimeSettings(activeRuntimeDraft()));
+				setRuntimeDraft(undefined);
+			}
+			setState(await uninstallPlugin(id));
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			setPluginBusy("");
+		}
+	};
+
+	const openInstalledPlugin = async (id: string) => {
+		setPluginBusy(`reveal:${id}`);
+		setError("");
+		try {
+			await revealPlugin(id);
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			setPluginBusy("");
+		}
+	};
 
   const resetSession = async () => {
     setResettingSession(true);
@@ -2410,6 +2490,7 @@ function App() {
         if (!projectID || !sessionID) continue;
         const startedAt = task.startedAt || new Date().toISOString();
         const messageID = "assistant-recovered-" + task.taskId;
+		const progress = findTaskProgress(task.parts);
         recovered[sessionIdentityKey(projectID, sessionID)] = {
           taskID: task.taskId,
           projectID,
@@ -2421,13 +2502,19 @@ function App() {
           attachments: [],
           links: [],
           startedAt,
+		  progress: progress ? cloneTaskProgress(progress) : undefined,
           assistantMessage: {
             id: messageID,
             role: "assistant",
-            content: "",
-            createdAt: startedAt,
-            streaming: true,
-            status: "后台任务正在运行",
+			content: task.content || "",
+			reasoning: task.reasoning,
+			createdAt: startedAt,
+			model: task.model,
+			parts: task.parts,
+			durationMs: task.durationMs,
+			streaming: true,
+			status: task.message || "后台任务正在运行",
+			statusKind: streamStatusKind(task.status),
           },
         };
       }
@@ -3966,7 +4053,7 @@ function App() {
               <Show
                 when={message.role === "user"}
                 fallback={
-                  <article class="op-msg assistant" classList={{ system: message.role === "system", failed: message.failed }}>
+				  <article class="op-msg assistant" classList={{ system: message.role === "system", failed: message.failed, interrupted: message.interrupted }}>
                     <MessageContent
                       parts={message.parts && message.parts.length > 0 ? message.parts : textToParts(message.content)}
                       hideTeamRun={message.streaming && activeSessionTask()?.messageID === message.id}
@@ -3985,19 +4072,34 @@ function App() {
                       isDisclosureOpen={(key) => isMessageDisclosureOpen(message.id, key)}
                       onDisclosureChange={(key, open) => setMessageDisclosureOpen(message.id, key, open)}
                     />
-					<Show when={message.streaming || message.cancelled}>
-                      <div class="op-stream-state" classList={{ cancelled: message.cancelled }}>
-                            <Show when={message.streaming}>
-                          <Show when={message.statusKind === "compression"} fallback={<span class="op-thinking-spinner" />}>
-                            <ListCollapse
-                              class="op-compression-icon"
-                              classList={{ completed: message.compressionStatus === "completed", error: message.compressionStatus === "error" }}
-                              size={14}
-                              aria-hidden="true"
-                            />
-                          </Show>
+					<Show when={message.streaming || message.cancelled || message.interrupted}>
+                      <div
+                        class="op-stream-state"
+                        classList={{
+                          cancelled: message.cancelled || message.statusKind === "cancelled",
+						  interrupted: message.interrupted,
+                          waiting: message.statusKind === "waiting",
+                          retrying: message.statusKind === "retrying",
+                          failed: message.statusKind === "failed",
+                        }}
+                      >
+                        <Show when={message.streaming}>
+                          <Switch fallback={<span class="op-thinking-spinner" />}>
+                            <Match when={message.statusKind === "compression"}>
+                              <ListCollapse
+                                class="op-compression-icon"
+                                classList={{ completed: message.compressionStatus === "completed", error: message.compressionStatus === "error" }}
+                                size={14}
+                                aria-hidden="true"
+                              />
+                            </Match>
+                            <Match when={message.statusKind === "waiting"}><Clock3 size={14} aria-hidden="true" /></Match>
+                            <Match when={message.statusKind === "retrying"}><RefreshCw class="op-status-retrying" size={14} aria-hidden="true" /></Match>
+                            <Match when={message.statusKind === "failed"}><AlertTriangle size={14} aria-hidden="true" /></Match>
+                          </Switch>
                         </Show>
-                        <span>{message.status || (message.cancelled ? "已停止" : "正在生成")}</span>
+						<Show when={message.interrupted && !message.streaming}><AlertTriangle size={14} aria-hidden="true" /></Show>
+						<span>{message.status || (message.interrupted ? "上次运行中断" : message.cancelled ? "已停止" : "正在生成")}</span>
 						<Show when={message.streaming}>
 						  <span class="op-stream-elapsed"><Clock3 size={12} aria-hidden="true" /><LiveElapsed startedAt={message.createdAt} /></span>
 						</Show>
@@ -4548,6 +4650,12 @@ function App() {
             resetUIAppearance={resetUIAppearance}
             refreshMCPServer={refreshMCPRuntime}
             refreshingMCPID={refreshingMCPID()}
+			plugins={pluginStatuses()}
+			pluginBusy={pluginBusy()}
+			installPlugin={installLocalPlugin}
+			refreshPlugins={refreshPluginRuntime}
+			revealPlugin={openInstalledPlugin}
+			uninstallPlugin={removeInstalledPlugin}
             providerKeyDrafts={providerKeyDrafts()}
             reasoningOptions={options()}
             runtimeDraft={activeRuntimeDraft()}
@@ -4784,6 +4892,44 @@ function insertTextAtSelection(editor: HTMLTextAreaElement | undefined, text: st
 	editor.setRangeText(text, start, end, "end");
 }
 
+function streamStatusKind(status?: string): ChatMessage["statusKind"] {
+  switch (status) {
+    case "waiting":
+    case "retrying":
+    case "failed":
+    case "cancelled":
+    case "completed":
+      return status;
+    case "running":
+      return "running";
+    default:
+      return undefined;
+  }
+}
+
+function toolEventMessage(event: ChatTaskEvent): string {
+	if (event.message?.trim()) return event.message.trim();
+	const name = event.toolName || "工具";
+	switch (event.status) {
+		case "waiting":
+			return `正在等待 ${name}`;
+		case "retrying":
+			return `正在重试 ${name}`;
+		case "error":
+		case "failed":
+			return `${name} 执行失败`;
+		case "completed":
+		case "ok":
+			return `${name} 已完成`;
+		default:
+			return `正在运行 ${name}`;
+	}
+}
+
+function toolEventStatusKind(status?: string): ChatMessage["statusKind"] {
+	return status === "waiting" || status === "retrying" ? status : undefined;
+}
+
 function chatFailureMessage(message: string): string {
   const normalized = message.trim();
   if (/\b502\b|bad gateway/i.test(normalized)) {
@@ -4838,6 +4984,28 @@ function updateLiveToolParts(parts: MessagePart[] | undefined, event: ChatTaskEv
   } else {
     next.push(livePart);
   }
+  return next;
+}
+
+function updateLiveTimelineParts(parts: MessagePart[] | undefined, event: ChatTaskEvent): MessagePart[] {
+  const message = event.message?.trim();
+  if (!message) return parts ?? [];
+  const status = event.type === "context_compression"
+    ? event.compression?.status || event.status || "running"
+    : event.status || "running";
+  const next = [...(parts ?? [])];
+  for (let index = next.length - 1; index >= 0; index--) {
+	const part = next[index];
+	if (part.kind !== "timeline_note") continue;
+	if (part.message === message && part.status === status) return next;
+	break;
+  }
+  next.push({
+	kind: "timeline_note",
+	message,
+	status,
+	startedAt: new Date().toISOString(),
+  });
   return next;
 }
 
@@ -4926,18 +5094,30 @@ function mergeLiveToolResultParts(
   for (const part of resultParts) {
     if (part.kind === "tool_call") {
       let index = -1;
+	  if (part.toolCallId) {
+		for (let candidate = next.length - 1; candidate >= 0; candidate--) {
+		  const currentPart = next[candidate];
+		  if (currentPart.kind === "tool_call" && currentPart.toolCallId === part.toolCallId) {
+			index = candidate;
+			break;
+		  }
+		}
+	  }
+	  if (index < 0) {
       for (let candidate = next.length - 1; candidate >= 0; candidate--) {
         const currentPart = next[candidate];
         if (currentPart.kind !== "tool_call" || currentPart.name !== part.name) continue;
+		if (part.toolCallId && currentPart.toolCallId && part.toolCallId !== currentPart.toolCallId) continue;
         if (part.input && currentPart.input && part.input !== currentPart.input) continue;
         index = candidate;
         break;
       }
+	  }
       if (index >= 0) {
         const currentPart = next[index] as Extract<MessagePart, { kind: "tool_call" }>;
         next[index] = isTerminalToolStatus(currentPart.status) && part.status === "running"
           ? currentPart
-          : { ...currentPart, ...part, toolCallId: currentPart.toolCallId };
+		  : { ...currentPart, ...part, toolCallId: part.toolCallId || currentPart.toolCallId };
       } else {
         next.push(part);
       }

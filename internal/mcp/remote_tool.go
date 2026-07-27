@@ -57,6 +57,13 @@ func (m *Manager) callTool(ctx context.Context, serverID, remoteName, displayNam
 	session := server.session
 	resultPolicy := server.config.ToolResultPolicy
 	m.mu.RUnlock()
+	tools.EmitProgress(ctx, tools.ResultPart{
+		Kind:   tools.PartToolCall,
+		Name:   displayName,
+		Status: "waiting",
+		Input:  truncateText(string(rawArgs), 1200),
+		Output: fmt.Sprintf("正在等待 MCP 服务器 %s 返回结果", serverID),
+	})
 	result, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: remoteName, Arguments: arguments})
 	if err != nil {
 		m.mu.Lock()

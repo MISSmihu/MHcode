@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
+import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, OpenSourceLicense, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -26,6 +26,7 @@ type WailsAppBinding = {
   ResetDeepSeekSession: () => Promise<WorkbenchState>;
   SaveRuntimeSettings: (settings: RuntimeSettings) => Promise<WorkbenchState>;
   GetAppInfo?: () => Promise<AppInfo>;
+  GetOpenSourceLicenses?: () => Promise<OpenSourceLicense[]>;
   GetUpdateState?: () => Promise<UpdateState>;
   CheckForUpdates?: () => Promise<UpdateState>;
   DownloadUpdate?: () => Promise<UpdateState>;
@@ -45,6 +46,11 @@ type WailsAppBinding = {
   DeleteModelProvider?: (providerID: string) => Promise<WorkbenchState>;
   RefreshModelProviderModels: (providerID: string) => Promise<WorkbenchState>;
   RefreshMCPServer?: (serverID: string) => Promise<WorkbenchState>;
+	RefreshPlugins?: () => Promise<WorkbenchState>;
+	SelectPluginDirectory?: () => Promise<string>;
+	InstallPlugin?: (source: string) => Promise<WorkbenchState>;
+	UninstallPlugin?: (id: string) => Promise<WorkbenchState>;
+	RevealPlugin?: (id: string) => Promise<void>;
   ListCheckpoints?: () => Promise<CheckpointInfo[]>;
   RewindToCheckpoint?: (checkpointID: string) => Promise<WorkbenchState>;
   ListBranches?: () => Promise<BranchInfo[]>;
@@ -145,12 +151,24 @@ const fallbackSkillsIndex: SkillIndexEntry[] = [
   {
     name: "mhcode-agent-core",
     version: 1,
-    trigger: "推理强度、缓存命中、MCP、工具调用、tokens 成本",
-    summary: "统一管理推理强度、Skills、MCP、工具调用、缓存命中和成本控制",
+    trigger: "mhcode agent | mhcode 工具注册 | mhcode 上下文组装",
+    triggerMode: "explicit",
+    summary: "修改 MHcode 自身 Agent 内核时使用的架构与验证约束",
     sha256: "sha256:local-preview",
-    description: "普通浏览器预览模式下的本地工作台状态。",
+    description: "仅在修改 MHcode 自身 Agent 内核时使用。",
     source: "preview",
     path: "skills/mhcode-agent-core/SKILL.md",
+  },
+  {
+    name: "mhcode-office-artifacts",
+    version: 1,
+    trigger: ".docx | .xlsx | .pptx | excel 工作簿 | 考勤表",
+    triggerMode: "explicit",
+    summary: "创建和修改 DOCX、XLSX、PPTX 办公产物时使用的质量约束",
+    sha256: "sha256:local-preview-office",
+    description: "创建或修改办公产物时使用。",
+    source: "preview",
+    path: "skills/mhcode-office-artifacts/SKILL.md",
   },
 ];
 
@@ -472,7 +490,7 @@ export async function getActiveChatTask(): Promise<ChatTaskState | null> {
   if (binding?.GetActiveChatTask) {
     return binding.GetActiveChatTask();
   }
-  return fallbackActiveChatTaskID ? { taskId: fallbackActiveChatTaskID, startedAt: new Date().toISOString() } : null;
+  return fallbackActiveChatTaskID ? { taskId: fallbackActiveChatTaskID, startedAt: new Date().toISOString(), status: "running" } : null;
 }
 
 export async function getActiveChatTasks(): Promise<ChatTaskState[]> {
@@ -511,7 +529,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.7",
+  version: "0.3.8",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",
@@ -534,6 +552,21 @@ const fallbackUpdateState: UpdateState = {
 export async function getAppInfo(): Promise<AppInfo> {
   const binding = wailsBinding();
   return binding?.GetAppInfo ? binding.GetAppInfo() : { ...fallbackAppInfo };
+}
+
+const fallbackOpenSourceLicenses: OpenSourceLicense[] = [
+  {
+    name: "MHcode",
+    description: "MHcode application source and binaries",
+    license: "MIT",
+    url: fallbackAppInfo.repositoryUrl,
+    text: "The complete offline license catalog is available in the MHcode desktop application.",
+  },
+];
+
+export async function getOpenSourceLicenses(): Promise<OpenSourceLicense[]> {
+  const binding = wailsBinding();
+  return binding?.GetOpenSourceLicenses ? binding.GetOpenSourceLicenses() : fallbackOpenSourceLicenses.map((item) => ({ ...item }));
 }
 
 export async function getUpdateState(): Promise<UpdateState> {
@@ -836,6 +869,46 @@ export async function refreshMCPServer(serverID: string): Promise<WorkbenchState
     })),
   };
   return cloneState(fallbackState);
+}
+
+export async function refreshPlugins(): Promise<WorkbenchState> {
+	const binding = wailsBinding();
+	if (binding?.RefreshPlugins) {
+		return binding.RefreshPlugins();
+	}
+	return cloneState(fallbackState);
+}
+
+export async function selectPluginDirectory(): Promise<string> {
+	const binding = wailsBinding();
+	if (binding?.SelectPluginDirectory) {
+		return binding.SelectPluginDirectory();
+	}
+	throw new Error("插件安装仅在 MHcode 桌面应用中可用。");
+}
+
+export async function installPlugin(source: string): Promise<WorkbenchState> {
+	const binding = wailsBinding();
+	if (binding?.InstallPlugin) {
+		return binding.InstallPlugin(source);
+	}
+	throw new Error("插件安装仅在 MHcode 桌面应用中可用。");
+}
+
+export async function uninstallPlugin(id: string): Promise<WorkbenchState> {
+	const binding = wailsBinding();
+	if (binding?.UninstallPlugin) {
+		return binding.UninstallPlugin(id);
+	}
+	throw new Error("插件卸载仅在 MHcode 桌面应用中可用。");
+}
+
+export async function revealPlugin(id: string): Promise<void> {
+	const binding = wailsBinding();
+	if (binding?.RevealPlugin) {
+		return binding.RevealPlugin(id);
+	}
+	throw new Error("插件目录仅在 MHcode 桌面应用中可用。");
 }
 
 function wailsBinding(): WailsAppBinding | undefined {
@@ -1520,12 +1593,32 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
         toolCount: 4,
       },
     ],
+		plugins: [
+			{
+				id: "office-artifacts",
+				name: "办公产物",
+				version: "1.0.0",
+				description: "独立读取、创建和编辑 DOCX、XLS/XLSX 与 PPTX。",
+				author: "MHcode",
+				source: "builtin",
+				state: "ready",
+				message: "内置产物引擎不依赖本机 Office。",
+				toolCount: 11,
+				availableToolCount: 11,
+				permissions: {fileRead: true, fileWrite: true, network: false},
+				grantedPermissions: {fileRead: true, fileWrite: true, network: false},
+				canUninstall: false,
+				manifestSchema: 1,
+				protocolVersion: "1.0",
+				tools: [],
+			},
+		],
     contextPreview: {
       stablePrefix: [
         { name: "product_identity", content: "MHcode 是面向开发者的 AI 协议交换台。" },
         { name: "system_rules", content: "稳定前缀保持顺序、文本和 schema 哈希可复现。" },
         { name: "reasoning", content: `${reasoning.id}:${reasoning.budget.cachePolicy}` },
-        { name: "skills_index", content: "skill: mhcode-agent-core" },
+        { name: "skills_index", content: "skill: mhcode-agent-core\n---\nskill: mhcode-office-artifacts" },
         { name: "mcp_schema_snapshot", content: "filesystem tools summary-first" },
         { name: "project_summary", content: "Go 核心引擎 + Wails v2 + SolidJS 前端。" },
         { name: "routing_policy", content: "DeepSeek official first, OpenAI-compatible later." },
@@ -1537,6 +1630,9 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
         { name: "output_requirements", content: "输出结构化摘要。" },
       ],
       prefixHash: "sha256:local-preview",
+      triggeredSkillNames: [],
+      triggeredSkillCharacters: 0,
+      triggeredSkillTokens: 0,
     },
     cacheDiagnostics: ["等待首轮模型请求记录缓存命中数据。"],
     runtimeSettings: defaultRuntimeSettings(),
@@ -1648,6 +1744,8 @@ function defaultRuntimeSettings(): RuntimeSettings {
     approvalPolicy: "on-request",
     workspaceRoot: "",
     extraWritableRoots: [],
+    toolTimeoutSeconds: 180,
+    taskIdleTimeoutSeconds: 300,
     maxCommandSeconds: 120,
     maxCommandMemoryMb: 4096,
     maxCommandCpuPercent: 100,
@@ -1718,6 +1816,13 @@ function defaultRuntimeSettings(): RuntimeSettings {
         },
       ],
     },
+		plugins: {
+			maxExecutionSeconds: 120,
+			maxOutputBytes: 1024 * 1024,
+			entries: [
+				{id: "office-artifacts", enabled: true, permissions: {fileRead: true, fileWrite: true, network: false}},
+			],
+		},
     model: {
       selectedProviderId: "deepseek",
       selectedModelId: "",
@@ -1819,6 +1924,11 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
       ...settings.mcp,
       servers: Array.isArray(settings.mcp?.servers) && settings.mcp.servers.length > 0 ? settings.mcp.servers : defaults.mcp.servers,
     },
+		plugins: {
+			...defaults.plugins,
+			...settings.plugins,
+			entries: Array.isArray(settings.plugins?.entries) ? settings.plugins.entries : defaults.plugins.entries,
+		},
     team: {
       ...defaults.team,
       ...settings.team,
@@ -1839,6 +1949,8 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
     extraWritableRoots: Array.isArray(merged.extraWritableRoots)
       ? merged.extraWritableRoots.map((item) => item.trim()).filter(Boolean)
       : [],
+    toolTimeoutSeconds: clampNumber(Number(merged.toolTimeoutSeconds), 5, 3600),
+    taskIdleTimeoutSeconds: clampNumber(Number(merged.taskIdleTimeoutSeconds), 15, 7200),
     maxCommandSeconds: clampNumber(Number(merged.maxCommandSeconds), 5, 3600),
     maxCommandMemoryMb: clampNumber(Number(merged.maxCommandMemoryMb), 256, 65536),
     maxCommandCpuPercent: clampNumber(Number(merged.maxCommandCpuPercent), 10, 100),
@@ -1906,6 +2018,23 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
         toolResultPolicy: server.toolResultPolicy || "summary-first",
       })),
     },
+		plugins: {
+			...merged.plugins,
+			maxExecutionSeconds: clampNumber(Number(merged.plugins.maxExecutionSeconds), 5, 3600),
+			maxOutputBytes: clampNumber(Number(merged.plugins.maxOutputBytes), 64 * 1024, 16 * 1024 * 1024),
+			entries: merged.plugins.entries
+				.map((entry) => ({
+					id: entry.id.trim().toLowerCase(),
+					enabled: Boolean(entry.enabled),
+					permissions: {
+						fileRead: Boolean(entry.permissions?.fileRead),
+						fileWrite: Boolean(entry.permissions?.fileWrite),
+						network: Boolean(entry.permissions?.network),
+					},
+				}))
+				.filter((entry, index, entries) => entry.id && entries.findIndex((candidate) => candidate.id === entry.id) === index)
+				.sort((left, right) => left.id.localeCompare(right.id)),
+		},
     model: {
       ...merged.model,
       selectedProviderId: merged.model.selectedProviderId || merged.model.providers[0]?.id || "",
@@ -1928,6 +2057,16 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
               provider: model.provider?.trim() || provider.id,
               contextWindowTokens: normalizeTokenWindow(model.contextWindowTokens),
               contextWindowSource: normalizeContextWindowSource(model.contextWindowSource, model.contextWindowTokens),
+              maxOutputTokens: normalizeTokenWindow(model.maxOutputTokens ?? 0),
+              reasoningLevels: Array.isArray(model.reasoningLevels)
+                ? model.reasoningLevels.filter((level) => ["none", "low", "medium", "high", "xhigh", "max"].includes(level))
+                : undefined,
+              thinkingModes: Array.isArray(model.thinkingModes)
+                ? model.thinkingModes.filter((mode) => ["adaptive", "enabled", "disabled"].includes(mode))
+                : undefined,
+              unsupportedParameters: Array.isArray(model.unsupportedParameters)
+                ? model.unsupportedParameters.filter((parameter) => ["temperature", "thinking", "output_config"].includes(parameter))
+                : undefined,
             }))
           : [],
         supportsModelFetch: supportsProviderModelFetch(provider.protocol),

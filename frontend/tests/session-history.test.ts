@@ -71,13 +71,15 @@ describe("session history reconciliation", () => {
     ]);
   });
 
-	test("restores durable failed and cancelled task states", () => {
+	test("restores durable failed, cancelled, and interrupted task states", () => {
 	  expect(reconcileSessionMessages([], [
 		{ id: "failed", role: "assistant", content: "failed", createdAt: "2026-07-19T02:00:00.000Z", status: "failed" },
 		{ id: "cancelled", role: "assistant", content: "stopped", createdAt: "2026-07-19T02:00:01.000Z", status: "cancelled" },
+		{ id: "interrupted", role: "assistant", content: "partial", createdAt: "2026-07-19T02:00:02.000Z", status: "interrupted" },
 	  ], false)).toMatchObject([
-		{ id: "failed", failed: true, cancelled: false },
-		{ id: "cancelled", failed: false, cancelled: true },
+		{ id: "failed", failed: true, cancelled: false, interrupted: false },
+		{ id: "cancelled", failed: false, cancelled: true, interrupted: false },
+		{ id: "interrupted", failed: false, cancelled: false, interrupted: true, status: "上次运行中断", statusKind: "failed" },
 	  ]);
 	});
 });

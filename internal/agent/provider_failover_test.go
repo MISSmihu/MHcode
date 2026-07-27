@@ -32,10 +32,16 @@ func TestFailoverProviderRetriesCompletionOnAlternateRoute(t *testing.T) {
 				return protocol.CompletionResult{}, io.EOF
 			},
 		}},
-		{route: chatRoute{Provider: ModelProviderSetting{ID: "two", Name: "two"}, ModelID: "model-two"}, provider: failoverProviderStub{
+		{route: chatRoute{
+			Provider: ModelProviderSetting{ID: "two", Name: "two"}, ModelID: "model-two",
+			Model: ProviderModel{ID: "model-two", MaxOutputTokens: 32_000, ReasoningLevels: []string{"none", "high"}, ThinkingModes: []string{"adaptive"}},
+		}, provider: failoverProviderStub{
 			name: "two", complete: func(request protocol.ChatRequest) (protocol.CompletionResult, error) {
 				if request.Model != "model-two" {
 					t.Fatalf("fallback model = %q", request.Model)
+				}
+				if request.MaxOutputTokens != 32_000 || len(request.ModelReasoningLevels) != 2 || len(request.ModelThinkingModes) != 1 {
+					t.Fatalf("fallback model metadata = %#v", request)
 				}
 				return protocol.CompletionResult{Content: "ok"}, nil
 			},

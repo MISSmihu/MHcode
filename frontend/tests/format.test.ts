@@ -50,6 +50,10 @@ describe("frontend fallback state", () => {
     expect(inferModelContextWindow("grok-4.20-0309-non-reasoning", "openai-compatible")).toEqual({ tokens: 1_000_000, source: "catalog" });
     expect(inferModelContextWindow("grok-4.20-multi-agent", "openai-compatible")).toEqual({ tokens: 1_000_000, source: "catalog" });
     expect(inferModelContextWindow("grok-chat-fast", "openai-compatible")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
+    expect(inferModelContextWindow("claude-fable-5", "anthropic")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
+    expect(inferModelContextWindow("claude-opus-5-20260724", "anthropic-compatible")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
+    expect(inferModelContextWindow("claude-opus-4-5-20251101", "anthropic")).toEqual({ tokens: 200_000, source: "catalog" });
+    expect(inferModelContextWindow("claude-unknown", "anthropic")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
   });
 
   test("keeps the five team roles explicit and disabled by default", () => {

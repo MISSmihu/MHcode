@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MISSmihu/MHcode/internal/tools"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -75,12 +76,19 @@ func TestManagerStreamableHTTPDiscoverAndExecute(t *testing.T) {
 	if !ok || !remote.ReadOnly() {
 		t.Fatalf("tool = %#v, want read-only RemoteTool", available[0])
 	}
-	result, err := available[0].Execute(ctx, json.RawMessage(`{"a":2,"b":3}`))
+	progress := make([]tools.ResultPart, 0, 1)
+	callCtx := tools.WithProgressSink(ctx, func(part tools.ResultPart) {
+		progress = append(progress, part)
+	})
+	result, err := available[0].Execute(callCtx, json.RawMessage(`{"a":2,"b":3}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.IsError || !strings.Contains(result.Summary, "sum=5") || !strings.Contains(result.Summary, `"sum":5`) {
 		t.Fatalf("result = %#v", result)
+	}
+	if len(progress) != 1 || progress[0].Status != "waiting" || !strings.Contains(progress[0].Output, "test-server") {
+		t.Fatalf("MCP progress = %#v", progress)
 	}
 
 	snapshots := manager.Snapshots()

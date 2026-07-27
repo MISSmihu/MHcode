@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/MISSmihu/MHcode/internal/plugins"
 )
 
 func TestResolveDefaultWorkspaceRootUsesRepositoryAboveBuildBin(t *testing.T) {
@@ -68,11 +70,15 @@ func TestRuntimeSettingsMigrationBackfillsProcessResourceLimits(t *testing.T) {
 	if !loaded {
 		t.Fatal("runtime settings were not loaded")
 	}
-	if settings.SchemaVersion != runtimeSettingsSchemaVersion || settings.MaxCommandMemoryMB != 4096 || settings.MaxCommandCPUPercent != 100 || settings.MaxCommandProcesses != 128 {
+	if settings.SchemaVersion != runtimeSettingsSchemaVersion || settings.ToolTimeoutSeconds != 180 || settings.TaskIdleTimeoutSeconds != 300 || settings.MaxCommandMemoryMB != 4096 || settings.MaxCommandCPUPercent != 100 || settings.MaxCommandProcesses != 128 {
 		t.Fatalf("migrated settings = %#v", settings)
 	}
 	if settings.Team.Enabled || settings.Team.MaxReviewRounds != 1 || len(settings.Team.Roles) != 5 {
 		t.Fatalf("migrated team settings = %#v", settings.Team)
+	}
+	artifactTools, artifactToolsOK := plugins.SettingFor(settings.Plugins, plugins.ArtifactPluginID)
+	if !artifactToolsOK || !artifactTools.Enabled || !artifactTools.Permissions.FileRead || !artifactTools.Permissions.FileWrite {
+		t.Fatalf("migrated plugin settings = %#v", settings.Plugins)
 	}
 }
 

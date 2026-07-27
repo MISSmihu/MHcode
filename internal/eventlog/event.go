@@ -18,6 +18,7 @@ const (
 	EventPlanUpdate       EventType = "plan_update"
 	EventTeamCheckpoint   EventType = "team_checkpoint"
 	EventTurnTerminal     EventType = "turn_terminal"
+	EventArtifactUpdate   EventType = "artifact_update"
 )
 
 // Event 是事件日志的一条记录。所有事件 append-only，靠 ParentID 串成树。
@@ -35,13 +36,14 @@ type Event struct {
 // EventPayload 承载各类事件的数据。用扁平可选字段而非 interface，便于 JSONL 序列化与回读。
 type EventPayload struct {
 	// message 类
-	Role        string              `json:"role,omitempty"`
-	Content     string              `json:"content,omitempty"`
-	Model       string              `json:"model,omitempty"`
-	DurationMs  int64               `json:"durationMs,omitempty"`
-	Parts       []MessagePart       `json:"parts,omitempty"`
-	Attachments []MessageAttachment `json:"attachments,omitempty"`
-	Status      string              `json:"status,omitempty"`
+	Role         string                `json:"role,omitempty"`
+	Content      string                `json:"content,omitempty"`
+	Model        string                `json:"model,omitempty"`
+	DurationMs   int64                 `json:"durationMs,omitempty"`
+	Parts        []MessagePart         `json:"parts,omitempty"`
+	Attachments  []MessageAttachment   `json:"attachments,omitempty"`
+	Status       string                `json:"status,omitempty"`
+	FailureState *FailureStrategyState `json:"failureState,omitempty"`
 
 	// file_snapshot 类
 	Path            string `json:"path,omitempty"`
@@ -65,6 +67,70 @@ type EventPayload struct {
 	// team_checkpoint stores a content-addressed JSON checkpoint so repeated
 	// role transitions do not inflate events.jsonl.
 	TeamCheckpointHash string `json:"teamCheckpointHash,omitempty"`
+
+	// artifact_update stores tool-confirmed file metadata on the same event
+	// branch as the conversation. Rewind and branch switching therefore change
+	// the visible artifact registry without a second mutable database.
+	Artifacts []ArtifactRecord `json:"artifacts,omitempty"`
+}
+
+// ArtifactRecord is a durable observation of a file created, modified, read,
+// or deleted by a tool. EventID, BranchID, and CheckpointID are derived again
+// when a branch is read so they always describe the selected branch.
+type ArtifactRecord struct {
+	ID                     string `json:"id"`
+	EventID                string `json:"eventId,omitempty"`
+	Path                   string `json:"path"`
+	DisplayPath            string `json:"displayPath,omitempty"`
+	Name                   string `json:"name,omitempty"`
+	FileType               string `json:"fileType,omitempty"`
+	MIMEType               string `json:"mimeType,omitempty"`
+	Size                   int64  `json:"size,omitempty"`
+	ModifiedAt             string `json:"modifiedAt,omitempty"`
+	SHA256                 string `json:"sha256,omitempty"`
+	Action                 string `json:"action,omitempty"`
+	Status                 string `json:"status"`
+	Tool                   string `json:"tool,omitempty"`
+	ToolCallID             string `json:"toolCallId,omitempty"`
+	MessageID              string `json:"messageId,omitempty"`
+	ProjectID              string `json:"projectId,omitempty"`
+	SessionID              string `json:"sessionId,omitempty"`
+	BranchID               string `json:"branchId,omitempty"`
+	CheckpointID           string `json:"checkpointId,omitempty"`
+	StructuralVerification string `json:"structuralVerification,omitempty"`
+	VisualVerification     string `json:"visualVerification,omitempty"`
+	FailureReason          string `json:"failureReason,omitempty"`
+	PreviewReference       string `json:"previewReference,omitempty"`
+	RenderReference        string `json:"renderReference,omitempty"`
+	LastCheckedAt          string `json:"lastCheckedAt,omitempty"`
+}
+
+// FailureStrategyState is the durable, branch-local summary of tool strategies
+// that failed without any intervening progress. It intentionally stores hashes
+// and redacted summaries instead of raw arguments so credentials never enter
+// the event log.
+type FailureStrategyState struct {
+	Version          int                     `json:"version"`
+	Revision         int                     `json:"revision"`
+	ProgressRevision int                     `json:"progressRevision"`
+	Records          []FailureStrategyRecord `json:"records,omitempty"`
+}
+
+type FailureStrategyRecord struct {
+	Fingerprint      string   `json:"fingerprint"`
+	StrategyKey      string   `json:"strategyKey"`
+	Tool             string   `json:"tool"`
+	Category         string   `json:"category"`
+	FailureClass     string   `json:"failureClass"`
+	ExitCode         *int     `json:"exitCode,omitempty"`
+	Attempts         int      `json:"attempts"`
+	BlockedAttempts  int      `json:"blockedAttempts,omitempty"`
+	ProgressRevision int      `json:"progressRevision"`
+	FirstTurn        int      `json:"firstTurn"`
+	LastTurn         int      `json:"lastTurn"`
+	Summary          string   `json:"summary,omitempty"`
+	Alternatives     []string `json:"alternatives,omitempty"`
+	Retryable        bool     `json:"retryable,omitempty"`
 }
 
 type MessageAttachment struct {

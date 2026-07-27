@@ -190,6 +190,41 @@ func (p SandboxPolicy) ValidateCommand(command string) error {
 	return nil
 }
 
+// ValidateDirectCommand applies the same conservative broker policy to an
+// executable and its raw argv. Display quoting is deliberately excluded: a
+// quoted label is presentation data and must never become security input.
+func (p SandboxPolicy) ValidateDirectCommand(executable string, args []string) error {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return errors.New("executable cannot be empty")
+	}
+	values := make([]string, 0, len(args)+1)
+	values = append(values, filepath.Base(executable))
+	values = append(values, args...)
+	command := strings.Join(values, " ")
+	normalized := strings.ToLower(strings.ReplaceAll(command, `\`, "/"))
+	if tool := structuredFileToolForCommand(normalized); tool != "" {
+		return fmt.Errorf("%w: use %s", ErrShellFileOperation, tool)
+	}
+	if tool := structuredRemoteToolForCommand(normalized); tool != "" {
+		return fmt.Errorf("%w: use %s", ErrShellRemoteOperation, tool)
+	}
+	if !p.AllowDestructiveOps && commandLooksDestructive(normalized) {
+		return ErrDestructiveDisabled
+	}
+	if !p.NetworkAccess && commandLooksNetworked(normalized) {
+		return ErrCommandNetworkDisabled
+	}
+	if !strings.EqualFold(strings.TrimSpace(p.FilesystemAccess), "unrestricted") {
+		for _, argument := range args {
+			if commandReferencesForeignPath(argument, p) {
+				return ErrCommandOutsideRoots
+			}
+		}
+	}
+	return nil
+}
+
 func structuredRemoteToolForCommand(command string) string {
 	canonical := strings.NewReplacer(
 		`"`, " ", `'`, " ", "(", " ", ")", " ", "{", " ", "}", " ",

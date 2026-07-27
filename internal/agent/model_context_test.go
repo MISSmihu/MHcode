@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
@@ -24,7 +25,7 @@ func TestResolveProviderModelContextsUsesBestAvailableSource(t *testing.T) {
 	models := resolveProviderModelContexts(provider, []protocol.Model{
 		{ID: "manual-model", ContextWindowTokens: 100_000, ContextWindowSource: ContextWindowSourceUpstream},
 		{ID: "gpt-4o-mini"},
-		{ID: "reported-model", ContextWindowTokens: 222_000},
+		{ID: "reported-model", ContextWindowTokens: 222_000, MaxOutputTokens: 32_000, ReasoningLevels: []string{"none", "high"}, ThinkingModes: []string{"adaptive"}},
 		{ID: "unknown-model"},
 	})
 
@@ -34,6 +35,9 @@ func TestResolveProviderModelContextsUsesBestAvailableSource(t *testing.T) {
 	}
 	assertModelContext(t, models[1], 128_000, ContextWindowSourceCatalog)
 	assertModelContext(t, models[2], 222_000, ContextWindowSourceUpstream)
+	if models[2].MaxOutputTokens != 32_000 || len(models[2].ReasoningLevels) != 2 || len(models[2].ThinkingModes) != 1 {
+		t.Fatalf("reported capabilities = %#v", models[2])
+	}
 	assertModelContext(t, models[3], 32_768, ContextWindowSourceProvider)
 }
 
@@ -61,6 +65,11 @@ func TestInferModelContextWindowUsesExactCatalogIDs(t *testing.T) {
 		{modelID: "grok-4.3", tokens: 1_000_000, source: ContextWindowSourceCatalog},
 		{modelID: "grok-4.20-multi-agent", tokens: 1_000_000, source: ContextWindowSourceCatalog},
 		{modelID: "grok-chat-fast"},
+		{modelID: "claude-fable-5"},
+		{modelID: "anthropic/claude-opus-5"},
+		{modelID: "claude-opus-5-20260724"},
+		{modelID: "claude-opus-4-5-20251101", tokens: 200_000, source: ContextWindowSourceCatalog},
+		{modelID: "claude-unknown"},
 	}
 
 	for _, test := range tests {
@@ -71,6 +80,47 @@ func TestInferModelContextWindowUsesExactCatalogIDs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUnknownAnthropicModelsDoNotClaimProtocolWide200K(t *testing.T) {
+	tokens, source := inferModelContextWindow("claude-custom-proxy-model", "anthropic-compatible")
+	if tokens != 0 || source != "" {
+		t.Fatalf("context = %d/%s, want unknown", tokens, source)
+	}
+	models := resolveProviderModelContexts(
+		ModelProviderSetting{ID: "custom", Protocol: "anthropic-compatible"},
+		[]protocol.Model{{ID: "claude-custom-proxy-model"}},
+	)
+	assertModelContext(t, models[0], safeDefaultContextWindowTokens, ContextWindowSourceFallback)
+}
+
+func TestRuntimeSettingsMigratesUnverifiedClaude5CatalogContext(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "runtime-settings.json")
+	stored := DefaultRuntimeSettings()
+	stored.SchemaVersion = 11
+	stored.Model.Providers = []ModelProviderSetting{{
+		ID: "anthropic", Protocol: "anthropic", Models: []ProviderModel{
+			{ID: "claude-fable-5", ContextWindowTokens: 1_000_000, ContextWindowSource: ContextWindowSourceCatalog},
+			{ID: "claude-opus-5", ContextWindowTokens: 900_000, ContextWindowSource: ContextWindowSourceManual},
+			{ID: "claude-sonnet-5", ContextWindowTokens: 1_000_000, ContextWindowSource: ContextWindowSourceUpstream},
+		},
+	}}
+	encoded, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, ok := loadRuntimeSettings(settingsPath)
+	if !ok || len(loaded.Model.Providers) != 1 || len(loaded.Model.Providers[0].Models) != 3 {
+		t.Fatalf("loaded settings = %#v ok=%v", loaded.Model.Providers, ok)
+	}
+	models := loaded.Model.Providers[0].Models
+	assertProviderModelContext(t, models[0], safeDefaultContextWindowTokens, ContextWindowSourceFallback)
+	assertProviderModelContext(t, models[1], 900_000, ContextWindowSourceManual)
+	assertProviderModelContext(t, models[2], 1_000_000, ContextWindowSourceUpstream)
 }
 
 func TestRuntimeSettingsMigratesStaleXAIContextGuess(t *testing.T) {
@@ -187,7 +237,10 @@ func TestRuntimeSettingsBackfillAndPersistModelContext(t *testing.T) {
 				ID:       "custom",
 				Name:     "Custom",
 				Protocol: "openai-compatible",
-				Models:   []ProviderModel{{ID: "gpt-5.5", DisplayName: "gpt-5.5", Provider: "custom"}},
+				Models: []ProviderModel{{
+					ID: "gpt-5.5", DisplayName: "gpt-5.5", Provider: "custom", MaxOutputTokens: 64_000,
+					ReasoningLevels: []string{"none", "high", "high", "invalid"}, ThinkingModes: []string{"adaptive", "invalid"},
+				}},
 			}},
 		},
 	}
@@ -207,6 +260,9 @@ func TestRuntimeSettingsBackfillAndPersistModelContext(t *testing.T) {
 	if provider.Models[0].ContextWindowTokens != 1_050_000 || provider.Models[0].ContextWindowSource != ContextWindowSourceCatalog {
 		t.Fatalf("backfilled model = %#v", provider.Models[0])
 	}
+	if provider.Models[0].MaxOutputTokens != 64_000 || len(provider.Models[0].ReasoningLevels) != 2 || len(provider.Models[0].ThinkingModes) != 1 {
+		t.Fatalf("normalized model capabilities = %#v", provider.Models[0])
+	}
 
 	persistedData, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -217,8 +273,68 @@ func TestRuntimeSettingsBackfillAndPersistModelContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	persistedProvider, _, ok := findModelProvider(persisted.Model.Providers, "custom")
-	if !ok || len(persistedProvider.Models) != 1 || persistedProvider.Models[0].ContextWindowTokens != 1_050_000 {
+	if !ok || len(persistedProvider.Models) != 1 || persistedProvider.Models[0].ContextWindowTokens != 1_050_000 || persistedProvider.Models[0].MaxOutputTokens != 64_000 {
 		t.Fatalf("persisted provider = %#v", persistedProvider)
+	}
+}
+
+func TestAnthropicCompatibilityLearningPersistsPerProviderModel(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "runtime-settings.json")
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath})
+	settings := service.WorkbenchState().RuntimeSettings
+	settings.Model = ModelSettings{
+		SelectedProviderID: "relay",
+		SelectedModelID:    "relay-claude",
+		Providers: []ModelProviderSetting{{
+			ID: "relay", Name: "Relay", Protocol: "anthropic-compatible", Enabled: true,
+			Models: []ProviderModel{{ID: "relay-claude", DisplayName: "Relay Claude", Provider: "relay"}},
+		}},
+	}
+	if _, err := service.SaveRuntimeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	providerSetting, _, ok := findModelProvider(service.runtimeSettings.Model.Providers, "relay")
+	if !ok {
+		t.Fatal("relay provider was not saved")
+	}
+	model, _, ok := findProviderModel(providerSetting.Models, "relay-claude")
+	if !ok {
+		t.Fatal("relay model was not saved")
+	}
+	provider, err := service.chatProviderForRoute(chatRoute{
+		Provider: providerSetting, ModelID: model.ID, Model: model, APIKey: "test-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, ok := provider.(protocol.AnthropicProvider)
+	if !ok || client.CompatibilityFeedback == nil {
+		t.Fatalf("provider = %#v", provider)
+	}
+	client.CompatibilityFeedback(protocol.AnthropicCompatibilityFeedback{
+		ProviderID: "relay", ModelID: "relay-claude", UnsupportedParameters: []string{"temperature", "temperature", "invalid"},
+	})
+
+	persistedData, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted RuntimeSettings
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	persistedProvider, _, ok := findModelProvider(persisted.Model.Providers, "relay")
+	if !ok {
+		t.Fatal("persisted relay provider is missing")
+	}
+	persistedModel, _, ok := findProviderModel(persistedProvider.Models, "relay-claude")
+	if !ok || strings.Join(persistedModel.UnsupportedParameters, ",") != "temperature" {
+		t.Fatalf("persisted model = %#v", persistedModel)
+	}
+	var request protocol.ChatRequest
+	applyRouteToChatRequest(&request, chatRoute{ModelID: persistedModel.ID, Model: persistedModel})
+	if strings.Join(request.ModelUnsupportedParameters, ",") != "temperature" {
+		t.Fatalf("request compatibility = %#v", request.ModelUnsupportedParameters)
 	}
 }
 

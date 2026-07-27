@@ -10,6 +10,17 @@ import (
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
+type approvalProgressProbeTool struct{}
+
+func (approvalProgressProbeTool) Name() string        { return "run_command" }
+func (approvalProgressProbeTool) Description() string { return "approval progress probe" }
+func (approvalProgressProbeTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (approvalProgressProbeTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	return tools.Result{Summary: "executed"}, nil
+}
+
 func TestApprovalBrokerApproveReject(t *testing.T) {
 	b := newApprovalBroker()
 	var got ApprovalRequest
@@ -77,6 +88,44 @@ func TestApprovalContextCancel(t *testing.T) {
 	_, err := b.request(ctx, ApprovalRequest{Tool: "write_file"})
 	if err == nil {
 		t.Fatal("ctx 超时应返回错误")
+	}
+}
+
+func TestApprovalGateEmitsWaitingAndResumesAfterApproval(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	svc.runtimeSettings.ApprovalPolicy = "on-request"
+	svc.SetApprovalNotify(func(req ApprovalRequest) {
+		go func() { _ = svc.RespondApproval(req.ID, req.Tool, true, "once") }()
+	})
+	statuses := make([]string, 0, 2)
+	ctx := tools.WithProgressSink(context.Background(), func(part tools.ResultPart) {
+		statuses = append(statuses, part.Status)
+	})
+	result, err := svc.runToolWithApproval(ctx, approvalProgressProbeTool{}, "run_command", json.RawMessage(`{"command":"echo ok"}`))
+	if err != nil || result.IsError {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	if len(statuses) != 2 || statuses[0] != "waiting" || statuses[1] != "running" {
+		t.Fatalf("approval progress statuses = %#v", statuses)
+	}
+}
+
+func TestApprovalGateCancellationLeavesWaitingPrompt(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	svc.runtimeSettings.ApprovalPolicy = "on-request"
+	svc.SetApprovalNotify(func(ApprovalRequest) {})
+	statuses := make([]string, 0, 1)
+	baseCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	ctx := tools.WithProgressSink(baseCtx, func(part tools.ResultPart) {
+		statuses = append(statuses, part.Status)
+	})
+	_, err := svc.runToolWithApproval(ctx, approvalProgressProbeTool{}, "run_command", json.RawMessage(`{"command":"echo ok"}`))
+	if err == nil {
+		t.Fatal("cancelled approval must return an error")
+	}
+	if len(statuses) != 1 || statuses[0] != "waiting" {
+		t.Fatalf("approval progress statuses = %#v", statuses)
 	}
 }
 

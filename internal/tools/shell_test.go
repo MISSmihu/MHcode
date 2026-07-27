@@ -2,14 +2,18 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRunCommandShellDisabled(t *testing.T) {
@@ -81,6 +85,203 @@ func TestRunCommandEcho(t *testing.T) {
 	if part.StartedAt == "" || part.CompletedAt == "" || part.DurationMs < 1 {
 		t.Fatalf("execution metadata is incomplete: %#v", part)
 	}
+}
+
+func TestRunCommandRequiresExactlyOneExecutionMode(t *testing.T) {
+	tool := RunCommandTool{Policy: SandboxPolicy{WorkspaceRoot: t.TempDir(), FilesystemAccess: "workspace-write", ShellAccess: true}}
+	for name, input := range map[string]map[string]any{
+		"neither":    {},
+		"both":       {"command": "echo shell", "executable": "echo", "args": []string{"direct"}},
+		"shell-args": {"command": "echo shell", "args": []string{"unexpected"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := json.Marshal(input)
+			result, err := tool.Execute(context.Background(), raw)
+			if err != nil || !result.IsError {
+				t.Fatalf("result = %#v, err = %v", result, err)
+			}
+		})
+	}
+}
+
+func TestRunCommandStructuredModePreservesArgumentsAndWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	workDir := filepath.Join(root, "中文 子目录")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{
+		"中文 空格",
+		"line one\nline two",
+		`single' and "double"`,
+		`folder\child\file.txt`,
+		"",
+	}
+	processArgs := append([]string{"-test.run=^TestRunCommandStructuredHelperProcess$", "--"}, wantArgs...)
+	raw, _ := json.Marshal(map[string]any{
+		"executable":        executable,
+		"args":              processArgs,
+		"working_directory": "中文 子目录",
+	})
+	tool := RunCommandTool{Policy: SandboxPolicy{
+		WorkspaceRoot: root, FilesystemAccess: "workspace-write", ShellAccess: true, MaxCommandSeconds: 30,
+	}}
+	result, err := tool.Execute(context.Background(), raw)
+	if err != nil || result.IsError {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	var payload struct {
+		Args []string `json:"args"`
+		CWD  string   `json:"cwd"`
+	}
+	output := result.Parts[0].Stdout
+	marker := "MHCODE_STRUCTURED_ARGS="
+	start := strings.Index(output, marker)
+	if start < 0 {
+		t.Fatalf("helper output = %q", output)
+	}
+	encoded := output[start+len(marker):]
+	if end := strings.IndexByte(encoded, '\n'); end >= 0 {
+		encoded = encoded[:end]
+	}
+	if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+		t.Fatalf("decode helper payload %q: %v", encoded, err)
+	}
+	if len(payload.Args) != len(wantArgs) {
+		t.Fatalf("args = %#v, want %#v", payload.Args, wantArgs)
+	}
+	for index := range wantArgs {
+		if payload.Args[index] != wantArgs[index] {
+			t.Fatalf("args[%d] = %q, want %q", index, payload.Args[index], wantArgs[index])
+		}
+	}
+	if filepath.Clean(payload.CWD) != filepath.Clean(workDir) || result.Parts[0].WorkingDirectory != workDir {
+		t.Fatalf("cwd = %q part=%q want=%q", payload.CWD, result.Parts[0].WorkingDirectory, workDir)
+	}
+	if !strings.Contains(result.Parts[0].Input, "中文 空格") || !strings.Contains(result.Parts[0].Input, `\"double\"`) {
+		t.Fatalf("display input = %q", result.Parts[0].Input)
+	}
+}
+
+func TestRunCommandStructuredPythonCodeIsNotRequoted(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows python -c quoting regression")
+	}
+	python, err := exec.LookPath("python.exe")
+	if err != nil {
+		python, err = exec.LookPath("python")
+	}
+	if err != nil {
+		t.Skip("Python is not installed")
+	}
+	payload := "中文 空格 \"double\" 'single' folder\\child\nsecond line"
+	code := "import base64,sys\nsys.stdout.write(base64.b64encode(sys.argv[1].encode('utf-8')).decode('ascii'))"
+	raw, _ := json.Marshal(map[string]any{
+		"executable": python,
+		"args":       []string{"-c", code, payload},
+	})
+	tool := RunCommandTool{Policy: SandboxPolicy{
+		WorkspaceRoot: t.TempDir(), FilesystemAccess: "workspace-write", ShellAccess: true, MaxCommandSeconds: 30,
+	}}
+	result, err := tool.Execute(context.Background(), raw)
+	if err != nil || result.IsError {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	decoded, decodeErr := base64.StdEncoding.DecodeString(strings.TrimSpace(result.Parts[0].Stdout))
+	if decodeErr != nil || string(decoded) != payload {
+		t.Fatalf("python argv changed: encoded=%q decoded=%q want=%q err=%v", result.Parts[0].Stdout, decoded, payload, decodeErr)
+	}
+}
+
+func TestRunCommandStructuredModeRejectsOutsideWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	raw, _ := json.Marshal(map[string]any{
+		"executable":        "go",
+		"args":              []string{"version"},
+		"working_directory": outside,
+	})
+	tool := RunCommandTool{Policy: SandboxPolicy{WorkspaceRoot: root, FilesystemAccess: "workspace-write", ShellAccess: true}}
+	result, err := tool.Execute(context.Background(), raw)
+	if err != nil || !result.IsError || !strings.Contains(result.Summary, "working_directory") {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+func TestRunCommandStructuredModeStillUsesCommandBroker(t *testing.T) {
+	tool := RunCommandTool{Policy: SandboxPolicy{
+		WorkspaceRoot: t.TempDir(), FilesystemAccess: "workspace-write", NetworkAccess: true, ShellAccess: true,
+	}}
+	for name, input := range map[string]map[string]any{
+		"ssh":       {"executable": "ssh", "args": []string{"root@example.com"}},
+		"file-read": {"executable": "powershell.exe", "args": []string{"-Command", "Get-Content README.md"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := json.Marshal(input)
+			result, err := tool.Execute(context.Background(), raw)
+			if err != nil || !result.IsError {
+				t.Fatalf("result = %#v, err = %v", result, err)
+			}
+		})
+	}
+}
+
+func TestRunCommandStructuredModeHonorsCancellation(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"executable": executable,
+		"args":       []string{"-test.run=^TestRunCommandStructuredHelperProcess$", "--", "__sleep__"},
+	})
+	tool := RunCommandTool{Policy: SandboxPolicy{
+		WorkspaceRoot: t.TempDir(), FilesystemAccess: "workspace-write", ShellAccess: true, MaxCommandSeconds: 30,
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	result, err := tool.Execute(ctx, raw)
+	if err != nil || !result.IsError {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 4*time.Second {
+		t.Fatalf("structured process cancellation took %s", elapsed)
+	}
+}
+
+func TestRunCommandStructuredHelperProcess(t *testing.T) {
+	separator := -1
+	for index, argument := range os.Args {
+		if argument == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 {
+		return
+	}
+	arguments := append([]string(nil), os.Args[separator+1:]...)
+	if len(arguments) == 1 && arguments[0] == "__sleep__" {
+		time.Sleep(30 * time.Second)
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(struct {
+		Args []string `json:"args"`
+		CWD  string   `json:"cwd"`
+	}{Args: arguments, CWD: cwd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Printf("MHCODE_STRUCTURED_ARGS=%s\n", payload)
 }
 
 func TestRunCommandStreamsStructuredOutputWhileRunning(t *testing.T) {

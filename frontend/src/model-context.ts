@@ -91,9 +91,33 @@ const exactModelContextWindows: Record<string, number> = {
   "grok-code-fast-1-0825": 256_000,
 };
 
+const anthropicModelContextWindows: Record<string, number> = {
+  "claude-haiku-4-5": 200_000,
+  "claude-opus-4-5": 200_000,
+  "claude-sonnet-4-5": 200_000,
+  "claude-opus-4-1": 200_000,
+  "claude-opus-4": 200_000,
+  "claude-sonnet-4": 200_000,
+  "claude-3-7-sonnet": 200_000,
+};
+
+function matchesAnthropicAlias(modelID: string, alias: string) {
+  if (modelID === alias || modelID === `${alias}-latest`) return true;
+  const suffix = modelID.startsWith(`${alias}-`) ? modelID.slice(alias.length + 1) : "";
+  return /^\d{8}$/.test(suffix);
+}
+
+function anthropicCatalogContextWindow(modelID: string) {
+  const normalizedID = modelID.startsWith("anthropic/") ? modelID.slice("anthropic/".length) : modelID;
+  for (const [alias, tokens] of Object.entries(anthropicModelContextWindows)) {
+    if (matchesAnthropicAlias(normalizedID, alias)) return tokens;
+  }
+  return 0;
+}
+
 export function inferModelContextWindow(modelID: string, protocol: string, providerDefault = 0) {
   const id = modelID.trim().toLowerCase();
-  const catalogTokens = exactModelContextWindows[id] ?? 0;
+  const catalogTokens = exactModelContextWindows[id] ?? anthropicCatalogContextWindow(id);
   if (catalogTokens > 0) {
     return { tokens: catalogTokens, source: "catalog" };
   }
@@ -101,7 +125,6 @@ export function inferModelContextWindow(modelID: string, protocol: string, provi
     return { tokens: providerDefault, source: "provider-default" };
   }
   if (protocol === "deepseek-official") return { tokens: 128_000, source: "protocol-default" };
-  if (protocol === "anthropic" || protocol === "anthropic-compatible") return { tokens: 200_000, source: "protocol-default" };
   if (protocol === "gemini") return { tokens: 1_048_576, source: "protocol-default" };
   return { tokens: 64 * 1024, source: "safe-default" };
 }

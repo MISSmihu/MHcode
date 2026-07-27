@@ -720,27 +720,36 @@ func TestServiceSendDeepSeekMessageReusesAppendOnlySession(t *testing.T) {
 	if len(requests) != 2 {
 		t.Fatalf("captured requests = %d, want 2", len(requests))
 	}
-	if len(requests[0]) != 2 {
-		t.Fatalf("first request message count = %d, want 2", len(requests[0]))
+	if len(requests[0]) != 3 {
+		t.Fatalf("first request message count = %d, want 3", len(requests[0]))
 	}
 	assertMessage(t, requests[0], 0, "system", "")
-	assertMessage(t, requests[0], 1, "user", "first")
-	if !strings.Contains(requests[0][0].Content, "cache_prefix_hash=sha256:") {
-		t.Fatalf("system prompt should include stable prefix hash: %q", requests[0][0].Content)
+	assertMessage(t, requests[0], 1, "user", "")
+	assertMessage(t, requests[0], 2, "user", "first")
+	if strings.Contains(requests[0][0].Content, "cache_prefix_hash=") {
+		t.Fatalf("system prompt leaked host-only prefix metadata: %q", requests[0][0].Content)
+	}
+	if !strings.Contains(requests[0][1].Content, requestContextStart) || strings.Contains(requests[0][1].Content, "first") {
+		t.Fatalf("private turn context should be present without duplicating user input: %q", requests[0][1].Content)
 	}
 
-	if len(requests[1]) != 4 {
-		t.Fatalf("second request message count = %d, want 4", len(requests[1]))
+	if len(requests[1]) != 6 {
+		t.Fatalf("second request message count = %d, want 6", len(requests[1]))
 	}
 	assertMessage(t, requests[1], 0, "system", requests[0][0].Content)
-	assertMessage(t, requests[1], 1, "user", "first")
-	assertMessage(t, requests[1], 2, "assistant", "answer-1")
-	assertMessage(t, requests[1], 3, "user", "second")
+	assertMessage(t, requests[1], 1, "user", requests[0][1].Content)
+	assertMessage(t, requests[1], 2, "user", "first")
+	assertMessage(t, requests[1], 3, "assistant", "answer-1")
+	assertMessage(t, requests[1], 4, "user", "")
+	assertMessage(t, requests[1], 5, "user", "second")
+	if !strings.Contains(requests[1][4].Content, requestContextStart) || strings.Contains(requests[1][4].Content, "second") {
+		t.Fatalf("second private turn context should not duplicate user input: %q", requests[1][4].Content)
+	}
 	if second.State.DeepSeekSession.TurnCount != 2 {
 		t.Fatalf("turn count = %d, want 2", second.State.DeepSeekSession.TurnCount)
 	}
-	if second.State.DeepSeekSession.MessageCount != 5 {
-		t.Fatalf("session message count = %d, want 5", second.State.DeepSeekSession.MessageCount)
+	if second.State.DeepSeekSession.MessageCount != 7 {
+		t.Fatalf("session message count = %d, want 7", second.State.DeepSeekSession.MessageCount)
 	}
 	if !second.State.DeepSeekSession.AppendOnlyPrefixStable {
 		t.Fatalf("append-only prefix stable = false, want true")
@@ -849,8 +858,74 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 	if strings.Contains(prompt, "skills_index") || strings.Contains(prompt, "mcp_schema_snapshot") {
 		t.Fatalf("stable prompt should not expand long internal sections: %q", prompt)
 	}
-	if !strings.Contains(prompt, "cache_prefix_hash=sha256:") {
-		t.Fatalf("stable prompt should keep prefix hash for observability: %q", prompt)
+	for _, forbidden := range []string{
+		"concise developer assistant",
+		"after each step changes state",
+		"Use the next user message as the only user-facing request",
+		"cache_prefix_hash=",
+		"prompt-cache reuse depends",
+		"byte-stable across turns",
+	} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("stable prompt still contains capability-limiting instruction %q: %q", forbidden, prompt)
+		}
+	}
+	for _, expected := range []string{
+		"enough detail to fully handle",
+		"materially changes state",
+		"length proportional to the task",
+		"immediately following any [MHcode private turn context] block",
+		"user explicitly supplies an absolute target",
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("stable prompt is missing completeness guidance %q: %q", expected, prompt)
+		}
+	}
+}
+
+func TestContextPreviewDoesNotForceStructuredSummary(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	ctx := service.contextPreviewForInput("检查并修复当前任务")
+	var requirements string
+	for _, section := range ctx.VolatileTail {
+		if section.Name == "output_requirements" {
+			requirements = section.Content
+			break
+		}
+	}
+	if requirements == "" {
+		t.Fatal("output requirements were not included in the volatile context")
+	}
+	if strings.Contains(requirements, "输出结构化摘要") {
+		t.Fatalf("output requirements still force a fixed summary: %q", requirements)
+	}
+	if !strings.Contains(requirements, "完整、准确") || !strings.Contains(requirements, "不强制使用固定摘要模板") {
+		t.Fatalf("output requirements do not preserve answer completeness: %q", requirements)
+	}
+}
+
+func TestContextPreviewPrioritizesLocalDiagnosticsOverSearch(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	input := "你帮我看看，我的 Claude 桌面版是不是出了问题，CCSwitch 当前模型仍然是另一个中转的"
+	if !localEnvironmentDiagnosticRequest(input) {
+		t.Fatal("local Claude/CCSwitch diagnosis was not detected")
+	}
+	if localEnvironmentDiagnosticRequest("帮我查找 CCSwitch 官方仓库") {
+		t.Fatal("a public repository lookup must not be misclassified as local diagnosis")
+	}
+
+	ctx := service.contextPreviewForInput(input)
+	var requirements string
+	for _, section := range ctx.VolatileTail {
+		if section.Name == "output_requirements" {
+			requirements = section.Content
+			break
+		}
+	}
+	for _, expected := range []string{"本机状态诊断任务", "本机结构化工具", "不能用网络搜索结果冒充本机检查", "必须读取权威页面"} {
+		if !strings.Contains(requirements, expected) {
+			t.Fatalf("local diagnostic requirements missing %q: %s", expected, requirements)
+		}
 	}
 }
 

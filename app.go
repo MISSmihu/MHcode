@@ -73,8 +73,10 @@ func NewApp() *App {
 		RevealFile:             revealDesktopFile,
 		Browser:                &browserToolBridge{app: app},
 		Computer:               &computerToolBridge{app: app},
+		ArtifactRenderer:       &artifactRenderBridge{app: app},
 		Git:                    app.git,
 		Terminal:               app.terminal,
+		PluginsDir:             pluginsDir(),
 		UsageStore:             usageStore,
 		UsageStoreError:        usageStoreError,
 	})
@@ -248,6 +250,37 @@ func (a *App) RefreshMCPServer(serverID string) agent.WorkbenchState {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return a.service.ConfigureMCP(ctx, serverID)
+}
+
+func (a *App) RefreshPlugins() agent.WorkbenchState {
+	return a.service.RefreshPlugins()
+}
+
+func (a *App) SelectPluginDirectory() (string, error) {
+	if a.ctx == nil {
+		return "", nil
+	}
+	return wruntime.OpenDirectoryDialog(a.ctx, wruntime.OpenDialogOptions{Title: "选择 MHcode 插件目录"})
+}
+
+func (a *App) InstallPlugin(source string) (agent.WorkbenchState, error) {
+	state, err := a.service.InstallPlugin(source)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+	}
+	return state, err
+}
+
+func (a *App) UninstallPlugin(id string) (agent.WorkbenchState, error) {
+	state, err := a.service.UninstallPlugin(id)
+	if err == nil {
+		a.setRuntimeSettings(state.RuntimeSettings)
+	}
+	return state, err
+}
+
+func (a *App) RevealPlugin(id string) error {
+	return a.service.RevealPlugin(id)
 }
 
 func (a *App) configureBrowser(settings agent.RuntimeSettings) error {
@@ -633,6 +666,14 @@ func automationTasksPath() string {
 	return filepath.Join(configDir, "MHcode", "automations.json")
 }
 
+func pluginsDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "mhcode-plugins"
+	}
+	return filepath.Join(configDir, "MHcode", "plugins")
+}
+
 func temporaryWorkspaceRoot() string {
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		return filepath.Join(home, "MHcodeProject")
@@ -657,6 +698,22 @@ func updateCacheDir() string {
 		return filepath.Join(os.TempDir(), "MHcode", "updates")
 	}
 	return filepath.Join(cacheDir, "MHcode", "updates")
+}
+
+func visualRenderCacheDir() string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		return filepath.Join(os.TempDir(), "MHcode", "visual-renders")
+	}
+	return filepath.Join(cacheDir, "MHcode", "visual-renders")
+}
+
+func webviewUserDataDir() string {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		return filepath.Join(os.TempDir(), "MHcode", "WebView2")
+	}
+	return filepath.Join(cacheDir, "MHcode", "WebView2")
 }
 
 func browserProfileDir() string {

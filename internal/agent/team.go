@@ -382,7 +382,7 @@ func (s *Service) runTeamTurnLegacy(
 			parts = append(parts, tools.ResultPart{Kind: tools.PartText, Text: answer})
 			s.finishTeamRun("cancelled", "计划未获批准", sink)
 			s.metrics = aggregate
-			s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+			s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 			s.sessionState.MessageCount = len(s.sessionMessages)
 			s.sessionState.TurnCount++
@@ -471,7 +471,7 @@ func (s *Service) runTeamTurnLegacy(
 	answer = sanitizeModelContent(answer)
 	parts = append(parts, tools.ResultPart{Kind: tools.PartText, Text: answer})
 	s.metrics = aggregate
-	s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+	s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
@@ -532,9 +532,9 @@ func (s *Service) runTeamRole(
 			outcome = toolLoopOutcome{Content: completion.Content, Reasoning: completion.Reasoning, Usage: completion.Usage, Parts: providerNoticeParts(completion.Notices)}
 		}
 	} else {
-		registry := s.buildReadOnlyRegistry()
+		registry := s.buildReadOnlyRegistryForContext(ctx)
 		if role == TeamRoleImplementer {
-			registry = s.buildWorkerToolRegistry()
+			registry = s.buildWorkerToolRegistryForContext(ctx)
 		}
 		outcome, err = s.runStreamingToolLoopWithState(ctx, provider, registry, request, roleSink, deploymentSSHPreflight{}, observeUsage)
 	}
@@ -581,7 +581,7 @@ func (s *Service) resolveTeamRoleRoute(settings TeamRoleSetting, primary chatRou
 
 func teamRoleRequest(base protocol.ChatRequest, role string, attempt int, route chatRoute, artifacts []teamArtifact) protocol.ChatRequest {
 	request := base
-	request.Model = route.ModelID
+	applyRouteToChatRequest(&request, route)
 	request.Metadata = make(map[string]string, len(base.Metadata)+3)
 	for key, value := range base.Metadata {
 		request.Metadata[key] = value

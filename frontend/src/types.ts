@@ -17,6 +17,7 @@ export type SkillIndexEntry = {
   name: string;
   version: number;
   trigger: string;
+  triggerMode?: string;
   summary: string;
   sha256: string;
   description: string;
@@ -48,6 +49,10 @@ export type Model = {
   provider: string;
   contextWindowTokens: number;
   contextWindowSource?: string;
+  maxOutputTokens?: number;
+  reasoningLevels?: ReasoningLevel[];
+  thinkingModes?: string[];
+  unsupportedParameters?: string[];
 };
 
 export type DeepSeekState = {
@@ -100,6 +105,9 @@ export type RequestContext = {
   stablePrefix: ContextSection[];
   volatileTail: ContextSection[];
   prefixHash: string;
+  triggeredSkillNames: string[];
+  triggeredSkillCharacters: number;
+  triggeredSkillTokens: number;
 };
 
 export type UsageMetrics = {
@@ -152,6 +160,8 @@ export type RuntimeSettings = {
   approvalPolicy: "never" | "on-request" | "on-failure" | "untrusted" | string;
   workspaceRoot: string;
   extraWritableRoots: string[];
+  toolTimeoutSeconds: number;
+  taskIdleTimeoutSeconds: number;
   maxCommandSeconds: number;
   maxCommandMemoryMb: number;
   maxCommandCpuPercent: number;
@@ -164,6 +174,7 @@ export type RuntimeSettings = {
   browser: BrowserSettings;
   computerControl: ComputerControlSettings;
   mcp: MCPSettings;
+	plugins: PluginSettings;
   model: ModelSettings;
   team: TeamSettings;
   skills: SkillsSettings;
@@ -193,6 +204,15 @@ export type AppInfo = {
   executablePath: string;
   configPath: string;
   repositoryUrl: string;
+};
+
+export type OpenSourceLicense = {
+  name: string;
+  version?: string;
+  description: string;
+  license: string;
+  url: string;
+  text: string;
 };
 
 export type UpdateState = {
@@ -346,6 +366,25 @@ export type WorkspaceFilePreview = {
   truncated: boolean;
   binary: boolean;
   tooLarge: boolean;
+  artifact?: OfficeArtifactPreview;
+};
+
+export type OfficeArtifactPreview = {
+  kind: "document" | "spreadsheet" | "presentation";
+  mimeType: string;
+  document?: {
+    blocks: Array<{ type: "paragraph" | "table" | string; text?: string; style?: string; table?: string[][] }>;
+    truncated: boolean;
+  };
+  spreadsheet?: {
+    sheets: Array<{ name: string; rows: string[][]; rowCount: number; columnCount: number; truncated: boolean }>;
+    activeSheet?: string;
+    truncated: boolean;
+  };
+  presentation?: {
+    slides: Array<{ number: number; title?: string; texts: string[] }>;
+    truncated: boolean;
+  };
 };
 
 export type WorkspaceDirectoryEntry = {
@@ -454,6 +493,53 @@ export type MCPServerStatus = {
   checkedAt?: string;
 };
 
+export type PluginPermissionSet = {
+	fileRead: boolean;
+	fileWrite: boolean;
+	network: boolean;
+};
+
+export type PluginSetting = {
+	id: string;
+	enabled: boolean;
+	permissions: PluginPermissionSet;
+};
+
+export type PluginSettings = {
+	maxExecutionSeconds: number;
+	maxOutputBytes: number;
+	entries: PluginSetting[];
+};
+
+export type PluginToolStatus = {
+	name: string;
+	fullName: string;
+	description: string;
+	readOnly: boolean;
+	permissions: PluginPermissionSet;
+};
+
+export type PluginStatus = {
+	id: string;
+	name: string;
+	version: string;
+	description: string;
+	author?: string;
+	homepage?: string;
+	source: "builtin" | "installed" | string;
+	state: "ready" | "disabled" | "unavailable" | "error" | string;
+	message: string;
+	path?: string;
+	toolCount: number;
+	availableToolCount: number;
+	permissions: PluginPermissionSet;
+	grantedPermissions: PluginPermissionSet;
+	canUninstall: boolean;
+	manifestSchema: number;
+	protocolVersion: string;
+	tools: PluginToolStatus[];
+};
+
 export type KeyValue = {
   key: string;
   value: string;
@@ -526,6 +612,7 @@ export type WorkbenchState = {
   skillsIndex: SkillIndexEntry[];
   mcpSnapshots: ServerSnapshot[];
   mcpServers: MCPServerStatus[];
+	plugins: PluginStatus[];
   contextPreview: RequestContext;
   cacheDiagnostics: string[];
   runtimeSettings: RuntimeSettings;
@@ -536,6 +623,35 @@ export type WorkbenchState = {
   team: TeamState;
   projectMemory: ProjectMemoryState;
   usageLedger?: UsageLedgerState;
+	artifacts?: SessionArtifactRecord[];
+};
+
+export type SessionArtifactRecord = {
+	id: string;
+	eventId?: string;
+	path: string;
+	displayPath?: string;
+	name?: string;
+	fileType?: string;
+	mimeType?: string;
+	size?: number;
+	modifiedAt?: string;
+	sha256?: string;
+	action?: "created" | "modified" | "deleted" | "available" | string;
+	status: "available" | "deleted" | "missing" | "unreadable" | "invalid" | string;
+	tool?: string;
+	toolCallId?: string;
+	messageId?: string;
+	projectId?: string;
+	sessionId?: string;
+	branchId?: string;
+	checkpointId?: string;
+	structuralVerification?: "passed" | "failed" | "pending" | "not_applicable" | string;
+	visualVerification?: "passed" | "failed" | "pending" | "not_applicable" | string;
+	failureReason?: string;
+	previewReference?: string;
+	renderReference?: string;
+	lastCheckedAt?: string;
 };
 
 export type PlanState = {
@@ -613,8 +729,16 @@ export type ChatResult = {
 export type ChatTaskState = {
   taskId: string;
   startedAt: string;
+	updatedAt?: string;
   projectId?: string;
   sessionId?: string;
+  status: "running" | "waiting" | "retrying" | "failed" | "cancelled" | "completed" | string;
+	message?: string;
+	model?: string;
+	content?: string;
+	reasoning?: string;
+	durationMs?: number;
+	parts?: MessagePart[];
 };
 
 export type ChatAttachment = {
@@ -643,7 +767,7 @@ export type ChatTaskEvent = {
   toolName?: string;
   toolCallId?: string;
   toolInput?: string;
-  status?: "running" | "completed" | "error" | string;
+  status?: "running" | "waiting" | "retrying" | "completed" | "failed" | "cancelled" | "error" | string;
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -797,7 +921,7 @@ export type MessagePart =
   | {
       kind: "tool_call";
       name: string;
-      status?: "running" | "ok" | "error";
+      status?: "running" | "waiting" | "retrying" | "ok" | "error";
       input?: string;
       output?: string;
 	  stdout?: string;
@@ -882,6 +1006,14 @@ export type MessagePart =
       retryable?: boolean;
 	}
   | {
+      kind: "timeline_note";
+      message: string;
+      status?: "running" | "waiting" | "retrying" | "completed" | "failed" | "cancelled" | "interrupted" | string;
+      startedAt?: string;
+      completedAt?: string;
+      durationMs?: number;
+	}
+  | {
       kind: "secret_result";
       status?: "ok" | "error" | string;
       secretId: string;
@@ -958,7 +1090,7 @@ export type SessionMessage = {
   durationMs?: number;
   parts?: MessagePart[];
   attachments?: ChatAttachment[];
-	status?: "failed" | "cancelled" | string;
+	status?: "failed" | "cancelled" | "interrupted" | string;
 };
 
 // 侧边栏树的项目节点（对应后端 agent.ProjectNode），含它的会话。

@@ -42,6 +42,8 @@ function isMeaningfulPart(part: MessagePart): boolean {
       return Boolean(part.taskId.trim() || part.summary?.trim());
     case "provider_notice":
       return false;
+	case "timeline_note":
+	  return false;
     case "secret_result":
       return Boolean(part.secretId.trim());
   }

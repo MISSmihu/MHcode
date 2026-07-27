@@ -6,11 +6,15 @@ import (
 )
 
 type Model struct {
-	ID                  string `json:"id"`
-	DisplayName         string `json:"displayName"`
-	Provider            string `json:"provider"`
-	ContextWindowTokens int    `json:"contextWindowTokens"`
-	ContextWindowSource string `json:"contextWindowSource,omitempty"`
+	ID                    string   `json:"id"`
+	DisplayName           string   `json:"displayName"`
+	Provider              string   `json:"provider"`
+	ContextWindowTokens   int      `json:"contextWindowTokens"`
+	ContextWindowSource   string   `json:"contextWindowSource,omitempty"`
+	MaxOutputTokens       int      `json:"maxOutputTokens,omitempty"`
+	ReasoningLevels       []string `json:"reasoningLevels,omitempty"`
+	ThinkingModes         []string `json:"thinkingModes,omitempty"`
+	UnsupportedParameters []string `json:"unsupportedParameters,omitempty"`
 }
 
 type ChatRequest struct {
@@ -36,6 +40,12 @@ type ChatRequest struct {
 	// Internal context budget hints. Providers never serialize these fields.
 	MaxInputTokens    int `json:"-"`
 	TargetInputTokens int `json:"-"`
+	// Model metadata reported by providers. It is transport-only and lets a
+	// native protocol avoid guessing capabilities for custom model aliases.
+	MaxOutputTokens            int      `json:"-"`
+	ModelReasoningLevels       []string `json:"-"`
+	ModelThinkingModes         []string `json:"-"`
+	ModelUnsupportedParameters []string `json:"-"`
 }
 
 // ResponsesClientContext describes the real MHcode turn using the metadata

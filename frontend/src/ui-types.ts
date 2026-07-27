@@ -14,8 +14,9 @@ export type ChatMessage = {
   failed?: boolean;
   streaming?: boolean;
   cancelled?: boolean;
+	interrupted?: boolean;
   status?: string;
-  statusKind?: "compression";
+  statusKind?: "compression" | "running" | "waiting" | "retrying" | "failed" | "cancelled" | "completed";
   compressionStatus?: "running" | "completed" | "error";
   parts?: MessagePart[];
   attachments?: ChatAttachment[];
@@ -33,6 +34,7 @@ export type SettingsCategory =
   | "profile"
   | "shortcuts"
   | "mcp"
+	| "plugins"
   | "browser"
   | "computer"
   | "models"

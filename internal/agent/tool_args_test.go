@@ -57,6 +57,18 @@ func TestNormalizeToolArgsCommand(t *testing.T) {
 	}
 }
 
+func TestStructuredRunCommandDisplayIsSharedByApprovalAndTimeline(t *testing.T) {
+	raw := json.RawMessage(`{"executable":"python","args":["-c","print('中文 空格')"]}`)
+	approval := commandFromArgs(raw)
+	timeline := toolInputForDisplay("run_command", raw)
+	if approval == "" || approval != timeline {
+		t.Fatalf("approval=%q timeline=%q", approval, timeline)
+	}
+	if approval != `python -c "print('中文 空格')"` {
+		t.Fatalf("display = %q", approval)
+	}
+}
+
 func TestToolInputForDisplaySupportsWebTools(t *testing.T) {
 	if got := toolInputForDisplay("web_search", json.RawMessage(`{"query":"宁波天气"}`)); got != "宁波天气" {
 		t.Fatalf("web_search input = %q", got)

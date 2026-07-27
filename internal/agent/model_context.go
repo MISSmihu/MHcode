@@ -129,6 +129,18 @@ func resolveProviderModelContexts(provider ModelProviderSetting, models []protoc
 			if strings.TrimSpace(previous.DisplayName) != "" && previous.DisplayName != previous.ID {
 				model.DisplayName = previous.DisplayName
 			}
+			if model.MaxOutputTokens <= 0 {
+				model.MaxOutputTokens = previous.MaxOutputTokens
+			}
+			if len(model.ReasoningLevels) == 0 {
+				model.ReasoningLevels = append([]string(nil), previous.ReasoningLevels...)
+			}
+			if len(model.ThinkingModes) == 0 {
+				model.ThinkingModes = append([]string(nil), previous.ThinkingModes...)
+			}
+			if len(model.UnsupportedParameters) == 0 {
+				model.UnsupportedParameters = append([]string(nil), previous.UnsupportedParameters...)
+			}
 		}
 		if model.DisplayName == "" {
 			model.DisplayName = model.ID
@@ -188,6 +200,9 @@ func inferModelContextWindow(modelID string, providerProtocol string) (int, stri
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	protocolName := strings.ToLower(strings.TrimSpace(providerProtocol))
 
+	if tokens, ok := protocol.AnthropicModelContextWindow(id); ok {
+		return tokens, ContextWindowSourceCatalog
+	}
 	if tokens, ok := exactModelContextWindows[id]; ok {
 		return tokens, ContextWindowSourceCatalog
 	}
@@ -196,10 +211,35 @@ func inferModelContextWindow(modelID string, providerProtocol string) (int, stri
 	case "deepseek-official":
 		return 128_000, ContextWindowSourceProtocol
 	case "anthropic", "anthropic-compatible":
-		return 200_000, ContextWindowSourceProtocol
+		return 0, ""
 	case "gemini":
 		return 1_048_576, ContextWindowSourceProtocol
 	default:
 		return 0, ""
 	}
+}
+
+func unverifiedAnthropicCatalogContext(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	id = strings.TrimPrefix(id, "anthropic/")
+	for _, alias := range []string{"claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5"} {
+		if id == alias || id == alias+"-latest" {
+			return true
+		}
+		suffix := strings.TrimPrefix(id, alias+"-")
+		if len(suffix) != 8 || suffix == id {
+			continue
+		}
+		dated := true
+		for _, char := range suffix {
+			if char < '0' || char > '9' {
+				dated = false
+				break
+			}
+		}
+		if dated {
+			return true
+		}
+	}
+	return false
 }

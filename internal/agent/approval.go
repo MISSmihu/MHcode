@@ -192,7 +192,7 @@ func (s *Service) needsApproval(toolName string, rawArgs json.RawMessage) bool {
 		return false
 	}
 	switch toolName {
-	case "write_file", "apply_patch", "copy_file", "delete_file", "run_command", "ssh":
+	case "write_file", "apply_patch", "copy_file", "delete_file", "download_file", "git_repository", "run_command", "ssh":
 		return true
 	case "git":
 		return gitActionNeedsApproval(rawArgs)
@@ -203,7 +203,7 @@ func (s *Service) needsApproval(toolName string, rawArgs json.RawMessage) bool {
 	case "computer":
 		return computerActionNeedsApproval(rawArgs)
 	default:
-		return strings.HasPrefix(toolName, "mcp__")
+		return strings.HasPrefix(toolName, "mcp__") || strings.HasPrefix(toolName, "plugin__")
 	}
 }
 
@@ -233,6 +233,7 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 			// 无实际改动或校验失败，无需审批，直接返回预演结果。
 			return result, nil
 		}
+		emitApprovalProgress(ctx, name, rawArgs, "waiting", "等待用户确认文件修改")
 		decision, err := s.approvals.request(ctx, ApprovalRequest{
 			Tool:        name,
 			Kind:        "file",
@@ -247,6 +248,7 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 		if !decision.Approved {
 			return rejectedResult(name, "用户拒绝了对 "+pending.Change.Path+" 的修改"), nil
 		}
+		emitApprovalProgress(ctx, name, rawArgs, "running", "审批已通过，正在写入文件")
 		if applyErr := tools.ApplyPending(pending); applyErr != nil {
 			return rejectedResult(name, "写入失败: "+applyErr.Error()), nil
 		}
@@ -268,6 +270,10 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 		request.Kind = "git"
 		request.Command = truncateApprovalArgs(rawArgs)
 		request.Summary = "请求执行 Git 写操作"
+	} else if name == "git_repository" {
+		request.Kind = "git"
+		request.Command = tools.GitRepositoryInputForDisplay(rawArgs)
+		request.Summary = "请求拉取 Git 仓库"
 	} else if name == "terminal" {
 		request.Kind = "terminal"
 		request.Command = truncateApprovalArgs(rawArgs)
@@ -276,11 +282,21 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 		request.Kind = "ssh"
 		request.Command = sshToolInputForDisplay(rawArgs)
 		request.Summary = "请求连接用户授权的 SSH 主机"
+	} else if name == "download_file" {
+		request.Kind = "file"
+		request.URL, request.Path = downloadApprovalDetails(rawArgs)
+		request.Command = ""
+		request.Summary = "请求下载文件到 " + request.Path
 	} else if strings.HasPrefix(name, "mcp__") {
 		request.Kind = "mcp"
 		request.Command = truncateApprovalArgs(rawArgs)
 		request.Summary = "请求调用 MCP 工具 " + name
+	} else if strings.HasPrefix(name, "plugin__") {
+		request.Kind = "plugin"
+		request.Command = truncateApprovalArgs(rawArgs)
+		request.Summary = "请求调用插件写入工具 " + name
 	}
+	emitApprovalProgress(ctx, name, rawArgs, "waiting", "等待用户确认操作")
 	decision, err := s.approvals.request(ctx, request)
 	if err != nil {
 		return tools.Result{}, err
@@ -288,7 +304,18 @@ func (s *Service) runToolWithApproval(ctx context.Context, tool tools.Tool, name
 	if !decision.Approved {
 		return rejectedResult(name, "用户拒绝了命令执行"), nil
 	}
+	emitApprovalProgress(ctx, name, rawArgs, "running", "审批已通过，正在执行")
 	return tool.Execute(ctx, rawArgs)
+}
+
+func emitApprovalProgress(ctx context.Context, name string, rawArgs json.RawMessage, status, output string) {
+	tools.EmitProgress(ctx, tools.ResultPart{
+		Kind:   tools.PartToolCall,
+		Name:   name,
+		Status: status,
+		Input:  toolInputForDisplay(name, rawArgs),
+		Output: output,
+	})
 }
 
 func truncateApprovalArgs(rawArgs json.RawMessage) string {
@@ -322,11 +349,17 @@ func rejectedResult(name, msg string) tools.Result {
 }
 
 func commandFromArgs(rawArgs json.RawMessage) string {
-	var a struct {
-		Command string `json:"command"`
+	return tools.RunCommandInputForDisplay(rawArgs)
+}
+
+func downloadApprovalDetails(rawArgs json.RawMessage) (downloadURL, destination string) {
+	var args struct {
+		URL                  string `json:"url"`
+		Destination          string `json:"destination"`
+		DestinationDirectory string `json:"destination_directory"`
 	}
-	_ = json.Unmarshal(rawArgs, &a)
-	return a.Command
+	_ = json.Unmarshal(rawArgs, &args)
+	return tools.SafeDownloadURLForDisplay(args.URL), firstNonEmpty(strings.TrimSpace(args.Destination), strings.TrimSpace(args.DestinationDirectory))
 }
 
 func browserURLFromArgs(rawArgs json.RawMessage) string {
@@ -334,7 +367,7 @@ func browserURLFromArgs(rawArgs json.RawMessage) string {
 		URL string `json:"url"`
 	}
 	_ = json.Unmarshal(rawArgs, &args)
-	return strings.TrimSpace(args.URL)
+	return tools.SafeDownloadURLForDisplay(args.URL)
 }
 
 func browserNavigationNeedsApproval(rawArgs json.RawMessage) bool {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const DefaultAnthropicBaseURL = "https://api.anthropic.com"
@@ -19,13 +20,55 @@ const DefaultAnthropicBaseURL = "https://api.anthropic.com"
 const anthropicVersion = "2023-06-01"
 
 type AnthropicProvider struct {
-	BaseURL          string
-	APIKey           string
-	ProviderID       string
-	HTTPClient       *http.Client
-	ExtraHeaders     string
-	ExtraBodyJSON    string
-	ReasoningProfile string
+	BaseURL               string
+	APIKey                string
+	ProviderID            string
+	HTTPClient            *http.Client
+	ExtraHeaders          string
+	ExtraBodyJSON         string
+	ReasoningProfile      string
+	CompatibilityCache    *AnthropicCompatibilityCache
+	CompatibilityFeedback func(AnthropicCompatibilityFeedback)
+}
+
+type AnthropicCompatibilityFeedback struct {
+	ProviderID            string
+	ModelID               string
+	UnsupportedParameters []string
+}
+
+type AnthropicCompatibilityCache struct {
+	mu     sync.RWMutex
+	models map[string][]string
+}
+
+func NewAnthropicCompatibilityCache() *AnthropicCompatibilityCache {
+	return &AnthropicCompatibilityCache{models: map[string][]string{}}
+}
+
+func (c *AnthropicCompatibilityCache) Parameters(providerID, modelID string) []string {
+	if c == nil {
+		return nil
+	}
+	key := anthropicCompatibilityCacheKey(providerID, modelID)
+	c.mu.RLock()
+	parameters := append([]string(nil), c.models[key]...)
+	c.mu.RUnlock()
+	return parameters
+}
+
+func (c *AnthropicCompatibilityCache) Learn(providerID, modelID string, parameters []string) {
+	if c == nil {
+		return
+	}
+	key := anthropicCompatibilityCacheKey(providerID, modelID)
+	c.mu.Lock()
+	c.models[key] = normalizeAnthropicUnsupportedParameters(append(c.models[key], parameters...))
+	c.mu.Unlock()
+}
+
+func anthropicCompatibilityCacheKey(providerID, modelID string) string {
+	return strings.ToLower(strings.TrimSpace(providerID)) + "\x00" + strings.ToLower(strings.TrimSpace(modelID))
 }
 
 func (p AnthropicProvider) Name() string {
@@ -78,7 +121,15 @@ func (p AnthropicProvider) ListModels(ctx context.Context) ([]Model, error) {
 			if displayName == "" {
 				displayName = id
 			}
-			models = append(models, Model{ID: id, DisplayName: displayName, Provider: p.Name()})
+			model := Model{ID: id, DisplayName: displayName, Provider: p.Name()}
+			if item.MaxInputTokens > 0 {
+				model.ContextWindowTokens = item.MaxInputTokens
+				model.ContextWindowSource = "upstream"
+			}
+			model.MaxOutputTokens = item.MaxTokens
+			model.ReasoningLevels = anthropicReportedReasoningLevels(id, item.Capabilities)
+			model.ThinkingModes = anthropicReportedThinkingModes(item.Capabilities)
+			models = append(models, model)
 		}
 		if !payload.HasMore || strings.TrimSpace(payload.LastID) == "" || payload.LastID == afterID {
 			break
@@ -95,49 +146,9 @@ func (p AnthropicProvider) Stream(ctx context.Context, request ChatRequest) (<-c
 	if strings.TrimSpace(request.Model) == "" {
 		return nil, errors.New("Anthropic model is required")
 	}
-	system, messages := anthropicMessagesFromProtocol(request.Messages)
-	if len(messages) == 0 {
-		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
-	}
-	reasoning := reasoningOptionsForRequest("anthropic", p.BaseURL, p.ReasoningProfile, request)
-	temperature := request.Temperature
-	if reasoning.Mode != "" {
-		temperature = 0
-	}
-	body := anthropicMessagesRequest{
-		Model:       request.Model,
-		MaxTokens:   anthropicMaxTokens(reasoning),
-		System:      system,
-		Messages:    messages,
-		Stream:      true,
-		Temperature: temperature,
-		Tools:       anthropicToolsFromProtocol(request.Tools),
-	}
-	applyAnthropicReasoning(&body, reasoning)
-	encoded, err := json.Marshal(body)
+	resp, err := p.doMessagesRequest(ctx, request, true, "text/event-stream")
 	if err != nil {
 		return nil, err
-	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "max_tokens", "messages", "output_config", "system", "temperature", "thinking", "stream", "tools"))
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/v1/messages"), bytes.NewReader(encoded))
-	if err != nil {
-		return nil, err
-	}
-	p.applyHeaders(req, "text/event-stream")
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return nil, err
-	}
-
-	resp, err := p.client().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("Anthropic chat request failed: %w", err)
-	}
-	if resp.StatusCode >= http.StatusBadRequest {
-		defer resp.Body.Close()
-		return nil, anthropicAPIError(resp)
 	}
 
 	events := make(chan StreamEvent, 16)
@@ -157,49 +168,11 @@ func (p AnthropicProvider) Complete(ctx context.Context, request ChatRequest) (C
 	if strings.TrimSpace(request.Model) == "" {
 		return CompletionResult{}, errors.New("Anthropic model is required")
 	}
-	system, messages := anthropicMessagesFromProtocol(request.Messages)
-	if len(messages) == 0 {
-		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
-	}
-	reasoning := reasoningOptionsForRequest("anthropic", p.BaseURL, p.ReasoningProfile, request)
-	temperature := request.Temperature
-	if reasoning.Mode != "" {
-		temperature = 0
-	}
-	body := anthropicMessagesRequest{
-		Model:       request.Model,
-		MaxTokens:   anthropicMaxTokens(reasoning),
-		System:      system,
-		Messages:    messages,
-		Stream:      false,
-		Temperature: temperature,
-		Tools:       anthropicToolsFromProtocol(request.Tools),
-	}
-	applyAnthropicReasoning(&body, reasoning)
-	encoded, err := json.Marshal(body)
+	resp, err := p.doMessagesRequest(ctx, request, false, "application/json")
 	if err != nil {
 		return CompletionResult{}, err
-	}
-	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "max_tokens", "messages", "output_config", "system", "temperature", "thinking", "stream", "tools"))
-	if err != nil {
-		return CompletionResult{}, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/v1/messages"), bytes.NewReader(encoded))
-	if err != nil {
-		return CompletionResult{}, err
-	}
-	p.applyHeaders(req, "application/json")
-	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
-		return CompletionResult{}, err
-	}
-	resp, err := p.client().Do(req)
-	if err != nil {
-		return CompletionResult{}, fmt.Errorf("Anthropic chat request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		return CompletionResult{}, anthropicAPIError(resp)
-	}
 
 	var payload anthropicMessagesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -210,6 +183,99 @@ func (p AnthropicProvider) Complete(ctx context.Context, request ChatRequest) (C
 		result.Usage = payload.Usage.toTokenUsage()
 	}
 	return result, nil
+}
+
+func (p AnthropicProvider) doMessagesRequest(ctx context.Context, request ChatRequest, stream bool, accept string) (*http.Response, error) {
+	unsupported := normalizeAnthropicUnsupportedParameters(append(
+		append([]string(nil), request.ModelUnsupportedParameters...),
+		p.CompatibilityCache.Parameters(p.Name(), request.Model)...,
+	))
+	resp, sent, err := p.sendMessagesRequest(ctx, request, stream, accept, unsupported)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < http.StatusBadRequest {
+		return resp, nil
+	}
+	status := resp.StatusCode
+	firstErr, detail := readAnthropicAPIError(resp)
+	_ = resp.Body.Close()
+	learned := anthropicUnsupportedParametersFromError(status, detail)
+	learned = filterAnthropicSentParameters(learned, sent, unsupported)
+	if len(learned) == 0 || ctx.Err() != nil {
+		return nil, firstErr
+	}
+
+	p.CompatibilityCache.Learn(p.Name(), request.Model, learned)
+	if p.CompatibilityFeedback != nil {
+		p.CompatibilityFeedback(AnthropicCompatibilityFeedback{
+			ProviderID:            p.Name(),
+			ModelID:               strings.TrimSpace(request.Model),
+			UnsupportedParameters: append([]string(nil), learned...),
+		})
+	}
+	retryUnsupported := normalizeAnthropicUnsupportedParameters(append(unsupported, learned...))
+	resp, _, retryErr := p.sendMessagesRequest(ctx, request, stream, accept, retryUnsupported)
+	if retryErr != nil {
+		return nil, errors.Join(firstErr, fmt.Errorf("Anthropic compatibility retry failed: %w", retryErr))
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		retryStatusErr, _ := readAnthropicAPIError(resp)
+		_ = resp.Body.Close()
+		return nil, errors.Join(firstErr, fmt.Errorf("Anthropic compatibility retry failed after omitting %s: %w", strings.Join(learned, ", "), retryStatusErr))
+	}
+	return resp, nil
+}
+
+func (p AnthropicProvider) sendMessagesRequest(ctx context.Context, request ChatRequest, stream bool, accept string, unsupported []string) (*http.Response, map[string]bool, error) {
+	system, messages := anthropicMessagesFromProtocol(request.Messages)
+	if len(messages) == 0 {
+		messages = []anthropicMessage{{Role: "user", Content: []anthropicContentBlock{{Type: "text", Text: ""}}}}
+	}
+	reasoning := anthropicReasoningForRequest(p.BaseURL, p.ReasoningProfile, request)
+	maxTokens := anthropicMaxTokens(request.Model, request.MaxOutputTokens, reasoning)
+	reasoning = constrainAnthropicThinkingBudget(reasoning, maxTokens)
+	temperature := request.Temperature
+	if anthropicShouldOmitTemperature(request.Model, reasoning) {
+		temperature = 0
+	}
+	body := anthropicMessagesRequest{
+		Model:       request.Model,
+		MaxTokens:   maxTokens,
+		System:      system,
+		Messages:    messages,
+		Stream:      stream,
+		Temperature: temperature,
+		Tools:       anthropicToolsFromProtocol(request.Tools),
+	}
+	applyAnthropicReasoning(&body, reasoning)
+	applyAnthropicUnsupportedParameters(&body, unsupported)
+	sent := map[string]bool{
+		"temperature":   body.Temperature != 0,
+		"thinking":      body.Thinking != nil,
+		"output_config": body.OutputConfig != nil,
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return nil, sent, err
+	}
+	encoded, err = mergeExtraJSONBody(encoded, p.ExtraBodyJSON, protectedBodyKeys("model", "max_tokens", "messages", "output_config", "system", "temperature", "thinking", "stream", "tools"))
+	if err != nil {
+		return nil, sent, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("/v1/messages"), bytes.NewReader(encoded))
+	if err != nil {
+		return nil, sent, err
+	}
+	p.applyHeaders(req, accept)
+	if err := applyExtraHeaders(req, p.ExtraHeaders); err != nil {
+		return nil, sent, err
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return nil, sent, fmt.Errorf("Anthropic chat request failed: %w", err)
+	}
+	return resp, sent, nil
 }
 
 func (p AnthropicProvider) endpoint(path string) string {
@@ -323,12 +389,33 @@ func anthropicToolsFromProtocol(tools []ToolDefinition) []anthropicTool {
 	return converted
 }
 
-func anthropicMaxTokens(reasoning ReasoningOptions) int {
+func anthropicMaxTokens(modelID string, reportedMaximum int, reasoning ReasoningOptions) int {
+	if reportedMaximum > 0 {
+		return reportedMaximum
+	}
+	if maximum := anthropicModelMaxOutputTokens(modelID); maximum > 0 {
+		return maximum
+	}
 	const visibleOutputReserve = 4096
 	if reasoning.BudgetTokens > 0 {
 		return reasoning.BudgetTokens + visibleOutputReserve
 	}
 	return visibleOutputReserve
+}
+
+func constrainAnthropicThinkingBudget(reasoning ReasoningOptions, maxTokens int) ReasoningOptions {
+	if reasoning.Mode != "enabled" || reasoning.BudgetTokens <= 0 {
+		return reasoning
+	}
+	const minimumBudgetTokens = 1024
+	budgetLimit := maxTokens * 3 / 4
+	if budgetLimit < minimumBudgetTokens {
+		return ReasoningOptions{}
+	}
+	if reasoning.BudgetTokens > budgetLimit {
+		reasoning.BudgetTokens = budgetLimit
+	}
+	return reasoning
 }
 
 func applyAnthropicReasoning(body *anthropicMessagesRequest, reasoning ReasoningOptions) {
@@ -480,6 +567,11 @@ func anthropicStreamContinuation(blocks map[int]*anthropicContentBlock) *Provide
 }
 
 func anthropicAPIError(resp *http.Response) error {
+	err, _ := readAnthropicAPIError(resp)
+	return err
+}
+
+func readAnthropicAPIError(resp *http.Response) (error, string) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	var envelope anthropicErrorEnvelope
 	_ = json.Unmarshal(body, &envelope)
@@ -488,18 +580,43 @@ func anthropicAPIError(resp *http.Response) error {
 		detail = strings.TrimSpace(string(body))
 	}
 	if detail == "" {
-		return fmt.Errorf("Anthropic request failed (HTTP %d)", resp.StatusCode)
+		return fmt.Errorf("Anthropic request failed (HTTP %d)", resp.StatusCode), ""
 	}
-	return fmt.Errorf("Anthropic request failed: %s (HTTP %d)", detail, resp.StatusCode)
+	return fmt.Errorf("Anthropic request failed: %s (HTTP %d)", detail, resp.StatusCode), detail
 }
 
 type anthropicModelsResponse struct {
 	Data []struct {
-		ID          string `json:"id"`
-		DisplayName string `json:"display_name"`
+		ID             string                              `json:"id"`
+		DisplayName    string                              `json:"display_name"`
+		MaxInputTokens int                                 `json:"max_input_tokens"`
+		MaxTokens      int                                 `json:"max_tokens"`
+		Capabilities   *anthropicReportedModelCapabilities `json:"capabilities"`
 	} `json:"data"`
 	HasMore bool   `json:"has_more"`
 	LastID  string `json:"last_id"`
+}
+
+type anthropicReportedCapabilitySupport struct {
+	Supported bool `json:"supported"`
+}
+
+type anthropicReportedModelCapabilities struct {
+	Effort struct {
+		Supported bool                               `json:"supported"`
+		Low       anthropicReportedCapabilitySupport `json:"low"`
+		Medium    anthropicReportedCapabilitySupport `json:"medium"`
+		High      anthropicReportedCapabilitySupport `json:"high"`
+		XHigh     anthropicReportedCapabilitySupport `json:"xhigh"`
+		Max       anthropicReportedCapabilitySupport `json:"max"`
+	} `json:"effort"`
+	Thinking struct {
+		Supported bool `json:"supported"`
+		Types     struct {
+			Adaptive anthropicReportedCapabilitySupport `json:"adaptive"`
+			Enabled  anthropicReportedCapabilitySupport `json:"enabled"`
+		} `json:"types"`
+	} `json:"thinking"`
 }
 
 type anthropicMessagesRequest struct {

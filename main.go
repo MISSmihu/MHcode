@@ -5,9 +5,11 @@ import (
 	"os"
 
 	"github.com/MISSmihu/MHcode/internal/appupdate"
+	"github.com/MISSmihu/MHcode/internal/plugins"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
 
 //go:embed all:frontend/dist
@@ -17,6 +19,9 @@ var assets embed.FS
 var bundledSkills embed.FS
 
 func main() {
+	if handled, exitCode := plugins.HandleCommandLine(os.Args[1:]); handled {
+		os.Exit(exitCode)
+	}
 	if handled, exitCode := appupdate.HandleCommandLine(os.Args[1:]); handled {
 		os.Exit(exitCode)
 	}
@@ -31,6 +36,9 @@ func main() {
 			Assets: assets,
 		},
 		BackgroundColour: &options.RGBA{R: 247, G: 248, B: 245, A: 1},
+		Windows: &windows.Options{
+			WebviewUserDataPath: webviewUserDataDir(),
+		},
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,
 		Bind: []interface{}{

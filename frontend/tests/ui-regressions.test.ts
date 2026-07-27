@@ -19,15 +19,67 @@ describe("chat UI regressions", () => {
     expect(settings).toContain('title="打开 SKILL.md 查看器"');
     expect(settings).toContain("updateSkillEnabled(skill.name, value)");
     expect(settings).toContain('label={`启用 ${skill.name}`}');
+    expect(settings).toContain('title="本轮 Skill 注入"');
+    expect(settings).toContain("triggeredSkillCharacters");
+    expect(settings).toContain("triggeredSkillTokens");
     expect(workbench).toContain("ReadSkillDetail?:");
     expect(workbench).toContain("OpenSkillFile?:");
     expect(workbench).toContain("RevealSkillFile?:");
     expect(types).toContain("export type SkillDetail");
+    expect(types).toContain("triggeredSkillNames: string[];");
     expect(types).toContain("skills: SkillsSettings;");
     expect(css).toContain(".skill-viewer-overlay {");
     expect(css).toContain(".skill-document {");
     expect(css).toContain(".settings-switch input:focus-visible + span");
   });
+
+	test("provides a permissioned plugin manager for office artifacts and local extensions", async () => {
+		const [app, constants, panels, services, types, css] = await Promise.all([
+			Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/constants.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+			Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+			Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+		]);
+		expect(constants).toContain('{ id: "plugins", label: "插件"');
+		expect(panels).toContain("<PluginSettingsPanel");
+		expect(panels).toContain('title="安装本地插件"');
+		expect(panels).toContain('title="刷新插件目录"');
+		expect(panels).toContain("updatePermission(plugin().id, permission.key, value)");
+		expect(panels).toContain("void props.uninstallPlugin(plugin().id)");
+		expect(services).toContain('id: "office-artifacts"');
+		expect(services).toContain("内置产物引擎不依赖本机 Office");
+		expect(app).toContain("setState(await installPlugin(source))");
+		expect(app).toContain("setState(await refreshPlugins())");
+		expect(app).toContain("setState(await uninstallPlugin(id))");
+		expect(services).toContain("RefreshPlugins?:");
+		expect(services).toContain("SelectPluginDirectory?:");
+		expect(services).toContain("InstallPlugin?:");
+		expect(services).toContain("UninstallPlugin?:");
+		expect(services).toContain("RevealPlugin?:");
+		expect(types).toContain("export type PluginSettings");
+		expect(types).toContain("export type PluginStatus");
+		expect(css).toContain(".plugin-settings-page {");
+		expect(css).toContain("grid-template-columns: 250px minmax(0, 1fr);");
+		expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.plugin-settings-page \{[\s\S]*?grid-template-columns: 1fr;/);
+		expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.plugin-list \{[\s\S]*?grid-template-columns: 1fr;/);
+	});
+
+	test("renders generated office artifacts without treating available files as edits", async () => {
+		const messageContent = await Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text();
+		const artifactStart = messageContent.indexOf("function activityArtifacts");
+		const artifactEnd = messageContent.indexOf("function friendlyToolName", artifactStart);
+		const artifactHelper = messageContent.slice(artifactStart, artifactEnd);
+		expect(artifactHelper).toContain('part.fileAction !== "available"');
+
+		const changedStart = messageContent.indexOf("function isChangedFilePart");
+		const changedEnd = messageContent.indexOf("function groupRenderBlocks", changedStart);
+		const changedHelper = messageContent.slice(changedStart, changedEnd);
+		expect(changedHelper).toContain('part.fileAction === "created"');
+		expect(changedHelper).toContain('part.fileAction === "modified"');
+		expect(changedHelper).not.toContain('part.fileAction === "available"');
+	});
 
   test("streams, deduplicates, and renders provider safety notices", async () => {
     const [app, messageContent, css, types] = await Promise.all([
@@ -57,6 +109,30 @@ describe("chat UI regressions", () => {
     expect(app).toContain("usageMetrics: usageState.usageMetrics");
     expect(app).toContain("usageLedger: usageState.usageLedger");
   });
+
+	test("keeps structured waiting and retrying states visible during tool execution", async () => {
+		const [app, types, css] = await Promise.all([
+			Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+			Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+		]);
+		expect(types).toContain('"running" | "waiting" | "retrying"');
+		expect(app.match(/status: toolEventMessage\(event\)/g)?.length).toBe(2);
+		expect(app.match(/statusKind: toolEventStatusKind\(event\.status\)/g)?.length).toBe(2);
+		expect(app).toContain('status === "waiting" || status === "retrying"');
+		expect(css).toContain(".op-stream-state.waiting");
+		expect(css).toContain(".op-stream-state.retrying");
+	});
+
+	test("merges renamed download progress and final results by tool call identity", async () => {
+		const app = await Bun.file(new URL("../src/app.tsx", import.meta.url)).text();
+		const mergeStart = app.indexOf("function mergeLiveToolResultParts");
+		const mergeEnd = app.indexOf("function isTerminalToolStatus", mergeStart);
+		const mergeHelper = app.slice(mergeStart, mergeEnd);
+		expect(mergeHelper).toContain("currentPart.toolCallId === part.toolCallId");
+		expect(mergeHelper).toContain("part.toolCallId !== currentPart.toolCallId");
+		expect(mergeHelper).toContain("toolCallId: part.toolCallId || currentPart.toolCallId");
+	});
 
   test("merges and renders dynamic subagents independently from the fixed AI team", async () => {
     const [app, messageContent, panel, host, services, css, types] = await Promise.all([
@@ -438,6 +514,18 @@ describe("chat UI regressions", () => {
     }])).toBe(false);
   });
 
+  test("shows render and visual inspection as distinct live activities", async () => {
+    const messageContent = await Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text();
+    expect(messageContent).toContain('case "render_artifact": return "render";');
+    expect(messageContent).toContain('case "inspect_visual": return "visual";');
+    expect(messageContent).toContain('name === "render_artifact"');
+    expect(messageContent).toContain('name === "inspect_visual"');
+    expect(messageContent).toContain('part.status === "waiting"');
+    expect(messageContent).toContain('part.status === "retrying"');
+    expect(messageContent).toContain("渲染预览");
+    expect(messageContent).toContain("视觉检查");
+  });
+
   test("treats successful webpage reads as usable partial results", () => {
     expect(hasUsablePartialResult([{
       kind: "tool_call",
@@ -474,6 +562,25 @@ describe("chat UI regressions", () => {
       content: "",
       parts: [{ kind: "provider_notice", noticeKind: "policy_error", message: "blocked" }],
     })).toBe(false);
+	expect(hasMeaningfulTurnOutput(undefined, {
+	  content: "",
+	  parts: [{ kind: "timeline_note", message: "正在分析任务", status: "running" }],
+	})).toBe(false);
+  });
+
+  test("shows verifiable progress notes while work is running and restores them from history", async () => {
+	const [app, messageContent, types, css] = await Promise.all([
+	  Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+	  Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+	  Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+	]);
+	expect(app).toContain("updateLiveTimelineParts(message.parts, event)");
+	expect(app).toContain('kind: "timeline_note"');
+	expect(messageContent).toContain("function TimelineNote");
+	expect(messageContent).toContain('block.kind === "timeline"');
+	expect(types).toContain('kind: "timeline_note"');
+	expect(css).toContain(".op-timeline-note {");
   });
 
   test("groups shell, terminal, and SSH actions into nested command rows", async () => {
@@ -483,8 +590,9 @@ describe("chat UI regressions", () => {
     ]);
     expect(messageContent).toMatch(/<CommandActivityList[\s\S]{0,180}parts={props\.item\.parts}/);
     expect(messageContent).toContain('class="op-command-entry"');
-    expect(messageContent).toContain('case "ssh": return "command";');
-    expect(messageContent).toContain('props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh"');
+		expect(messageContent).toContain('case "git_repository": return "command";');
+		expect(messageContent).toContain('props.part.name === "run_command" || props.part.name === "terminal" || props.part.name === "ssh" || props.part.name === "git_repository"');
+		expect(messageContent).toContain('if (name === "git_repository") return "Git";');
     expect(css).toContain(".op-command-list {");
     expect(css).toContain(".op-command-entry > summary {");
     expect(css).toContain(".op-command-entry[open] > summary > svg {");

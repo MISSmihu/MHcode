@@ -2,6 +2,38 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.8 - 2026-07-28
+
+### Agent reliability and recoverability
+
+- Add durable task runtime states, watchdog timeouts, fast cancellation, crash recovery, and progress-aware strategy switching so failed tools cannot leave a conversation permanently running.
+- Preserve project identity, sessions, branches, plans, team checkpoints, long-term memory, and prompt-cache continuity when a project is removed and later re-added.
+- Register created and modified artifacts with stable paths, tool ownership, validation state, previews, and branch-aware rewind/restore context.
+- Restore live progress notes, tool activity, reasoning, elapsed time, and terminal states when switching conversations or restarting the application.
+
+### Artifacts, plugins, and visual verification
+
+- Add built-in DOCX, XLS/XLSX, and PPTX creation, editing, inspection, conversion, and right-side structured previews without requiring Microsoft Office.
+- Add a permissioned plugin ABI and management surface for bundled and external JSON-RPC/JSONL workers.
+- Add isolated artifact rendering and visual inspection for images, HTML, PDF, Office documents, browser pages, and authorized windows, with source-hash invalidation and explicit degraded states.
+
+### Protocols, tools, and Windows safety
+
+- Add Anthropic model capability discovery and persistence, legal thinking/effort mapping, unsupported-parameter learning, and model-specific context/output limits.
+- Add structured downloads and Git clone/fetch/pull with progress, cancellation, retries, checksums, atomic writes, credential redaction, and authorized external-drive paths.
+- Harden Windows command argument handling, process-tree cancellation, structured errors, DPAPI-backed secret recovery, and task-level duplicate-failure detection.
+
+### Skills and interface
+
+- Replace broad Skill keyword matching with explicit, manual, and legacy-compatible activation modes; generic Agent, Plan, cache, protocol, and MCP requests no longer inject MHcode internals.
+- Reduce the core Agent Skill from about 3882 to 631 estimated tokens, split Office guidance into its own Skill, and expose per-turn Skill injection diagnostics.
+- Add artifact viewing, richer execution disclosures, plugin and Skill controls, task-state restoration, and context diagnostics across the desktop interface.
+
+### Verification
+
+- Both bundled Skills pass the standard Skill validator.
+- All Go package tests, `go vet`, TypeScript checking, 79 frontend tests, the production Vite build, and a clean Wails Windows/amd64 build pass.
+
 ## v0.3.7 - 2026-07-25
 
 ### Reliable stream finalization

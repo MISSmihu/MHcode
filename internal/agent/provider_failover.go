@@ -107,7 +107,7 @@ func (p *failoverProvider) openStream(ctx context.Context, request protocol.Chat
 			return routedProvider{}, index, nil, errors.Join(failures...)
 		}
 		attempt := request
-		attempt.Model = candidate.route.ModelID
+		applyRouteToChatRequest(&attempt, candidate.route)
 		events, err := candidate.provider.Stream(ctx, attempt)
 		if err == nil {
 			return candidate, index, events, nil
@@ -136,7 +136,7 @@ func (p *failoverProvider) Complete(ctx context.Context, request protocol.ChatRe
 			continue
 		}
 		attempt := request
-		attempt.Model = candidate.route.ModelID
+		applyRouteToChatRequest(&attempt, candidate.route)
 		completion, err := caller.Complete(ctx, attempt)
 		if err == nil {
 			return completion, nil

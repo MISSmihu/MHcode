@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/MISSmihu/MHcode/internal/applicense"
 	"github.com/MISSmihu/MHcode/internal/appupdate"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -16,6 +17,10 @@ func (a *App) GetAppInfo() appupdate.AppInfo {
 		return appupdate.AppInfo{Name: "MHcode", Version: appVersion, ConfigPath: runtimeSettingsPath()}
 	}
 	return a.updater.Info(runtimeSettingsPath())
+}
+
+func (a *App) GetOpenSourceLicenses() []applicense.Notice {
+	return applicense.Catalog()
 }
 
 func (a *App) GetUpdateState() appupdate.State {

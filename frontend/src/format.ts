@@ -107,6 +107,8 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
     approvalPolicy: "on-request",
     workspaceRoot: "",
     extraWritableRoots: [],
+    toolTimeoutSeconds: 180,
+    taskIdleTimeoutSeconds: 300,
     maxCommandSeconds: 120,
     maxCommandMemoryMb: 4096,
     maxCommandCpuPercent: 100,
@@ -177,6 +179,13 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
         },
       ],
     },
+		plugins: {
+			maxExecutionSeconds: 120,
+			maxOutputBytes: 1024 * 1024,
+			entries: [
+				{id: "office-artifacts", enabled: true, permissions: {fileRead: true, fileWrite: true, network: false}},
+			],
+		},
     model: {
       selectedProviderId: "deepseek",
       selectedModelId: "",
@@ -294,6 +303,8 @@ export function settingsCategoryDescription(category: SettingsCategory) {
       return "配置审批策略和沙盒设置。";
     case "mcp":
       return "连接外部工具和数据源。";
+		case "plugins":
+			return "管理 Office、Access 和第三方扩展工具。";
     case "browser":
       return "管理 MHcode 的浏览器。可在电脑使用设置中配置 Google Chrome。";
     case "computer":

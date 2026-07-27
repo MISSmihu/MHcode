@@ -63,7 +63,7 @@ func (s *Service) runToolLoopTurn(
 	sink = serializedChatEventSink(sink)
 	execRequest := baseRequest
 	planStarted := false
-	reg := s.buildToolRegistry()
+	reg := s.buildToolRegistryForContext(ctx)
 	preflight := s.runDeploymentSSHPreflight(ctx, reg, baseRequest.Messages, sink)
 	if preflight.Attempted {
 		execRequest.Messages = appendDeploymentSSHPreflight(baseRequest.Messages, preflight)
@@ -108,7 +108,7 @@ func (s *Service) runToolLoopTurn(
 				// 用户否决计划：不执行，直接把计划作为回复返回。
 				answer := "已生成执行计划，但你选择不执行。\n\n" + plan
 				parts := mergeOutcomeParts(append([]tools.ResultPart{}, preflight.Result.Parts...), []tools.ResultPart{{Kind: tools.PartText, Text: plan}})
-				s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+				s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 				s.sessionState.MessageCount = len(s.sessionMessages)
 				s.recordAssistantAndCheckpoint(answer, route.ModelID, parts, chatTurnDurationMs(ctx))
 				s.markChatProviderStatus(route.Provider.ID, "ok", "计划已生成，等待下一步。")
@@ -152,15 +152,9 @@ func (s *Service) runToolLoopTurn(
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
-		cancelled := errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
-		partialCompleted := !cancelled && hasUsablePartialToolResult(outcome.Parts)
+		cancelled := chatTurnWasCancelled(ctx, err)
 		if planStarted {
-			if partialCompleted {
-				if planErr := s.finishPlanState("completed"); planErr != nil {
-					err = errors.Join(err, fmt.Errorf("finish partial plan: %w", planErr))
-					partialCompleted = false
-				}
-			} else if cancelled {
+			if cancelled {
 				if planErr := s.finishPlanState("cancelled"); planErr != nil {
 					err = errors.Join(err, fmt.Errorf("cancel plan: %w", planErr))
 				}
@@ -172,11 +166,7 @@ func (s *Service) runToolLoopTurn(
 		if cancelled {
 			terminalStatus = "cancelled"
 		}
-		if partialCompleted {
-			setOutcomeProgressStatus(&outcome, "completed")
-		} else {
-			setOutcomeProgressStatus(&outcome, terminalStatus)
-		}
+		setOutcomeProgressStatus(&outcome, terminalStatus)
 		emitOutcomeProgress(sink, outcome.Parts)
 
 		partialContent := partialToolEvidenceContent(outcome)
@@ -195,23 +185,6 @@ func (s *Service) runToolLoopTurn(
 			State:     s.workbenchStateLocked(),
 			Parts:     partialParts,
 		}
-		if partialCompleted && partialContent != "" && len(requestMessages) > 0 {
-			currentUser := requestMessages[len(requestMessages)-1]
-			if currentUser.Role == "user" {
-				s.sessionMessages = append(s.sessionMessages,
-					currentUser,
-					protocol.Message{Role: "assistant", Content: partialContent},
-				)
-				s.sessionState.MessageCount = len(s.sessionMessages)
-				s.sessionState.TurnCount++
-				s.recordAssistantAndCheckpoint(partialContent, route.ModelID, partialParts, chatTurnDurationMs(ctx))
-				result.TurnCommitted = true
-			}
-		}
-		if partialCompleted {
-			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
-			return result, nil
-		}
 		s.retainInterruptedTurn(&result, terminalStatus, requestMessages, baseMessageCount, prefixDiagnostic)
 		return result, err
 	}
@@ -223,7 +196,7 @@ func (s *Service) runToolLoopTurn(
 	}
 
 	answer := sanitizeModelContent(outcome.Content)
-	s.sessionMessages = append(s.sessionMessages, protocol.Message{Role: "assistant", Content: answer})
+	s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, outcome.Parts)
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
@@ -246,7 +219,7 @@ func partialToolFailureContent(outcome toolLoopOutcome) string {
 		return content
 	}
 	if hasMeaningfulResultParts(outcome.Parts) {
-		return "工具已经执行，但上游模型未能完成最终回复。执行记录已保留，可以直接重试。"
+		return "工具结果已经保留，但本轮任务尚未形成可用结论。请重试，或根据执行记录继续调查。"
 	}
 	return ""
 }
@@ -260,16 +233,11 @@ func partialToolEvidenceContent(outcome toolLoopOutcome) string {
 			return repositoryReadFallbackContent(part)
 		}
 	}
-	for _, part := range outcome.Parts {
-		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
-			return webSearchFallbackContent(part)
-		}
-	}
 	return ""
 }
 
 func hasUsablePartialToolResult(parts []tools.ResultPart) bool {
-	return hasSuccessfulRepositoryRead(parts) || hasSuccessfulWebpageRead(parts) || hasWebSearchSources(parts)
+	return hasSuccessfulRepositoryRead(parts) || hasSuccessfulWebpageRead(parts)
 }
 
 func hasSuccessfulRepositoryRead(parts []tools.ResultPart) bool {
@@ -315,7 +283,7 @@ func hasWebSearchSources(parts []tools.ResultPart) bool {
 
 func webSearchFallbackContent(part tools.ResultPart) string {
 	var content strings.Builder
-	content.WriteString("网络搜索已完成。以下摘要直接整理自搜索来源，请通过链接核对关键细节：")
+	content.WriteString("本轮未完成最终分析。以下仅为原始网络搜索记录，不能视为结论：")
 	for index, source := range part.Sources {
 		title := strings.TrimSpace(source.Title)
 		if title == "" {
@@ -496,25 +464,6 @@ func compactMultilineFallback(value string, maxRunes int) string {
 	return value
 }
 
-func emptyToolCompletionContent(parts []tools.ResultPart) string {
-	for _, part := range parts {
-		if isSuccessfulRepositoryRead(part) {
-			return repositoryReadFallbackContent(part)
-		}
-	}
-	for _, part := range parts {
-		if isSuccessfulWebpageRead(part) {
-			return webpageReadFallbackContent(part)
-		}
-	}
-	for _, part := range parts {
-		if part.Kind == tools.PartWebSearch && len(part.Sources) > 0 {
-			return webSearchFallbackContent(part)
-		}
-	}
-	return ""
-}
-
 func appendTextPartIfMissing(parts []tools.ResultPart, content string) []tools.ResultPart {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -531,30 +480,30 @@ func appendTextPartIfMissing(parts []tools.ResultPart, content string) []tools.R
 // buildToolRegistry 依据当前 runtime settings 构造工具注册表。
 // 沙盒策略从 RuntimeSettings 映射到 tools.SandboxPolicy，实现权限边界。
 func (s *Service) buildToolRegistry() *tools.Registry {
-	return s.buildMutableToolRegistry(true, true)
+	return s.buildToolRegistryForContext(context.Background())
+}
+
+func (s *Service) buildToolRegistryForContext(ctx context.Context) *tools.Registry {
+	return s.buildMutableToolRegistryForContext(ctx, true, true)
 }
 
 // buildWorkerToolRegistry is used by delegated and fixed-team workers. It
 // excludes coordinator tools so a worker cannot mutate the main plan or spawn
 // another layer of agents.
 func (s *Service) buildWorkerToolRegistry() *tools.Registry {
-	return s.buildMutableToolRegistry(false, false)
+	return s.buildWorkerToolRegistryForContext(context.Background())
 }
 
 func (s *Service) buildMutableToolRegistry(includePlan, includeDelegation bool) *tools.Registry {
-	policy := tools.SandboxPolicy{
-		SandboxMode:          s.runtimeSettings.SandboxMode,
-		WorkspaceRoot:        s.runtimeSettings.WorkspaceRoot,
-		ExtraWritableRoots:   s.runtimeSettings.ExtraWritableRoots,
-		FilesystemAccess:     s.runtimeSettings.FilesystemAccess,
-		NetworkAccess:        s.runtimeSettings.NetworkAccess,
-		ShellAccess:          s.runtimeSettings.ShellAccess,
-		AllowDestructiveOps:  s.runtimeSettings.AllowDestructiveOps,
-		MaxCommandSeconds:    s.runtimeSettings.MaxCommandSeconds,
-		MaxCommandMemoryMB:   s.runtimeSettings.MaxCommandMemoryMB,
-		MaxCommandCPUPercent: s.runtimeSettings.MaxCommandCPUPercent,
-		MaxCommandProcesses:  s.runtimeSettings.MaxCommandProcesses,
-	}
+	return s.buildMutableToolRegistryForContext(context.Background(), includePlan, includeDelegation)
+}
+
+func (s *Service) buildWorkerToolRegistryForContext(ctx context.Context) *tools.Registry {
+	return s.buildMutableToolRegistryForContext(ctx, false, false)
+}
+
+func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includePlan, includeDelegation bool) *tools.Registry {
+	policy := s.sandboxPolicyForContext(ctx)
 	reg := tools.NewRegistry()
 	if includePlan {
 		reg.Add(tools.UpdatePlanTool{OnUpdate: s.updatePlanState})
@@ -563,10 +512,16 @@ func (s *Service) buildMutableToolRegistry(includePlan, includeDelegation bool) 
 	reg.Add(tools.FileInfoTool{Policy: policy})
 	reg.Add(tools.ListDirTool{Policy: policy})
 	reg.Add(tools.SearchTool{Policy: policy})
+	if s.config.ArtifactRenderer != nil {
+		reg.Add(tools.RenderArtifactTool{Policy: policy, Controller: s})
+		reg.Add(tools.InspectVisualTool{Policy: policy, Controller: s})
+	}
 	if s.runtimeSettings.NetworkAccess {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
+		reg.Add(tools.DownloadFileTool{Policy: policy})
+		reg.Add(tools.GitRepositoryTool{Policy: policy})
 	}
 	if s.config.OpenFile != nil || s.config.PreviewFile != nil {
 		reg.Add(tools.OpenFileTool{Policy: policy, Open: s.config.OpenFile, Preview: s.config.PreviewFile})
@@ -609,30 +564,35 @@ func (s *Service) buildMutableToolRegistry(includePlan, includeDelegation bool) 
 			reg.Add(remoteTool)
 		}
 	}
+	if s.pluginManager != nil {
+		for _, pluginTool := range s.pluginManager.Tools(s.runtimeSettings.Plugins, policy, false) {
+			reg.Add(pluginTool)
+		}
+	}
 	return reg
 }
 
 // buildReadOnlyRegistry 只含只读工具，供 Plan 阶段「先探索、不改动」使用。
 func (s *Service) buildReadOnlyRegistry() *tools.Registry {
-	policy := tools.SandboxPolicy{
-		SandboxMode:          "read-only",
-		WorkspaceRoot:        s.runtimeSettings.WorkspaceRoot,
-		ExtraWritableRoots:   s.runtimeSettings.ExtraWritableRoots,
-		FilesystemAccess:     "read-only",
-		NetworkAccess:        s.runtimeSettings.NetworkAccess,
-		ShellAccess:          false,
-		AllowDestructiveOps:  false,
-		MaxCommandSeconds:    s.runtimeSettings.MaxCommandSeconds,
-		MaxCommandMemoryMB:   s.runtimeSettings.MaxCommandMemoryMB,
-		MaxCommandCPUPercent: s.runtimeSettings.MaxCommandCPUPercent,
-		MaxCommandProcesses:  s.runtimeSettings.MaxCommandProcesses,
-	}
+	return s.buildReadOnlyRegistryForContext(context.Background())
+}
+
+func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Registry {
+	policy := s.sandboxPolicyForContext(ctx)
+	policy.SandboxMode = "read-only"
+	policy.FilesystemAccess = "read-only"
+	policy.ShellAccess = false
+	policy.AllowDestructiveOps = false
 	reg := tools.NewRegistry(
 		tools.ReadFileTool{Policy: policy},
 		tools.FileInfoTool{Policy: policy},
 		tools.ListDirTool{Policy: policy},
 		tools.SearchTool{Policy: policy},
 	)
+	if s.config.ArtifactRenderer != nil {
+		reg.Add(tools.RenderArtifactTool{Policy: policy, Controller: s})
+		reg.Add(tools.InspectVisualTool{Policy: policy, Controller: s})
+	}
 	if s.config.Git != nil {
 		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: true})
 	}
@@ -640,6 +600,19 @@ func (s *Service) buildReadOnlyRegistry() *tools.Registry {
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
+	}
+	if s.mcpManager != nil {
+		for _, remoteTool := range s.mcpManager.Tools() {
+			readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
+			if ok && readOnlyTool.ReadOnly() {
+				reg.Add(remoteTool)
+			}
+		}
+	}
+	if s.pluginManager != nil {
+		for _, pluginTool := range s.pluginManager.Tools(s.runtimeSettings.Plugins, policy, true) {
+			reg.Add(pluginTool)
+		}
 	}
 	return reg
 }
@@ -727,6 +700,10 @@ type completionFunc func(context.Context, protocol.ChatRequest) (protocol.Comple
 
 const postToolCompletionRetries = 2
 
+const toolResultRecoveryKind = "tool-result-recovery"
+
+var errEmptyToolResultSynthesis = errors.New("模型在工具执行后没有返回可用结论")
+
 const (
 	toolLoopCycleRepetitions = 3
 	toolLoopMaxCyclePeriod   = 3
@@ -749,6 +726,10 @@ type toolLoopGuard struct {
 	objectiveSatisfied         bool
 	forceFinalResponse         bool
 	maxPlanUpdates             int
+	failureStrategy            failureStrategyState
+	resolvedFailures           map[string]bool
+	blockedFailures            map[string]int
+	turnIndex                  int
 	cycles                     toolLoopCycleGuard
 }
 
@@ -822,6 +803,9 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
 		}
 	}
+	if result, message, blocked := g.beforeEquivalentFailure(call); blocked {
+		return result, message, true, false
+	}
 	if name == "ssh" {
 		signature := sshToolCallSignature(call.Function.Arguments)
 		if signature != "" && g.completedSSHCalls[signature] && (g.remoteLookup || strings.HasPrefix(signature, "test\x00")) {
@@ -884,6 +868,18 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 }
 
 func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, message *protocol.Message) {
+	if result.IsError {
+		record, diagnosis := g.failureStrategy.observeFailure(call, result, g.turnIndex)
+		if record.StrategyKey != "" {
+			feedback := failureDiagnosticContent("change_strategy_before_retry", record, diagnosis)
+			message.Content = strings.TrimSpace(message.Content + "\n\nMHcode structured failure diagnosis:\n" + feedback)
+			if record.Retryable && record.Attempts >= equivalentFailureRepetitions {
+				g.forceFinalResponse = true
+			}
+		}
+	} else {
+		g.failureStrategy.observeSuccess(call, result, g.resolvedFailures)
+	}
 	switch call.Function.Name {
 	case "update_plan":
 		if result.IsError {
@@ -927,6 +923,48 @@ func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, messa
 		g.browserUnavailable = true
 		message.Content = strings.TrimSpace(message.Content + "\n本轮不要再次调用 browser；如已有搜索来源，请直接基于来源完成回答。")
 	}
+}
+
+const equivalentFailureRepetitions = 3
+
+func equivalentToolArgumentShape(raw json.RawMessage) string {
+	var value any
+	if err := json.Unmarshal(normalizeToolArgs(raw), &value); err != nil {
+		return normalizeEquivalentText(string(raw))
+	}
+	value = normalizeEquivalentValue(value)
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return normalizeEquivalentText(string(raw))
+	}
+	return string(encoded)
+}
+
+func normalizeEquivalentValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return normalizeEquivalentText(typed)
+	case []any:
+		items := make([]any, len(typed))
+		for index, item := range typed {
+			items[index] = normalizeEquivalentValue(item)
+		}
+		return items
+	case map[string]any:
+		items := make(map[string]any, len(typed))
+		for key, item := range typed {
+			items[key] = normalizeEquivalentValue(item)
+		}
+		return items
+	default:
+		return value
+	}
+}
+
+func normalizeEquivalentText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.NewReplacer("\"", "", "'", "", "`", "", "\\", "/").Replace(value)
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func normalizedToolArguments(raw json.RawMessage) string {
@@ -1113,8 +1151,10 @@ func browserUseExplicitlyRequested(messages []protocol.Message) bool {
 	for _, phrase := range []string{
 		"打开网页", "打开网站", "打开链接", "访问网页", "访问网站", "使用浏览器", "用浏览器", "内置浏览器",
 		"浏览这个网页", "浏览这个网站", "读取网页", "分析网页", "操作网页", "点击网页", "登录网站", "登录网页",
+		"官网下载", "从官网下载", "下载官网", "下载网站", "下载页", "下载页面",
 		"open the webpage", "open the page", "open the website", "open this link", "use the browser", "in-app browser",
 		"visit the website", "browse the website", "read the webpage", "click on the page", "log in to the website",
+		"download from the official website", "download from the vendor website", "download page",
 	} {
 		if strings.Contains(request, phrase) {
 			return true
@@ -1235,11 +1275,21 @@ func (s *Service) runToolLoopWithCompletionState(
 	messages := append([]protocol.Message{}, req.Messages...)
 	toolDefs := toolDefinitions(reg)
 	toolsDisabled := false // 自定义模型不支持 function-calling 时降级为纯对话
+	emptyCompletionStage := 0
+	synthesisOnly := false
+	visualVerificationRequested := false
 	guard := toolLoopGuard{
 		browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages),
 		remoteLookup:               remoteLookupTask(req.Messages),
 		completedSSHCalls:          make(map[string]bool),
+		failureStrategy:            s.failureStrategySnapshot(),
+		resolvedFailures:           make(map[string]bool),
+		blockedFailures:            make(map[string]int),
+		turnIndex:                  s.sessionState.TurnCount + 1,
 	}
+	defer func() {
+		s.mergeFailureStrategyState(guard.failureStrategy, guard.resolvedFailures)
+	}()
 	if guard.remoteLookup {
 		guard.maxPlanUpdates = maxLookupPlanUpdates
 	}
@@ -1269,6 +1319,7 @@ func (s *Service) runToolLoopWithCompletionState(
 				emitChatEvent(sink, ChatStreamEvent{
 					Type:    "status",
 					Message: fmt.Sprintf("模型连接中断，正在继续整理工具结果（%d/%d）", retry, postToolCompletionRetries),
+					Status:  "retrying",
 				})
 				if waitErr := waitForPostToolRetry(ctx, retry); waitErr != nil {
 					err = waitErr
@@ -1293,9 +1344,15 @@ func (s *Service) runToolLoopWithCompletionState(
 			outcome.Content = completion.Content
 		}
 		if err != nil {
-			// 首轮带工具失败：很可能该模型/端点不支持 tools（自定义模型常见）。
-			// 降级为不带 tools 重试一次，保证普通对话可用。
-			if !toolsDisabled && executed == 0 && len(toolDefs) > 0 {
+			// Only retry without tools when the provider explicitly rejects the
+			// function-calling fields. Transport, timeout, policy, authentication,
+			// and unrelated request errors must retain their real failure semantics.
+			if !toolsDisabled && executed == 0 && len(toolDefs) > 0 && isToolCompatibilityError(err) {
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:    "status",
+					Message: "当前模型端点明确不支持工具调用，已降级为普通对话。",
+					Status:  "retrying",
+				})
 				toolsDisabled = true
 				continue
 			}
@@ -1306,6 +1363,18 @@ func (s *Service) runToolLoopWithCompletionState(
 
 		// 无工具调用 → 最终答案。
 		if toolsDisabled && len(completion.ToolCalls) > 0 {
+			if synthesisOnly {
+				if content := strings.TrimSpace(completion.Content); content != "" {
+					outcome.Content = s.appendVisualVerificationDisclosure(ensureWebSearchSourcesListed(content, outcome.Parts))
+					outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
+					setOutcomeProgressStatus(&outcome, "completed")
+					emitOutcomeProgress(sink, outcome.Parts)
+					return outcome, nil
+				}
+				setOutcomeProgressStatus(&outcome, "failed")
+				emitOutcomeProgress(sink, outcome.Parts)
+				return outcome, errEmptyToolResultSynthesis
+			}
 			summary := "上游模型在工具已禁用后仍请求调用工具，MHcode 已停止本轮工具循环并保留全部已完成结果。"
 			if _, canCollectSubagents := reg.Get("await_subagents"); canCollectSubagents && s.hasUncollectedSubagents() {
 				call := newAwaitSubagentsToolCall()
@@ -1327,6 +1396,7 @@ func (s *Service) runToolLoopWithCompletionState(
 			} else {
 				outcome.Content += "\n\n" + summary
 			}
+			outcome.Content = s.appendVisualVerificationDisclosure(outcome.Content)
 			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
 			setOutcomeProgressStatus(&outcome, "completed")
 			emitOutcomeProgress(sink, outcome.Parts)
@@ -1349,7 +1419,7 @@ func (s *Service) runToolLoopWithCompletionState(
 					Message:    "正在等待后台子代理完成",
 					ToolName:   call.Function.Name,
 					ToolCallID: call.ID,
-					Status:     "running",
+					Status:     "waiting",
 				})
 				result, toolMessage := s.executeToolCall(ctx, reg, call)
 				toolStatus := "completed"
@@ -1373,11 +1443,47 @@ func (s *Service) runToolLoopWithCompletionState(
 				}
 				continue
 			}
-			outcome.Content = completion.Content
-			if strings.TrimSpace(outcome.Content) == "" {
-				outcome.Content = emptyToolCompletionContent(outcome.Parts)
+			pendingVisual := s.pendingVisualArtifactsForCurrentTurn()
+			if len(pendingVisual) > 0 && !visualVerificationRequested && !toolsDisabled {
+				visualVerificationRequested = true
+				messages = append(messages, visualVerificationRecoveryMessage(pendingVisual))
+				emitChatEvent(sink, ChatStreamEvent{
+					Type:    "status",
+					Message: "发现尚未完成视觉验收的产物，正在请求渲染与检查",
+					Status:  "running",
+				})
+				continue
 			}
-			outcome.Content = ensureWebSearchSourcesListed(outcome.Content, outcome.Parts)
+			content := strings.TrimSpace(completion.Content)
+			if content == "" {
+				hasToolEvidence := executed > 0 || hasMeaningfulResultParts(outcome.Parts)
+				if hasToolEvidence && emptyCompletionStage == 0 && !toolsDisabled {
+					emptyCompletionStage = 1
+					messages = append(messages, toolResultRecoveryMessage(false))
+					emitChatEvent(sink, ChatStreamEvent{
+						Type:    "status",
+						Message: "模型尚未形成结论，正在继续核验工具结果",
+						Status:  "retrying",
+					})
+					continue
+				}
+				if hasToolEvidence && emptyCompletionStage < 2 {
+					emptyCompletionStage = 2
+					synthesisOnly = true
+					toolsDisabled = true
+					messages = append(messages, toolResultRecoveryMessage(true))
+					emitChatEvent(sink, ChatStreamEvent{
+						Type:    "status",
+						Message: "调查结果已保留，正在要求模型生成最终结论",
+						Status:  "retrying",
+					})
+					continue
+				}
+				setOutcomeProgressStatus(&outcome, "failed")
+				emitOutcomeProgress(sink, outcome.Parts)
+				return outcome, errEmptyToolResultSynthesis
+			}
+			outcome.Content = s.appendVisualVerificationDisclosure(ensureWebSearchSourcesListed(content, outcome.Parts))
 			if strings.TrimSpace(outcome.Content) != "" {
 				outcome.Parts = append(outcome.Parts, tools.ResultPart{
 					Kind: tools.PartText,
@@ -1450,16 +1556,23 @@ func (s *Service) runToolLoopWithCompletionState(
 					if part.Input == "" {
 						part.Input = toolInput
 					}
+					if part.ToolCallID == "" {
+						part.ToolCallID = call.ID
+					}
 					if part.Status == "" {
 						part.Status = "running"
 					}
+					eventStatus := strings.TrimSpace(part.Status)
+					if eventStatus == "" {
+						eventStatus = "running"
+					}
 					emitChatEvent(sink, ChatStreamEvent{
 						Type:       "tool",
-						Message:    fmt.Sprintf("正在运行 %s", call.Function.Name),
+						Message:    toolProgressMessage(call.Function.Name, eventStatus, part.Output),
 						ToolName:   call.Function.Name,
 						ToolCallID: call.ID,
 						ToolInput:  toolInput,
-						Status:     "running",
+						Status:     eventStatus,
 						Parts:      []tools.ResultPart{part},
 					})
 				})
@@ -1522,6 +1635,20 @@ func (s *Service) runToolLoopWithCompletionState(
 	}
 }
 
+func toolProgressMessage(name, status, output string) string {
+	if message := strings.TrimSpace(output); message != "" && (status == "waiting" || status == "retrying") {
+		return message
+	}
+	switch status {
+	case "waiting":
+		return fmt.Sprintf("正在等待 %s", name)
+	case "retrying":
+		return fmt.Sprintf("正在重试 %s", name)
+	default:
+		return fmt.Sprintf("正在运行 %s", name)
+	}
+}
+
 func remoteLookupTask(messages []protocol.Message) bool {
 	request := latestUserRequest(messages)
 	if request == "" || !strings.Contains(request, scopedCredentialScheme) {
@@ -1554,6 +1681,84 @@ func latestUserRequest(messages []protocol.Message) string {
 		}
 	}
 	return ""
+}
+
+func toolResultRecoveryMessage(final bool) protocol.Message {
+	instruction := strings.Join([]string{
+		"[MHcode private tool-result recovery]",
+		"The previous completion returned no user-facing answer after tool execution. The task is not complete.",
+		"Continue investigating with the available tools. Treat web_search snippets only as discovery: for named software, open and read the official website, official documentation, or real source repository before drawing conclusions.",
+		"For questions about the user's computer or current configuration, inspect the authorized local state or explicitly request the missing permission. Never substitute a raw search-result list for the requested diagnosis.",
+		"[/MHcode private tool-result recovery]",
+	}, "\n")
+	if final {
+		instruction = strings.Join([]string{
+			"[MHcode private tool-result recovery]",
+			"Produce the final user-facing answer now from the verified tool evidence already in the conversation.",
+			"If the evidence is insufficient, say exactly what remains unverified and which permission or user action is needed. Include only relevant source links actually used. Never present raw search snippets as a completed answer.",
+			"[/MHcode private tool-result recovery]",
+		}, "\n")
+	}
+	return protocol.Message{Role: "user", Content: instruction, InternalKind: toolResultRecoveryKind}
+}
+
+func isToolCompatibilityError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if info, ok := protocol.ProviderErrorDetails(err); ok {
+		// Authentication, throttling, policy, and transient server failures are
+		// never evidence that the endpoint lacks function calling.
+		if info.HTTPStatus == 401 || info.HTTPStatus == 403 || info.HTTPStatus == 408 ||
+			info.HTTPStatus == 409 || info.HTTPStatus == 429 || info.HTTPStatus >= 500 {
+			return false
+		}
+		code := strings.ToLower(strings.TrimSpace(info.Code + " " + info.Type))
+		mentionsCapability := strings.Contains(code, "tool") || strings.Contains(code, "function_call") || strings.Contains(code, "function-call")
+		rejectsCapability := strings.Contains(code, "unsupported") || strings.Contains(code, "not_supported") ||
+			strings.Contains(code, "unknown_parameter") || strings.Contains(code, "unrecognized_parameter")
+		if mentionsCapability && rejectsCapability {
+			return true
+		}
+		return toolCompatibilityMessage(info.Message)
+	}
+	return toolCompatibilityMessage(err.Error())
+}
+
+func toolCompatibilityMessage(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	if message == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"does not support tool completions",
+		"does not support tool calls",
+		"doesn't support tool calls",
+		"tool calls are not supported",
+		"tool calling is not supported",
+		"tool use is not supported",
+		"function calling is not supported",
+		"function calls are not supported",
+		"unsupported parameter: tools",
+		"unsupported parameter 'tools'",
+		"unsupported parameter \"tools\"",
+		"unknown parameter: tools",
+		"unknown parameter: 'tools'",
+		"unknown parameter: \"tools\"",
+		"unrecognized request argument supplied: tools",
+		"unknown field: tools",
+		"unknown field 'tools'",
+		"unknown field \"tools\"",
+		"'tools' is not allowed",
+		"\"tools\" is not allowed",
+		"unsupported tool_choice",
+		"unknown parameter: tool_choice",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func isRetryablePostToolCompletionError(ctx context.Context, err error) bool {
@@ -1792,12 +1997,8 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 				Content:    summary,
 			}
 	}
-	if toolNeedsExclusiveWorkspaceAccess(name, tool) {
-		s.toolMutationMu.Lock()
-		defer s.toolMutationMu.Unlock()
-	}
-
-	result, err := s.runToolWithApproval(ctx, tool, name, normalizedArgs)
+	timeout := time.Duration(s.runtimeSettings.ToolTimeoutSeconds) * time.Second
+	result, err := s.runToolWithWatchdog(ctx, tool, name, normalizedArgs, timeout)
 	if err != nil {
 		summary := fmt.Sprintf("工具 %s 执行出错: %v", name, err)
 		return tools.Result{
@@ -1831,6 +2032,26 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 			s.turnChanges = append(s.turnChanges, change)
 		}
 	}
+	var artifactRecords []ArtifactRecord
+	if !result.IsError {
+		// Attach the call ID before registration so the durable record can be
+		// associated with the exact tool invocation even if the turn is later
+		// interrupted before an assistant message is produced.
+		result = ensureToolExecutionMetadata(result, name, call.ID, normalizedArgs, startedAt, time.Now())
+		var artifactErr error
+		artifactRecords, artifactErr = s.recordToolArtifacts(name, call.ID, result)
+		if artifactErr != nil {
+			result.IsError = true
+			result.Summary = strings.TrimSpace(result.Summary + "\n" + artifactErr.Error())
+			for index := range result.Parts {
+				if result.Parts[index].Kind != tools.PartToolCall {
+					continue
+				}
+				result.Parts[index].Status = "error"
+				result.Parts[index].Output = result.Summary
+			}
+		}
+	}
 	// Build model feedback only after snapshot recording and any automatic
 	// rollback, so the model never receives a stale success message.
 	feedback := result.Summary
@@ -1842,6 +2063,9 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 			feedback = feedback + "\n" + part.Output
 			break
 		}
+	}
+	if context := formatLocalArtifactContext(artifactReferencesFromRecords(artifactRecords), 4_000); context != "" {
+		feedback += "\n\n" + context
 	}
 	return result, protocol.Message{
 		Role:        "tool",
@@ -1856,8 +2080,14 @@ func toolNeedsExclusiveWorkspaceAccess(name string, tool tools.Tool) bool {
 	if _, ok := tool.(tools.MutatingTool); ok {
 		return true
 	}
+	if strings.HasPrefix(name, "plugin__") {
+		if readOnly, ok := tool.(interface{ ReadOnly() bool }); ok {
+			return !readOnly.ReadOnly()
+		}
+		return true
+	}
 	switch name {
-	case "run_command", "git", "terminal":
+	case "run_command", "git", "git_repository", "terminal":
 		return true
 	}
 	return strings.HasPrefix(name, "mcp__")
@@ -1876,15 +2106,15 @@ func ensureToolExecutionMetadata(result tools.Result, name, toolCallID string, r
 	found := false
 	for index := range result.Parts {
 		part := &result.Parts[index]
+		if part.ToolCallID == "" {
+			part.ToolCallID = toolCallID
+		}
 		if part.Kind != tools.PartToolCall {
 			continue
 		}
 		found = true
 		if part.Name == "" {
 			part.Name = name
-		}
-		if part.ToolCallID == "" {
-			part.ToolCallID = toolCallID
 		}
 		if part.Status == "" {
 			part.Status = status
@@ -1992,7 +2222,11 @@ func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
 	case "read_repository", "read_webpage":
 		key = "url"
 	case "run_command":
-		key = "command"
+		return tools.RunCommandInputForDisplay(rawArgs)
+	case "download_file":
+		return tools.DownloadFileInputForDisplay(rawArgs)
+	case "git_repository":
+		return tools.GitRepositoryInputForDisplay(rawArgs)
 	case "terminal":
 		command, _ := args["command"].(string)
 		action, _ := args["action"].(string)
@@ -2006,7 +2240,7 @@ func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
 		return strings.TrimSpace(source + " -> " + destination)
 	case "browser":
 		if value, _ := args["url"].(string); strings.TrimSpace(value) != "" {
-			return value
+			return tools.SafeDownloadURLForDisplay(value)
 		}
 		key = "action"
 	case "computer":

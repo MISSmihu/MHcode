@@ -179,6 +179,10 @@ type DelegateTaskTool struct {
 
 func (DelegateTaskTool) Name() string { return "delegate_task" }
 
+// RetainsTaskContext reports that workers started by this tool intentionally
+// outlive Execute and remain bound to the parent chat task instead.
+func (DelegateTaskTool) RetainsTaskContext() bool { return true }
+
 func (DelegateTaskTool) Description() string {
 	return "将 1-3 个彼此独立的子任务同时放到后台执行并立即返回任务 ID。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。启动后主 Agent 应继续自己的独立工作，临近最终综合时再调用 await_subagents。多个 implement 以及主 Agent 的写入范围必须互不重叠。"
 }
@@ -369,6 +373,14 @@ func (t AwaitSubagentsTool) Execute(ctx context.Context, rawArgs json.RawMessage
 	results := make([]delegatedTaskResult, 0, len(controls))
 	parts := make([]tools.ResultPart, 0, len(controls)*2)
 	running := 0
+	if wait {
+		tools.EmitProgress(ctx, tools.ResultPart{
+			Kind:   tools.PartToolCall,
+			Name:   "await_subagents",
+			Status: "waiting",
+			Output: fmt.Sprintf("正在等待 %d 个后台子代理完成", len(controls)),
+		})
+	}
 	for _, control := range controls {
 		if wait {
 			select {
@@ -644,9 +656,9 @@ func (s *Service) runDelegatedTask(
 	emit(part)
 
 	request := subagentRequest(scope.BaseRequest, spec, part.TaskID, route)
-	registry := s.buildReadOnlyRegistry()
+	registry := s.buildReadOnlyRegistryForContext(ctx)
 	if spec.AgentType == subagentImplement {
-		registry = s.buildWorkerToolRegistry()
+		registry = s.buildWorkerToolRegistryForContext(ctx)
 	}
 	stepIndex := make(map[string]int)
 	activityIndex := make(map[string]int)
@@ -755,7 +767,7 @@ func (s *Service) resolveSubagentRoute(spec delegateTaskSpec, primary chatRoute)
 
 func subagentRequest(base protocol.ChatRequest, spec delegateTaskSpec, taskID string, route chatRoute) protocol.ChatRequest {
 	request := base
-	request.Model = route.ModelID
+	applyRouteToChatRequest(&request, route)
 	request.Metadata = make(map[string]string, len(base.Metadata)+4)
 	for key, value := range base.Metadata {
 		request.Metadata[key] = value
@@ -830,10 +842,14 @@ func subagentToolStepTitle(name, input string) string {
 		label = "写入文件"
 	case "apply_patch":
 		label = "修改文件"
+	case "download_file":
+		label = "下载文件"
 	case "run_command":
 		label = "运行命令"
 	case "git":
 		label = "检查 Git"
+	case "git_repository":
+		label = "拉取仓库"
 	case "terminal":
 		label = "操作终端"
 	}
