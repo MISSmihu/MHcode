@@ -529,7 +529,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.8",
+  version: "0.3.9",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",

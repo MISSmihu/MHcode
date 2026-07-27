@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/eventlog"
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
@@ -39,7 +40,7 @@ func TestArtifactRegistryPersistsToolMetadataAcrossRestart(t *testing.T) {
 		t.Fatalf("artifact records = %#v", records)
 	}
 	record := records[0]
-	expectedPath := filepath.Join(workspace, "reports", "report.txt")
+	expectedPath := canonicalArtifactTestPath(t, filepath.Join(workspace, "reports", "report.txt"))
 	written, err := os.ReadFile(expectedPath)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +95,7 @@ func TestExecuteToolCallFeedsCanonicalArtifactContextToModelImmediately(t *testi
 		ID: "call-immediate", Type: "function",
 		Function: protocol.ToolCallFunction{Name: "write_file", Arguments: arguments},
 	})
-	path := filepath.Join(workspace, "output.txt")
+	path := canonicalArtifactTestPath(t, filepath.Join(workspace, "output.txt"))
 	if result.IsError || !strings.Contains(message.Content, localArtifactContextStart) || !strings.Contains(message.Content, path) {
 		t.Fatalf("tool feedback did not expose canonical artifact: result=%#v message=%q", result, message.Content)
 	}
@@ -273,8 +274,37 @@ func assertArtifactPaths(t *testing.T, records []ArtifactRecord, expected ...str
 		t.Fatalf("artifact paths = %#v, want %#v", actual, expected)
 	}
 	for index := range expected {
-		if actual[index] != expected[index] {
+		if artifactPathKey(actual[index]) != artifactPathKey(expected[index]) {
 			t.Fatalf("artifact paths = %#v, want %#v", actual, expected)
 		}
+	}
+}
+
+func canonicalArtifactTestPath(t *testing.T, path string) string {
+	t.Helper()
+	canonical, err := pathutil.Canonical(path)
+	if err != nil {
+		t.Fatalf("canonicalize artifact test path %q: %v", path, err)
+	}
+	return canonical
+}
+
+func TestArtifactPathKeyTreatsWindowsShortAndLongPathsAsOneFile(t *testing.T) {
+	if os.PathSeparator != '\\' {
+		t.Skip("Windows path aliases only")
+	}
+	shortPath := filepath.Join(t.TempDir(), "artifact.txt")
+	if err := os.WriteFile(shortPath, []byte("artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	longPath, err := filepath.EvalSymlinks(shortPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.EqualFold(shortPath, longPath) {
+		t.Skip("test environment does not expose an 8.3 path alias")
+	}
+	if artifactPathKey(shortPath) != artifactPathKey(longPath) {
+		t.Fatalf("short and long paths have different identities: %q != %q", shortPath, longPath)
 	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/MISSmihu/MHcode/internal/artifacts"
 	"github.com/MISSmihu/MHcode/internal/eventlog"
+	"github.com/MISSmihu/MHcode/internal/pathutil"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
@@ -277,17 +278,21 @@ func (s *Service) canonicalArtifactPath(path string) (absolute, display string) 
 			path = filepath.Join(root, path)
 		}
 	}
-	absolute, err := filepath.Abs(path)
+	absolute, err := pathutil.Canonical(path)
 	if err != nil {
-		absolute = filepath.Clean(path)
+		absolute, err = filepath.Abs(path)
+		if err != nil {
+			absolute = filepath.Clean(path)
+		}
 	}
 	absolute = filepath.Clean(absolute)
-	if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
-		absolute = filepath.Clean(resolved)
-	}
 	display = absolute
 	if root := strings.TrimSpace(s.runtimeSettings.WorkspaceRoot); root != "" {
-		if relative, relativeErr := filepath.Rel(root, absolute); relativeErr == nil &&
+		canonicalRoot, rootErr := pathutil.Canonical(root)
+		if rootErr != nil {
+			canonicalRoot = filepath.Clean(root)
+		}
+		if relative, relativeErr := filepath.Rel(canonicalRoot, absolute); relativeErr == nil &&
 			relative != "." && relative != ".." && !filepath.IsAbs(relative) &&
 			!strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
 			display = filepath.ToSlash(relative)
@@ -395,7 +400,12 @@ func artifactActionPriority(action string) int {
 }
 
 func artifactPathKey(path string) string {
-	path = filepath.Clean(strings.TrimSpace(path))
+	path = filepath.Clean(filepath.FromSlash(strings.TrimSpace(path)))
+	if filepath.IsAbs(path) {
+		if canonical, err := pathutil.Canonical(path); err == nil {
+			path = filepath.Clean(canonical)
+		}
+	}
 	if runtime.GOOS == "windows" {
 		path = strings.ToLower(path)
 	}

@@ -132,7 +132,7 @@ func TestTurnAuthorizedExternalDownloadIsRegisteredAsArtifact(t *testing.T) {
 		t.Fatalf("external artifact=%q err=%v", content, err)
 	}
 	records := service.ListSessionArtifacts()
-	if len(records) != 1 || records[0].Path != destination || records[0].Tool != "download_file" || records[0].ToolCallID != "download-external" {
+	if len(records) != 1 || artifactPathKey(records[0].Path) != artifactPathKey(destination) || records[0].Tool != "download_file" || records[0].ToolCallID != "download-external" {
 		t.Fatalf("external artifact records=%#v", records)
 	}
 }

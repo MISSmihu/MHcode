@@ -2,6 +2,19 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.9 - 2026-07-28
+
+### Windows artifact path identity
+
+- Canonicalize existing and deleted artifact paths through their nearest existing ancestor so Windows 8.3 short names and long names resolve to one durable identity.
+- Canonicalize the workspace root before deriving display paths, preserving relative labels when the workspace was supplied through a short-path alias.
+- Keep artifact creation, deletion, external downloads, render restoration, and visual inspection on the same path key across restarts and clean CI environments.
+
+### Verification
+
+- Add a Windows short/long path alias regression and rerun the artifact registry, rewind, download, render, and visual tool-loop tests.
+- All local Go package tests, `go vet`, frontend checks, and the production Wails build pass; GitHub Actions verification is required before publishing this patch release.
+
 ## v0.3.8 - 2026-07-28
 
 ### Agent reliability and recoverability
