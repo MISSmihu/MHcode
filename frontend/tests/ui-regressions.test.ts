@@ -619,6 +619,23 @@ describe("chat UI regressions", () => {
     expect(css).toContain(".op-command-entry[open] > summary > svg {");
   });
 
+  test("groups consecutive research actions under one stable disclosure", async () => {
+    const [app, messageContent, css] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/chat.css", import.meta.url)).text(),
+    ]);
+    expect(messageContent).toContain("function buildActivityBatches");
+    expect(messageContent).toContain('category === "web"');
+    expect(messageContent).toContain('category === "repository"');
+    expect(messageContent).toContain('class="op-activity-item op-activity-batch"');
+    expect(messageContent).toContain("正在查阅 ${count} 项资料");
+    expect(messageContent).toContain("activity-batch:${activityBatchIdentity(batch, index())}");
+    expect(css).toContain(".op-activity-batch-body {");
+    expect(app).toContain("const renderedMessages = createStableListViews(messages, (message) => message.id);");
+    expect(app).toContain("each={renderedMessages()}");
+  });
+
   test("loads Markdown as chat context and imports durable Markdown Skills", async () => {
     const [app, settings, workbench] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),

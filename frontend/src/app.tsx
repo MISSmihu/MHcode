@@ -199,6 +199,7 @@ import {
 import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
 import { hasMeaningfulTurnOutput } from "./lib/chat-results";
 import { appendLiveAssistantText, displayMessageParts, liveTaskStatus, settleLiveTimelineParts, updateLiveTimelineParts } from "./lib/timeline";
+import { createStableListViews } from "./lib/stable-list";
 import { redactSensitiveTextForDisplay } from "./lib/sensitive-text";
 import type { UIAppearancePreferences } from "./ui-appearance";
 import {
@@ -338,6 +339,7 @@ function App() {
   const [previewAttachment, setPreviewAttachment] = createSignal<ChatAttachment>();
   const [copiedMessageID, setCopiedMessageID] = createSignal("");
   const [messages, setMessages] = createSignal<ChatMessage[]>([]);
+  const renderedMessages = createStableListViews(messages, (message) => message.id);
   const [messageDisclosures, setMessageDisclosures] = createSignal<Record<string, boolean>>({});
   const [chatNearBottom, setChatNearBottom] = createSignal(true);
   const [runtimeDraft, setRuntimeDraft] = createSignal<RuntimeSettings>();
@@ -4173,7 +4175,7 @@ function App() {
           onScroll={updateChatScrollState}
         >
           <For
-            each={messages()}
+            each={renderedMessages()}
             fallback={
               <div class="welcome-state">
                 <div class="welcome-brand">

@@ -36,6 +36,7 @@ import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench
 import { formatElapsedDuration } from "../../lib/duration";
 import { writeClipboardText } from "../../lib/clipboard";
 import { isRoutineTaskStatus } from "../../lib/timeline";
+import { createStableListViews } from "../../lib/stable-list";
 import { groupSecretResults, secretResultFieldLabel, type SecretResultGroup } from "../../lib/secret-results";
 import { InlineCodePreview } from "./InlineCodePreview";
 import { InlineDiffPreview } from "./InlineDiffPreview";
@@ -59,7 +60,8 @@ export function MessageContent(props: {
 	onDisclosureChange?: (key: string, open: boolean) => void;
 }) {
   const renderedParts = createMemo(() => withInferredFileArtifacts(props.parts, props.inferFileArtifacts !== false));
-  const blocks = createMemo(() => groupRenderBlocks(renderedParts()));
+  const rawBlocks = createMemo(() => groupRenderBlocks(renderedParts()));
+  const blocks = createStableListViews(rawBlocks, renderBlockIdentity);
   const fileChanges = createMemo(() => editedFileSummaries(renderedParts()));
   return (
     <div class="op-stream">
@@ -144,6 +146,7 @@ type TimelineRenderBlock = { kind: "timeline"; part: TimelineNotePart };
 type RenderBlock = TextRenderBlock | TimelineRenderBlock | ActivityRenderBlock | TeamRenderBlock | SubagentRenderBlock | ProviderRenderBlock | SecretRenderBlock;
 type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "render" | "visual" | "browser" | "computer" | "open" | "file" | "tool";
 type ActivityItem = { category: ActivityCategory; parts: MessagePart[] };
+type ActivityBatch = { kind: "research" | "activity"; items: ActivityItem[] };
 type DisclosureProps = {
 	isDisclosureOpen?: (key: string) => boolean;
 	onDisclosureChange?: (key: string, open: boolean) => void;
@@ -155,21 +158,36 @@ function ActivityGroup(props: {
   onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
   onOpenURL?: (url: string) => void | Promise<void>;
 } & DisclosureProps) {
-  const items = createMemo(() => buildActivityItems(props.parts));
+  const rawBatches = createMemo(() => buildActivityBatches(buildActivityItems(props.parts)));
+  const batches = createStableListViews(rawBatches, activityBatchIdentity);
   const artifacts = createMemo(() => activityArtifacts(props.parts));
   return (
     <>
       <div class="op-activity-feed">
-        <For each={items()}>
-          {(item, index) => (
-            <ActivityRow
-              item={item}
-			  disclosureKey={activityDisclosureKey(item, index())}
-              onOpenURL={props.onOpenURL}
-              onOpenWorkspaceFile={props.onOpenWorkspaceFile}
-			  isDisclosureOpen={props.isDisclosureOpen}
-			  onDisclosureChange={props.onDisclosureChange}
-            />
+        <For each={batches()}>
+          {(batch, index) => (
+            <Show
+              when={batch.kind === "research" && activityBatchOperationCount(batch) > 1}
+              fallback={
+                <ActivityRow
+                  item={batch.items[0]}
+                  disclosureKey={activityDisclosureKey(batch.items[0], index())}
+                  onOpenURL={props.onOpenURL}
+                  onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+                  isDisclosureOpen={props.isDisclosureOpen}
+                  onDisclosureChange={props.onDisclosureChange}
+                />
+              }
+            >
+              <ResearchActivityBatch
+                batch={batch}
+                disclosureKey={`activity-batch:${activityBatchIdentity(batch, index())}`}
+                onOpenURL={props.onOpenURL}
+                onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+                isDisclosureOpen={props.isDisclosureOpen}
+                onDisclosureChange={props.onDisclosureChange}
+              />
+            </Show>
           )}
         </For>
       </div>
@@ -186,6 +204,51 @@ function ActivityGroup(props: {
         )}
       </For>
     </>
+  );
+}
+
+function ResearchActivityBatch(props: {
+  batch: ActivityBatch;
+  disclosureKey: string;
+  onOpenURL?: (url: string) => void | Promise<void>;
+  onOpenWorkspaceFile?: (path: string, view?: WorkspaceFileView, line?: number) => void | Promise<void>;
+} & DisclosureProps) {
+  const rawItems = createMemo(() => props.batch.items);
+  const items = createStableListViews(rawItems, activityDisclosureKey);
+  const status = () => activityBatchStatus(props.batch);
+  return (
+    <details
+      class="op-activity-item op-activity-batch"
+      classList={{ [status()]: true }}
+      open={props.isDisclosureOpen?.(props.disclosureKey)}
+      onToggle={(event) => props.onDisclosureChange?.(props.disclosureKey, event.currentTarget.open)}
+    >
+      <summary title={activityBatchTitle(props.batch)}>
+        <span class="op-activity-icon"><Search size={14} /></span>
+        <span class="op-activity-label">{activityBatchLabel(props.batch)}</span>
+        <Show when={status() === "running"}>
+          <span class="op-activity-spinner" aria-label="执行中" />
+        </Show>
+        <Show when={status() === "error"}>
+          <AlertCircle class="op-activity-error" size={14} aria-label="部分操作失败" />
+        </Show>
+        <ChevronRight class="op-activity-chevron" size={14} aria-hidden="true" />
+      </summary>
+      <div class="op-activity-body op-activity-batch-body">
+        <For each={items()}>
+          {(item, index) => (
+            <ActivityRow
+              item={item}
+              disclosureKey={activityDisclosureKey(item, index())}
+              onOpenURL={props.onOpenURL}
+              onOpenWorkspaceFile={props.onOpenWorkspaceFile}
+              isDisclosureOpen={props.isDisclosureOpen}
+              onDisclosureChange={props.onDisclosureChange}
+            />
+          )}
+        </For>
+      </div>
+    </details>
   );
 }
 
@@ -656,6 +719,25 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
   return blocks;
 }
 
+function renderBlockIdentity(block: RenderBlock, index: number): string {
+  switch (block.kind) {
+    case "text":
+      return `block:${index}:text`;
+    case "timeline":
+      return `block:${index}:timeline:${block.part.startedAt ?? ""}`;
+    case "activity":
+      return `block:${index}:activity:${partDisclosureIdentity(block.parts[0])}`;
+    case "team":
+      return `block:${index}:team:${block.parts[0]?.role ?? "team"}`;
+    case "subagents":
+      return `block:${index}:subagents:${block.parts[0]?.taskId ?? "subagents"}`;
+    case "provider":
+      return `block:${index}:provider:${block.part.requestId ?? block.part.noticeKind}`;
+    case "secret":
+      return `block:${index}:secret:${block.group.key}`;
+  }
+}
+
 function buildActivityItems(parts: MessagePart[]): ActivityItem[] {
   const raw: ActivityItem[] = [];
   for (let index = 0; index < parts.length; index++) {
@@ -687,6 +769,55 @@ function buildActivityItems(parts: MessagePart[]): ActivityItem[] {
     }
   }
   return raw;
+}
+
+function buildActivityBatches(items: ActivityItem[]): ActivityBatch[] {
+  const batches: ActivityBatch[] = [];
+  for (const item of items) {
+    const kind: ActivityBatch["kind"] = isResearchActivity(item.category) ? "research" : "activity";
+    const previous = batches.at(-1);
+    if (kind === "research" && previous?.kind === "research") {
+      previous.items.push(item);
+      continue;
+    }
+    batches.push({ kind, items: [item] });
+  }
+  return batches;
+}
+
+function isResearchActivity(category: ActivityCategory): boolean {
+  return category === "read"
+    || category === "directory"
+    || category === "search"
+    || category === "web"
+    || category === "repository";
+}
+
+function activityBatchIdentity(batch: ActivityBatch, index: number): string {
+  return `${index}:${batch.kind}:${partDisclosureIdentity(batch.items[0]?.parts[0])}`;
+}
+
+function activityBatchOperationCount(batch: ActivityBatch): number {
+  return Math.max(1, batch.items.reduce((total, item) => {
+    const tools = item.parts.filter((part) => part.kind === "tool_call").length;
+    return total + Math.max(1, tools);
+  }, 0));
+}
+
+function activityBatchStatus(batch: ActivityBatch): "running" | "ok" | "error" {
+  const statuses = batch.items.map(activityStatus);
+  if (statuses.includes("error")) return "error";
+  if (statuses.includes("running")) return "running";
+  return "ok";
+}
+
+function activityBatchLabel(batch: ActivityBatch): string {
+  const count = activityBatchOperationCount(batch);
+  return activityBatchStatus(batch) === "running" ? `正在查阅 ${count} 项资料` : `查阅了 ${count} 项资料`;
+}
+
+function activityBatchTitle(batch: ActivityBatch): string {
+  return uniqueStrings(batch.items.map(activityTitle).filter(Boolean)).join("\n");
 }
 
 function activityCategory(part: Exclude<MessagePart, TextPart>): ActivityCategory {

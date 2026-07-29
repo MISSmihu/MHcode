@@ -1308,6 +1308,25 @@
   border-left: 1px solid var(--border-color);
 }
 
+.op-activity-batch > summary {
+  font-weight: 520;
+}
+
+.op-activity-batch-body {
+  gap: 1px;
+  margin-bottom: 8px;
+  padding-top: 1px;
+  padding-bottom: 1px;
+}
+
+.op-activity-batch-body > .op-activity-item > summary {
+  min-height: 28px;
+}
+
+.op-activity-batch-body > .op-activity-item > .op-activity-body {
+  margin-left: 8px;
+}
+
 .op-command-list {
   display: grid;
   min-width: 0;
