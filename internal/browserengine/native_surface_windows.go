@@ -3,6 +3,7 @@
 package browserengine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/chromedp/cdproto/target"
 	"github.com/wailsapp/go-webview2/pkg/edge"
 	"golang.org/x/sys/windows"
 )
@@ -99,15 +101,15 @@ func (*windowsNativeBrowserSurface) Supported() bool { return true }
 // external process window to be attached.
 func (*windowsNativeBrowserSurface) Attach(int) error { return nil }
 
-func (s *windowsNativeBrowserSurface) Start(options embeddedBrowserOptions) (string, error) {
+func (s *windowsNativeBrowserSurface) Start(options embeddedBrowserOptions) (embeddedBrowserStart, error) {
 	s.Close()
 	mainWindow, err := waitForNativeWindow(uint32(os.Getpid()), isWailsWindow, 5*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("locate MHcode window: %w", err)
+		return embeddedBrowserStart{}, fmt.Errorf("locate MHcode window: %w", err)
 	}
 	port, err := reserveLoopbackPort()
 	if err != nil {
-		return "", fmt.Errorf("reserve WebView2 debugging port: %w", err)
+		return embeddedBrowserStart{}, fmt.Errorf("reserve WebView2 debugging port: %w", err)
 	}
 	options.AdditionalBrowserArgs = append(
 		append([]string(nil), options.AdditionalBrowserArgs...),
@@ -131,17 +133,22 @@ func (s *windowsNativeBrowserSurface) Start(options embeddedBrowserOptions) (str
 	select {
 	case started = <-ready:
 	case <-time.After(embeddedSurfaceCommandTimeout):
-		return "", errors.New("WebView2 initialization timed out")
+		return embeddedBrowserStart{}, errors.New("WebView2 initialization timed out")
 	}
 	if started.err != nil {
 		s.Close()
-		return "", started.err
+		return embeddedBrowserStart{}, started.err
 	}
-	if err := waitForDevToolsEndpoint(started.endpoint, 8*time.Second); err != nil {
+	rootTargetID, err := waitForDevToolsTarget(
+		started.endpoint,
+		"about:blank#mhcode-browser-bootstrap-"+strconv.Itoa(port),
+		8*time.Second,
+	)
+	if err != nil {
 		s.Close()
-		return "", err
+		return embeddedBrowserStart{}, err
 	}
-	return started.endpoint, nil
+	return embeddedBrowserStart{Endpoint: started.endpoint, RootTargetID: rootTargetID}, nil
 }
 
 func (s *windowsNativeBrowserSurface) CreateTab(tabID, markerURL string) error {
@@ -449,20 +456,23 @@ func reserveLoopbackPort() (int, error) {
 	return port, nil
 }
 
-func waitForDevToolsEndpoint(endpoint string, timeout time.Duration) error {
+func waitForDevToolsTarget(endpoint, markerURL string, timeout time.Duration) (target.ID, error) {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 600 * time.Millisecond}
-	versionURL := strings.TrimRight(endpoint, "/") + "/json/version"
-	var lastErr error
+	targetsURL := strings.TrimRight(endpoint, "/") + "/json/list"
+	lastErr := errors.New("WebView2 target list is empty")
 	for time.Now().Before(deadline) {
-		response, err := client.Get(versionURL)
+		response, err := client.Get(targetsURL)
 		if err == nil {
-			body, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 256*1024))
 			_ = response.Body.Close()
-			if readErr == nil && response.StatusCode == http.StatusOK && strings.Contains(string(body), "webSocketDebuggerUrl") {
-				return nil
-			}
-			if readErr != nil {
+			if readErr == nil && response.StatusCode == http.StatusOK {
+				if targetID, findErr := findDevToolsTarget(body, markerURL); findErr == nil {
+					return targetID, nil
+				} else {
+					lastErr = findErr
+				}
+			} else if readErr != nil {
 				lastErr = readErr
 			} else {
 				lastErr = fmt.Errorf("HTTP %d", response.StatusCode)
@@ -472,7 +482,24 @@ func waitForDevToolsEndpoint(endpoint string, timeout time.Duration) error {
 		}
 		time.Sleep(80 * time.Millisecond)
 	}
-	return fmt.Errorf("WebView2 debugging endpoint did not become ready: %w", lastErr)
+	return "", fmt.Errorf("WebView2 bootstrap target did not become ready: %w", lastErr)
+}
+
+func findDevToolsTarget(payload []byte, markerURL string) (target.ID, error) {
+	var targets []struct {
+		ID   target.ID `json:"id"`
+		Type string    `json:"type"`
+		URL  string    `json:"url"`
+	}
+	if err := json.Unmarshal(payload, &targets); err != nil {
+		return "", fmt.Errorf("decode WebView2 targets: %w", err)
+	}
+	for _, candidate := range targets {
+		if candidate.ID != "" && candidate.Type == "page" && candidate.URL == markerURL {
+			return candidate.ID, nil
+		}
+	}
+	return "", fmt.Errorf("WebView2 bootstrap target %q was not found", markerURL)
 }
 
 func pumpWindowMessages() {

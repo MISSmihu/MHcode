@@ -45,3 +45,24 @@ func TestEmbeddedBrowserIdentity(t *testing.T) {
 		t.Fatalf("marker URL = %q", marker)
 	}
 }
+
+func TestFindDevToolsTargetSelectsBootstrapPage(t *testing.T) {
+	payload := []byte(`[
+		{"id":"other","type":"page","url":"about:blank"},
+		{"id":"bootstrap","type":"page","url":"about:blank#mhcode-browser-bootstrap-9222"},
+		{"id":"worker","type":"worker","url":"about:blank#mhcode-browser-bootstrap-9222"}
+	]`)
+	targetID, err := findDevToolsTarget(payload, "about:blank#mhcode-browser-bootstrap-9222")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetID != "bootstrap" {
+		t.Fatalf("target ID = %q, want bootstrap", targetID)
+	}
+}
+
+func TestFindDevToolsTargetRejectsMissingBootstrapPage(t *testing.T) {
+	if _, err := findDevToolsTarget([]byte(`[{"id":"other","type":"page","url":"about:blank"}]`), "about:blank#missing"); err == nil {
+		t.Fatal("expected missing bootstrap target error")
+	}
+}

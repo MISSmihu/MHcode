@@ -1,6 +1,10 @@
 package browserengine
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/chromedp/cdproto/target"
+)
 
 type NativeSurfaceBounds struct {
 	X              float64 `json:"x"`
@@ -31,10 +35,15 @@ type nativeBrowserSurface interface {
 // visible page and the page being inspected are always the same target.
 type embeddedNativeBrowserSurface interface {
 	nativeBrowserSurface
-	Start(options embeddedBrowserOptions) (string, error)
+	Start(options embeddedBrowserOptions) (embeddedBrowserStart, error)
 	CreateTab(tabID, markerURL string) error
 	ActivateTab(tabID string) error
 	CloseTab(tabID string)
+}
+
+type embeddedBrowserStart struct {
+	Endpoint     string
+	RootTargetID target.ID
 }
 
 type embeddedBrowserOptions struct {

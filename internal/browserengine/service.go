@@ -485,7 +485,7 @@ func (s *Service) startEmbeddedBrowser(
 	surface embeddedNativeBrowserSurface,
 	settings Settings,
 ) error {
-	endpoint, err := surface.Start(embeddedBrowserOptions{
+	started, err := surface.Start(embeddedBrowserOptions{
 		ProfileDir: s.profileDir,
 		AdditionalBrowserArgs: []string{
 			"--disable-crash-reporter",
@@ -503,8 +503,12 @@ func (s *Service) startEmbeddedBrowser(
 		return err
 	}
 
-	allocatorCtx, allocatorCancel := chromedp.NewRemoteAllocator(context.Background(), endpoint)
-	rootCtx, rootCancel := chromedp.NewContext(allocatorCtx, chromedp.WithErrorf(browserProtocolErrorf))
+	allocatorCtx, allocatorCancel := chromedp.NewRemoteAllocator(context.Background(), started.Endpoint)
+	rootCtx, rootCancel := chromedp.NewContext(
+		allocatorCtx,
+		chromedp.WithTargetID(started.RootTargetID),
+		chromedp.WithErrorf(browserProtocolErrorf),
+	)
 	chromedp.ListenBrowser(rootCtx, s.handleBrowserEvent)
 	err = chromedp.Run(rootCtx,
 		network.Enable(),
@@ -521,7 +525,7 @@ func (s *Service) startEmbeddedBrowser(
 		return fmt.Errorf("connect to embedded WebView2: %w", err)
 	}
 
-	rootTargetID := target.ID("")
+	rootTargetID := started.RootTargetID
 	if details := chromedp.FromContext(rootCtx); details != nil && details.Target != nil {
 		rootTargetID = details.Target.TargetID
 	}

@@ -2,6 +2,20 @@
 
 本项目的显著变化记录在此文件中。
 
+## v0.3.12 - 2026-07-29
+
+### 内置浏览器热修复
+
+- 修复 Microsoft Edge WebView2 150 中内置浏览器偶发报错 `start embedded WebView2 browser: connect to embedded WebView2: context canceled` 并无法打开的问题。
+- 启动时先从 WebView2 调试端点识别 MHcode 已创建的 bootstrap 页面，再让 `chromedp` 附加该页面，避免默认发送会导致 WebView2 进程访问冲突崩溃的 `Target.createTarget(newWindow=true)`。
+- 新增 bootstrap 目标识别测试和可显式运行的真实 WebView2/CDP 集成测试，覆盖控制器创建、目标发现、附加及完整协议初始化。
+
+### 验证
+
+- `go test ./...` 全部通过。
+- Windows WebView2 150 真实运行时集成测试通过。
+- Linux amd64 浏览器引擎交叉编译通过。
+
 ## v0.3.11 - 2026-07-29
 
 ### Agent 执行与恢复
