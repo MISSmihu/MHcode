@@ -83,6 +83,7 @@ type LoadedSkill struct {
 	Name        string
 	Version     int
 	Trigger     string
+	TriggerMode string
 	Summary     string
 	SHA256      string
 	Description string
@@ -122,6 +123,7 @@ func (l Loader) Load(name string) (LoadedSkill, error) {
 			Name:        entry.Name,
 			Version:     entry.Version,
 			Trigger:     entry.Trigger,
+			TriggerMode: entry.TriggerMode,
 			Summary:     entry.Summary,
 			SHA256:      entry.SHA256,
 			Description: entry.Description,
@@ -201,6 +203,11 @@ func (l Loader) applyRuntimeMetadata(skillPath string, entry IndexEntry) IndexEn
 	metadata := parseKeyValueData(string(data))
 	activation := strings.ToLower(strings.TrimSpace(metadata["activation"]))
 	trigger := strings.TrimSpace(metadata["trigger"])
+	if activation == "always" {
+		entry.Trigger = "always"
+		entry.TriggerMode = "always"
+		return entry
+	}
 	if activation == "manual" || strings.EqualFold(trigger, "manual") {
 		entry.Trigger = "manual"
 		entry.TriggerMode = "manual"

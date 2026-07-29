@@ -68,3 +68,16 @@ func TestVisualToolsRejectInvalidInputsAndForwardInspection(t *testing.T) {
 		t.Fatalf("inspect summary=%q", result.Summary)
 	}
 }
+
+func TestInspectVisualSchemaUsesObjectRootWithoutComposition(t *testing.T) {
+	schema := (InspectVisualTool{}).InputSchema()
+	if schema["type"] != "object" {
+		t.Fatalf("schema root type = %#v, want object", schema["type"])
+	}
+	if _, exists := schema["anyOf"]; exists {
+		t.Fatalf("schema root must not use anyOf: %#v", schema)
+	}
+	if _, exists := schema["oneOf"]; exists {
+		t.Fatalf("schema root must not use oneOf: %#v", schema)
+	}
+}

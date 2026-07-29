@@ -21,7 +21,7 @@
 - MHcode 的显式触发条件放在 `agents/mhcode.yaml`，标准 `SKILL.md` frontmatter 只保留 `name` 和 `description`。
 - `agents/mhcode.yaml` 中的 `trigger` 只按分隔后的完整短语匹配，不使用名称碎片或宽泛关键词猜测。
 - `activation: manual` 表示只能由完整 Skill 名称显式调用。
-- 命中后最多加载两份 Skill 正文，并记录名称、字符数和估算 token。
+- 命中后按推理档位分配 Skill token 预算，不使用固定 Skill 数量上限；显式点名的 Skill 优先于自动触发项，超长正文只在预算边界内注入，并记录名称、字符数和估算 token。
 - 内部开发说明放在 `docs/`；运行时 Skill 只保留当前任务真正需要的约束。
 
 ## 推理与工具循环
@@ -36,7 +36,9 @@
 - 停滞检测确认重复失败且无法切换有效方案。
 - 上下文、审批、沙箱或资源策略拒绝继续。
 
-每轮工具结果必须包含结构化摘要、可恢复 parts、退出状态和必要引用。模型失败但工具已经产生有效结果时保留结果，不得重复用户消息或伪造完成。
+每轮工具结果必须包含结构化摘要、可恢复 parts、退出状态和必要引用。回喂模型的 tool 消息使用稳定 JSON 元数据携带工具名、调用 ID、脱敏输入、工作目录、退出码、耗时、stdout 和 stderr。工具同时返回 `result + error` 时，错误只改变终态，不得覆盖或删除已产生的 text、file、diff、web、image、subagent、`FileChange` 和产物引用。模型失败但工具已经产生有效结果时保留结果，不得重复用户消息或伪造完成。
+
+支持协议时允许模型在同一回合提出多个独立工具调用，以减少模型往返；当前宿主仍按顺序执行普通工具，并通过独占门串行化写入、Shell、Git、终端和远程工具。同一工作区的 detached session runtime 共享该写入门，因此不同对话可以并行推理和读取，但不能并发修改同一工作区；等待写入门时必须响应取消。若兼容端点明确拒绝 `parallel_tool_calls`，只关闭该请求字段后重试，不能因此禁用完整工具能力。
 
 ## 权限与结构化工具
 
@@ -47,6 +49,8 @@
 - 网络、Shell、破坏性操作与桌面控制开关。
 - 超时、内存、CPU、进程数和 Windows Job Object。
 - 用户审批、取消、迟到结果隔离和失败回滚。
+
+模型看到的工具注册表必须反映当前有效权限。只读模式不暴露写文件、下载落盘、Git 拉取、Shell、SSH、持久终端或声明为可写的 MCP/插件工具；底层策略仍保留重复校验，不能只依赖隐藏 schema。
 
 文本读取、枚举、搜索、写入、补丁、复制和删除使用结构化文件工具。`run_command` 用于构建、测试、编译器和真实可执行程序，并优先使用 `executable + args[]`，避免 Windows Shell 引号和编码问题。
 
@@ -62,6 +66,8 @@ planner -> implementer -> tester/reviewer -> synthesizer
 
 Planner、Tester 和 Reviewer 默认只读；Implementer 执行修改；Synthesizer 只综合可核验结果。审阅反馈允许有限修订，不得形成无限角色循环。
 
+Tester 与 Reviewer 的状态协议只接受首个非空行中的 `VERDICT: APPROVED` 或 `VERDICT: CHANGES_REQUIRED`。普通正文里的“通过”“需要修改”等词不能驱动宿主状态机。任一团队角色失败时保留已完成文件和角色证据，提交失败计划、团队 checkpoint 和 `turn_terminal`，宿主不得生成伪成功答案。显式恢复任务没有新的用户消息；恢复失败终态通过紧邻的失败团队 checkpoint 关联，在事件重建时恢复为 assistant 失败记录。
+
 动态子代理通过 `delegate_task` 后台并发启动。主 Agent 继续处理文件范围不重叠的工作，只在需要结果或最终综合时 `await_subagents`。父任务结束前必须 join；父任务取消会停止全部子代理，单个子代理取消不影响兄弟任务。实时输出和终态进入结构化事件，侧栏只读展示。
 
 ## 上下文压缩与恢复
@@ -72,7 +78,7 @@ Planner、Tester 和 Reviewer 默认只读；Implementer 执行修改；Synthesi
 2. 保留稳定 system、当前请求、最近完整对话组以及完整 tool call/result 对。
 3. 将较旧历史合并为一条压缩记忆。
 4. 记录压缩前后 tokens、移除消息数和目标预算。
-5. 失败时回滚本轮，不静默丢消息。
+5. 失败时回滚本轮，不静默丢消息；私有 reasoning 不算可保留输出，只有 reasoning 的失败轮必须恢复原输入。
 
 事件日志、checkpoint、rewind 和分支始终保留原始历史。停止后“继续”应恢复计划、产物、团队 checkpoint、中断位置和最近工具终态。
 

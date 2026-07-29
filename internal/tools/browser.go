@@ -31,7 +31,7 @@ type BrowserTool struct {
 func (t BrowserTool) Name() string { return "browser" }
 
 func (t BrowserTool) Description() string {
-	return "控制 MHcode 内置浏览器。仅当用户明确要求打开、读取或操作具体网页时使用；普通网络检索应使用 web_search，并在回答中列出来源链接供用户自行选择是否打开。可读取页面快照、点击、输入、按键和保存截图。不要使用 run_command 启动浏览器。"
+	return "控制 MHcode 内置浏览器。仅在网页导航、读取或交互确实有助于当前任务时使用；打开外部网站仍受用户审批策略控制。普通网络检索优先使用 web_search，并在回答中列出实际使用的来源链接。可读取页面快照、点击、输入、按键和保存截图。不要使用 run_command 启动浏览器。"
 }
 
 func (t BrowserTool) InputSchema() map[string]any {

@@ -24,6 +24,7 @@ import type {
   ReasoningLevel,
   RuntimeSettings,
   SkillDetail,
+  SkillImportResult,
   TeamRole,
   UpdateState,
   UsageMetrics,
@@ -95,7 +96,8 @@ export type SettingsCenterProps = {
   refreshingMCPID: string;
 	plugins: WorkbenchState["plugins"];
 	pluginBusy: string;
-	installPlugin: () => Promise<void> | void;
+  installPlugin: () => Promise<void> | void;
+	importSkillMarkdown: (fileName: string, content: string) => Promise<SkillImportResult>;
 	refreshPlugins: () => Promise<void> | void;
 	revealPlugin: (id: string) => Promise<void> | void;
 	uninstallPlugin: (id: string) => Promise<void> | void;
@@ -314,6 +316,7 @@ export function SettingsCenter(props: SettingsCenterProps) {
               updateRuntimeDraft={props.updateRuntimeDraft}
               resetRuntimeDraft={props.resetRuntimeDraft}
               dark={props.themeMode === "dark"}
+              importSkillMarkdown={props.importSkillMarkdown}
             />
           </Match>
           <Match when={props.activeCategory === "commands"}>
@@ -1861,6 +1864,26 @@ export function TeamSettingsPanel(props: {
             />
           }
         />
+        <SettingsRow
+          icon={<Bot size={16} />}
+          title="并行子代理数"
+          description="同时运行的独立子任务数量，不限制模型的工具调用轮数"
+          control={
+            <SelectControl
+              value={String(props.runtimeDraft.maxConcurrentSubagents)}
+              options={[
+                { value: "1", label: "1 个" },
+                { value: "2", label: "2 个" },
+                { value: "4", label: "4 个" },
+                { value: "6", label: "6 个" },
+                { value: "8", label: "8 个" },
+                { value: "12", label: "12 个" },
+                { value: "16", label: "16 个" },
+              ]}
+              onChange={(value) => props.updateRuntimeDraft({ maxConcurrentSubagents: Number(value) })}
+            />
+          }
+        />
       </SettingsSection>
 
       <SettingsSection title="角色与模型">
@@ -1935,6 +1958,7 @@ export function SkillsSettingsPanel(props: {
   updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
   resetRuntimeDraft: () => void;
   dark: boolean;
+  importSkillMarkdown: (fileName: string, content: string) => Promise<SkillImportResult>;
 }) {
   const builtin = createMemo(() => props.snapshots.find((snapshot) => snapshot.server === "builtin"));
   const [expandedSkill, setExpandedSkill] = createSignal("");
@@ -1943,6 +1967,8 @@ export function SkillsSettingsPanel(props: {
   const [detailError, setDetailError] = createSignal("");
   const [wrapDetail, setWrapDetail] = createSignal(false);
   const [detailMode, setDetailMode] = createSignal<"document" | "source">("document");
+  const [importBusy, setImportBusy] = createSignal(false);
+  let importInputRef: HTMLInputElement | undefined;
 
   const disabledSkills = createMemo(() => new Set(props.runtimeDraft.skills?.disabled ?? []));
   const skillEnabled = (name: string) => !disabledSkills().has(name);
@@ -1996,6 +2022,31 @@ export function SkillsSettingsPanel(props: {
     }
   };
 
+  const importMarkdown = async (file?: File) => {
+    if (!file || importBusy()) return;
+    setImportBusy(true);
+    setDetailError("");
+    try {
+      if (file.size === 0) throw new Error("Markdown 文件为空。");
+      if (file.size > 256 * 1024) throw new Error("Skill 文件不能超过 256 KiB。");
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer()).replace(/^\uFEFF/, "");
+      } catch {
+        throw new Error("Skill 文件必须是有效的 UTF-8 文本。");
+      }
+      const result = await props.importSkillMarkdown(file.name, content);
+      setExpandedSkill(result.name);
+      setDetailMode("document");
+      setDetail(result.skill);
+    } catch (cause) {
+      setDetailError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setImportBusy(false);
+      if (importInputRef) importInputRef.value = "";
+    }
+  };
+
   return (
     <div class="settings-page-body skills-settings-page">
       <PanelSection icon={<Wrench size={16} />} title={`内置 Agent 工具 · ${formatInteger(builtin()?.tools.length ?? 0)}`}>
@@ -2019,6 +2070,27 @@ export function SkillsSettingsPanel(props: {
       </PanelSection>
 
       <PanelSection icon={<Sparkles size={16} />} title="Skills">
+        <div class="skills-import-actions">
+          <input
+            ref={importInputRef}
+            class="composer-image-input"
+            type="file"
+            accept=".md,.markdown,text/markdown,text/x-markdown"
+            onChange={(event) => void importMarkdown(event.currentTarget.files?.[0])}
+          />
+          <button
+            type="button"
+            class="settings-soft-button"
+            title="导入后在每轮对话中自动应用"
+            disabled={importBusy()}
+            onClick={() => importInputRef?.click()}
+          >
+            <Show when={!importBusy()} fallback={<RefreshCw size={14} class="spinning" />}>
+              <FileText size={14} />
+            </Show>
+            {importBusy() ? "正在导入" : "导入长期 Markdown 规则"}
+          </button>
+        </div>
         <div class="skills-list">
           <For each={props.skills} fallback={<p class="empty-line">未发现 Skill</p>}>
             {(skill) => {
@@ -2063,7 +2135,7 @@ export function SkillsSettingsPanel(props: {
                     <div class="skill-resource-details">
                       <div class="skill-detail-grid">
                         <span><b>来源</b>{skillSourceLabel(skill.source)}</span>
-                        <span><b>触发</b>{skill.trigger || "手动"}</span>
+                        <span><b>触发</b>{skillActivationLabel(skill)}</span>
                         <span><b>版本</b>v{skill.version}</span>
                         <span><b>文件</b>{skill.path || "内置资源"}</span>
                       </div>
@@ -2190,10 +2262,19 @@ function skillSourceLabel(source?: string): string {
   switch (source) {
     case "bundled": return "内置";
     case "project": return "当前项目";
+    case "user": return "用户导入";
     case "local": return "本机 Skills";
     case "preview": return "预览模式";
     default: return source || "未知来源";
   }
+}
+
+function skillActivationLabel(skill: { trigger?: string; triggerMode?: string; source?: string }): string {
+  const mode = skill.triggerMode?.trim().toLowerCase();
+  if (mode === "always" || (skill.source === "user" && mode === "description")) return "每轮自动应用";
+  if (mode === "manual") return "显式调用";
+  if (mode === "explicit") return skill.trigger || "按触发词";
+  return "模型按需加载";
 }
 
 function skillDisplayTitle(skill: SkillDetail): string {

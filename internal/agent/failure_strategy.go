@@ -309,7 +309,7 @@ func requiredStrategyChange(class string) string {
 	case "data-invalid":
 		return "先读取并验证真实数据结构，再使用对应结构化工具修改。"
 	case "timeout", "network", "rate-limit", "upstream-unavailable":
-		return "允许有限退避重试；再次失败后必须切换协议、工具或验证方式。"
+		return "允许有限退避重试；再次失败后必须切换协议、工具或验证方式。对于指定网页或仓库，不能用网络搜索摘要替代原始证据。"
 	default:
 		return "分析完整错误与退出码，并改变命令、输入、工具或前置条件后再执行。"
 	}
@@ -453,7 +453,14 @@ func recommendedAlternativeTools(call protocol.ToolCall, failureClass string) []
 		add("file_info", "list_dir", "search")
 	}
 	if failureClass == "network" || failureClass == "upstream-unavailable" {
-		add("web_search", "read_webpage", "read_repository")
+		switch name {
+		case "read_webpage":
+			add("browser")
+		case "read_repository":
+			add("git_repository")
+		case "download_file":
+			add("read_webpage", "browser")
+		}
 	}
 	if len(recommendations) > 6 {
 		recommendations = recommendations[:6]

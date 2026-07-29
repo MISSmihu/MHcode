@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,38 @@ import (
 type contextIgnoringTool struct {
 	name    string
 	release <-chan struct{}
+}
+
+type silentSleepTool struct {
+	duration time.Duration
+}
+
+type lateMutationProbeTool struct {
+	executed chan struct{}
+	calls    *atomic.Int32
+}
+
+func (lateMutationProbeTool) Name() string { return "mcp__probe__write" }
+func (lateMutationProbeTool) Description() string {
+	return "records whether a cancelled mutation started"
+}
+func (lateMutationProbeTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (tool lateMutationProbeTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	tool.calls.Add(1)
+	close(tool.executed)
+	return tools.Result{Summary: "unexpected execution"}, nil
+}
+
+func (silentSleepTool) Name() string        { return "silent_sleep" }
+func (silentSleepTool) Description() string { return "runs quietly for a bounded duration" }
+func (silentSleepTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (tool silentSleepTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	time.Sleep(tool.duration)
+	return tools.Result{Summary: "quiet work completed"}, nil
 }
 
 func (tool contextIgnoringTool) Name() string {
@@ -105,6 +138,37 @@ func TestToolWatchdogReturnsParentCancellation(t *testing.T) {
 	}
 }
 
+func TestCancelledToolDoesNotStartAfterWaitingForWorkspaceMutationLock(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	gate := service.toolMutationGateForWorkspace()
+	gate.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	executed := make(chan struct{})
+	var calls atomic.Int32
+	_, err := service.runToolWithWatchdog(
+		ctx,
+		lateMutationProbeTool{executed: executed, calls: &calls},
+		"mcp__probe__write",
+		json.RawMessage(`{}`),
+		time.Second,
+	)
+	if !errors.Is(err, context.Canceled) {
+		gate.Unlock()
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	gate.Unlock()
+
+	select {
+	case <-executed:
+		t.Fatal("cancelled tool executed after the workspace lock became available")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("cancelled mutation calls = %d, want 0", calls.Load())
+	}
+}
+
 func TestTaskIdleWatchdogEmitsFailedTerminalStatus(t *testing.T) {
 	var events []ChatStreamEvent
 	ctx, _, control := withTaskIdleWatchdog(context.Background(), 35*time.Millisecond, func(event ChatStreamEvent) {
@@ -137,6 +201,32 @@ func TestTaskIdleWatchdogResetsOnActivity(t *testing.T) {
 	default:
 	}
 	control.pause()
+}
+
+func TestActiveSilentToolKeepsTaskIdleWatchdogAlive(t *testing.T) {
+	var events []ChatStreamEvent
+	ctx, _, control := withTaskIdleWatchdog(context.Background(), 90*time.Millisecond, func(event ChatStreamEvent) {
+		events = append(events, event)
+	})
+	defer control.close()
+
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	result, err := service.runToolWithWatchdog(
+		ctx,
+		silentSleepTool{duration: 220 * time.Millisecond},
+		"silent_sleep",
+		json.RawMessage(`{}`),
+		time.Second,
+	)
+	if err != nil || result.IsError {
+		t.Fatalf("quiet tool result=%#v err=%v", result, err)
+	}
+	if errors.Is(context.Cause(ctx), ErrTaskIdleTimeout) {
+		t.Fatalf("active quiet tool was treated as an idle task: cause=%v", context.Cause(ctx))
+	}
+	if len(events) != 0 {
+		t.Fatalf("internal heartbeat must not create visible timeline events: %#v", events)
+	}
 }
 
 func TestResolvedTaskContextErrorKeepsIdleTimeoutAsFailure(t *testing.T) {

@@ -60,6 +60,18 @@ func TestRuntimeSettingsNormalizeProcessResourceLimits(t *testing.T) {
 	}
 }
 
+func TestRuntimeSettingsNormalizesSubagentConcurrencyLimit(t *testing.T) {
+	settings := DefaultRuntimeSettings()
+	settings.MaxConcurrentSubagents = 0
+	if normalized := settings.Normalized(); normalized.MaxConcurrentSubagents != defaultMaxConcurrentSubagents {
+		t.Fatalf("default subagent concurrency = %d", normalized.MaxConcurrentSubagents)
+	}
+	settings.MaxConcurrentSubagents = maxConcurrentSubagents + 1
+	if normalized := settings.Normalized(); normalized.MaxConcurrentSubagents != maxConcurrentSubagents {
+		t.Fatalf("capped subagent concurrency = %d", normalized.MaxConcurrentSubagents)
+	}
+}
+
 func TestRuntimeSettingsMigrationBackfillsProcessResourceLimits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime-settings.json")
 	data := []byte(`{"schemaVersion":2,"sandboxMode":"workspace-write","filesystemAccess":"workspace-write"}`)
@@ -70,7 +82,7 @@ func TestRuntimeSettingsMigrationBackfillsProcessResourceLimits(t *testing.T) {
 	if !loaded {
 		t.Fatal("runtime settings were not loaded")
 	}
-	if settings.SchemaVersion != runtimeSettingsSchemaVersion || settings.ToolTimeoutSeconds != 180 || settings.TaskIdleTimeoutSeconds != 300 || settings.MaxCommandMemoryMB != 4096 || settings.MaxCommandCPUPercent != 100 || settings.MaxCommandProcesses != 128 {
+	if settings.SchemaVersion != runtimeSettingsSchemaVersion || settings.ToolTimeoutSeconds != 180 || settings.TaskIdleTimeoutSeconds != 300 || settings.MaxConcurrentSubagents != defaultMaxConcurrentSubagents || settings.MaxCommandMemoryMB != 4096 || settings.MaxCommandCPUPercent != 100 || settings.MaxCommandProcesses != 128 {
 		t.Fatalf("migrated settings = %#v", settings)
 	}
 	if settings.Team.Enabled || settings.Team.MaxReviewRounds != 1 || len(settings.Team.Roles) != 5 {

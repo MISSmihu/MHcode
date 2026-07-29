@@ -134,9 +134,12 @@ type FailureStrategyRecord struct {
 }
 
 type MessageAttachment struct {
-	Name     string `json:"name"`
-	MIMEType string `json:"mimeType"`
-	Data     string `json:"data"`
+	Kind           string `json:"kind,omitempty"`
+	Name           string `json:"name"`
+	MIMEType       string `json:"mimeType"`
+	Data           string `json:"data"`
+	Size           int    `json:"size,omitempty"`
+	CharacterCount int    `json:"characterCount,omitempty"`
 }
 
 // MessagePart 对齐前端/tools 的结构化片段，供 Timeline 与重建对话使用。

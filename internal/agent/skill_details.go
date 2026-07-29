@@ -14,6 +14,7 @@ type SkillDetail struct {
 	Name        string `json:"name"`
 	Version     int    `json:"version"`
 	Trigger     string `json:"trigger"`
+	TriggerMode string `json:"triggerMode,omitempty"`
 	Summary     string `json:"summary"`
 	SHA256      string `json:"sha256"`
 	Description string `json:"description"`
@@ -35,6 +36,7 @@ func (s *Service) ReadSkillDetail(name string) (SkillDetail, error) {
 		Name:        loaded.Name,
 		Version:     loaded.Version,
 		Trigger:     loaded.Trigger,
+		TriggerMode: loaded.TriggerMode,
 		Summary:     loaded.Summary,
 		SHA256:      loaded.SHA256,
 		Description: loaded.Description,

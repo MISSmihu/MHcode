@@ -19,7 +19,8 @@ export function hasMeaningfulTurnOutput(
 }
 
 function hasMeaningfulOutput(content?: string, reasoning?: string, parts?: MessagePart[]): boolean {
-  return Boolean(content?.trim() || reasoning?.trim() || parts?.some(isMeaningfulPart));
+  void reasoning;
+  return Boolean(content?.trim() || parts?.some(isMeaningfulPart));
 }
 
 function isMeaningfulPart(part: MessagePart): boolean {

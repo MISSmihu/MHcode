@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
+	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
 type teamProviderScript struct {
@@ -20,8 +21,34 @@ type teamProviderScript struct {
 	readOnlyToolLeak    bool
 	reviewerNeedsChange bool
 	implementerErr      error
+	synthesizerErr      error
 	blockRole           string
 	blockStarted        chan struct{}
+}
+
+func TestTeamRoleLabelAlwaysReturnsReadableFallback(t *testing.T) {
+	if got := teamRoleLabel(""); got != "协作任务" {
+		t.Fatalf("empty role label = %q", got)
+	}
+	if got := teamRoleLabel("security-review"); got != "协作任务（security-review）" {
+		t.Fatalf("unknown role label = %q", got)
+	}
+}
+
+func TestTeamVerdictRequiresExplicitFirstLineProtocol(t *testing.T) {
+	for _, test := range []struct {
+		content string
+		want    string
+	}{
+		{content: "VERDICT: APPROVED\n验证通过。", want: "approved"},
+		{content: "**VERDICT: CHANGES_REQUIRED**\n必须修复边界问题。", want: "changes_required"},
+		{content: "测试没有通过，必须修复。", want: "unknown"},
+		{content: "说明文本\nVERDICT: APPROVED", want: "unknown"},
+	} {
+		if got := teamVerdict(TeamRoleReviewer, test.content); got != test.want {
+			t.Fatalf("teamVerdict(%q) = %q, want %q", test.content, got, test.want)
+		}
+	}
 }
 
 type scriptedTeamProvider struct {
@@ -33,6 +60,10 @@ func (p scriptedTeamProvider) Name() string { return "team-test-" + p.role }
 
 func (p scriptedTeamProvider) ListModels(context.Context) ([]protocol.Model, error) {
 	return []protocol.Model{{ID: "model-" + p.role}}, nil
+}
+
+func (p scriptedTeamProvider) Complete(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+	return collectProviderStream(ctx, p, request, nil)
 }
 
 func (p scriptedTeamProvider) Stream(ctx context.Context, request protocol.ChatRequest) (<-chan protocol.StreamEvent, error) {
@@ -52,6 +83,7 @@ func (p scriptedTeamProvider) Stream(ctx context.Context, request protocol.ChatR
 	}
 	needsChange := p.script.reviewerNeedsChange
 	implementerErr := p.script.implementerErr
+	synthesizerErr := p.script.synthesizerErr
 	p.script.mu.Unlock()
 	if p.role == p.script.blockRole {
 		if p.script.blockStarted != nil {
@@ -66,6 +98,9 @@ func (p scriptedTeamProvider) Stream(ctx context.Context, request protocol.ChatR
 	}
 	if p.role == TeamRoleImplementer && implementerErr != nil {
 		return nil, implementerErr
+	}
+	if p.role == TeamRoleSynthesizer && synthesizerErr != nil {
+		return nil, synthesizerErr
 	}
 
 	events := make(chan protocol.StreamEvent, 4)
@@ -168,6 +203,54 @@ func TestTeamModeRunsRolesWithReadOnlyReviewers(t *testing.T) {
 	}
 	if teamEvents < 10 {
 		t.Fatalf("team events = %d", teamEvents)
+	}
+}
+
+func TestTeamModeSkipsImplementerWhenWorkspaceIsReadOnly(t *testing.T) {
+	svc, workspace, script := newTeamTestService(t, false)
+	svc.runtimeSettings.SandboxMode = "read-only"
+	svc.runtimeSettings.FilesystemAccess = "read-only"
+
+	result, err := svc.SendChatMessage(context.Background(), "只读分析当前实现")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if script.calls[TeamRoleImplementer] != 0 {
+		t.Fatalf("read-only team ran implementer: %#v", script.calls)
+	}
+	for _, role := range []string{TeamRolePlanner, TeamRoleTester, TeamRoleReviewer, TeamRoleSynthesizer} {
+		if script.calls[role] == 0 {
+			t.Fatalf("read-only team skipped %s: %#v", role, script.calls)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "generated.txt")); !os.IsNotExist(err) {
+		t.Fatalf("read-only team created a file: %v", err)
+	}
+	implementer := TeamRoleState{}
+	for _, role := range result.State.Team.Roles {
+		if role.Role == TeamRoleImplementer {
+			implementer = role
+			break
+		}
+	}
+	if implementer.Enabled || implementer.Status != "skipped" {
+		t.Fatalf("read-only implementer state = %#v", implementer)
+	}
+	if result.State.Team.Status != "completed" || result.State.Team.Active {
+		t.Fatalf("read-only team state = %#v", result.State.Team)
+	}
+}
+
+func TestReadOnlyTeamResumeSkipsPausedImplementerStage(t *testing.T) {
+	settings := DefaultRuntimeSettings().Team
+	effective := teamSettingsForPolicy(settings, tools.SandboxPolicy{
+		SandboxMode: "read-only", FilesystemAccess: "read-only",
+	})
+	if roleEnabled(effective, TeamRoleImplementer) {
+		t.Fatal("read-only team kept implementer enabled")
+	}
+	if stage := availableTeamStage(effective, TeamRoleImplementer); stage != TeamRoleTester {
+		t.Fatalf("read-only resume stage = %q, want %q", stage, TeamRoleTester)
 	}
 }
 
@@ -361,7 +444,7 @@ func TestTeamModeResumeSkipsCompletedRoles(t *testing.T) {
 	}
 	pauseMessageRestored := false
 	for _, message := range svc.GetSessionMessages() {
-		if message.Role == "assistant" && strings.Contains(message.Content, "发送“继续”") {
+		if message.Role == "assistant" && strings.Contains(message.Content, "使用“继续任务”操作") {
 			pauseMessageRestored = true
 			break
 		}
@@ -370,7 +453,15 @@ func TestTeamModeResumeSkipsCompletedRoles(t *testing.T) {
 		t.Fatal("pause assistant message was not restored")
 	}
 
-	result, err := svc.SendChatMessage(context.Background(), "继续")
+	_, err := svc.SendChatMessage(context.Background(), "继续")
+	if err == nil || !strings.Contains(err.Error(), "继续任务") {
+		t.Fatalf("ordinary message did not require an explicit team lifecycle action: %v", err)
+	}
+	if svc.teamResume == nil || svc.teamState.Status != "paused" {
+		t.Fatalf("ordinary message changed paused team state: checkpoint=%#v state=%#v", svc.teamResume, svc.teamState)
+	}
+
+	result, err := svc.ResumePausedTeamTaskWithEvents(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,6 +492,113 @@ func TestTeamModeResumeSkipsCompletedRoles(t *testing.T) {
 	}
 }
 
+func TestResumedTeamFailureSurvivesSessionRebuild(t *testing.T) {
+	svc, _, script := newTeamTestService(t, false)
+	svc.runtimeSettings.FilesystemAccess = "unrestricted"
+	started := make(chan struct{})
+	script.blockRole = TeamRoleReviewer
+	script.blockStarted = started
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.SendChatMessage(ctx, "创建文件并在审阅时暂停")
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("reviewer did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, errTeamRunPaused) {
+			t.Fatalf("pause error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("team pause did not return promptly")
+	}
+
+	script.mu.Lock()
+	script.blockRole = ""
+	script.blockStarted = nil
+	script.synthesizerErr = errors.New("resume synthesizer unavailable")
+	script.mu.Unlock()
+
+	result, err := svc.ResumePausedTeamTaskWithEvents(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "resume synthesizer unavailable") {
+		t.Fatalf("resumed team error = %v", err)
+	}
+	if !result.TurnCommitted || result.State.Team.Status != "failed" || !strings.Contains(result.Content, "未能生成最终汇总") {
+		t.Fatalf("resumed failure result = %#v", result)
+	}
+
+	svc.teamState = TeamState{Enabled: true, Status: "idle", Roles: []TeamRoleState{}}
+	svc.sessionMessages = nil
+	svc.rebuildSessionFromEvents()
+	if state := svc.WorkbenchState().Team; state.Status != "failed" || state.Active {
+		t.Fatalf("rebuilt resumed team state = %#v", state)
+	}
+	userMessages := 0
+	failureMessages := 0
+	for _, message := range svc.GetSessionMessages() {
+		if message.Role == "user" {
+			userMessages++
+		}
+		if message.Role == "assistant" && message.Status == "failed" && strings.Contains(message.Content, "未能生成最终汇总") {
+			failureMessages++
+		}
+	}
+	if userMessages != 1 {
+		t.Fatalf("resume action fabricated a user message: count=%d", userMessages)
+	}
+	if failureMessages != 1 {
+		t.Fatalf("rebuilt resumed failure messages = %d, want 1", failureMessages)
+	}
+}
+
+func TestAbandonPausedTeamTaskClearsResumptionButKeepsHistory(t *testing.T) {
+	svc, _, _ := newTeamTestService(t, false)
+	svc.runtimeSettings.FilesystemAccess = "unrestricted"
+	svc.teamState = TeamState{
+		Enabled:     true,
+		Active:      false,
+		Status:      "paused",
+		CurrentRole: TeamRoleReviewer,
+		Roles: []TeamRoleState{{
+			Role: TeamRoleReviewer, Label: "审阅", Enabled: true, Status: "paused", Attempt: 1,
+		}},
+	}
+	svc.planState = PlanState{
+		Status: "running",
+		Steps:  []tools.ProgressStep{{Title: "检查实现", Status: "in_progress"}},
+	}
+	checkpoint := newTeamRunCheckpoint(svc.runtimeSettings.Team)
+	checkpoint.Status = "paused"
+	checkpoint.NextRole = TeamRoleReviewer
+	checkpoint.PlanStarted = true
+	if err := svc.persistTeamRunCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	svc.recordUserEvent("先暂停团队任务")
+
+	state, err := svc.AbandonPausedTeamTask()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if svc.teamResume != nil || state.Team.Status != "cancelled" || state.Team.Active {
+		t.Fatalf("abandoned team state = checkpoint=%#v team=%#v", svc.teamResume, state.Team)
+	}
+	if state.PlanState.Status != "cancelled" {
+		t.Fatalf("team plan was not cancelled: %#v", state.PlanState)
+	}
+	if len(svc.GetSessionMessages()) == 0 {
+		t.Fatal("abandoning a paused team task discarded session history")
+	}
+}
+
 func TestTeamPlanMarksPlanAndTeamFailedWhenImplementerFails(t *testing.T) {
 	svc, workspace, script := newTeamTestService(t, false)
 	svc.planMode = true
@@ -409,9 +607,12 @@ func TestTeamPlanMarksPlanAndTeamFailedWhenImplementerFails(t *testing.T) {
 		go func() { _ = svc.RespondApproval(request.ID, request.Tool, true, "once") }()
 	})
 
-	_, err := svc.SendChatMessage(context.Background(), "按团队计划执行但模拟失败")
+	result, err := svc.SendChatMessage(context.Background(), "按团队计划执行但模拟失败")
 	if err == nil || !strings.Contains(err.Error(), "implementer unavailable") {
 		t.Fatalf("team execution error = %v", err)
+	}
+	if !result.TurnCommitted || !strings.Contains(result.Content, "任务执行失败") {
+		t.Fatalf("failed team turn was not retained: %#v", result)
 	}
 	state := svc.WorkbenchState()
 	if state.PlanState.Status != "failed" || state.Team.Status != "failed" {
@@ -419,6 +620,78 @@ func TestTeamPlanMarksPlanAndTeamFailedWhenImplementerFails(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workspace, "generated.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("failed implementer unexpectedly wrote a file: %v", statErr)
+	}
+
+	// Simulate switching away or reopening the conversation. The failed team,
+	// plan, assistant evidence, and terminal status must survive reconstruction.
+	svc.teamState = TeamState{Enabled: true, Status: "idle", Roles: []TeamRoleState{}}
+	svc.planState = PlanState{}
+	svc.sessionMessages = nil
+	svc.rebuildSessionFromEvents()
+	restored := svc.WorkbenchState()
+	if restored.PlanState.Status != "failed" || restored.Team.Status != "failed" || restored.Team.Active {
+		t.Fatalf("rebuilt failed team state: plan=%#v team=%#v", restored.PlanState, restored.Team)
+	}
+	foundFailure := false
+	for _, message := range svc.GetSessionMessages() {
+		if message.Role == "assistant" && message.Status == "failed" && strings.Contains(message.Content, "任务执行失败") {
+			foundFailure = true
+			break
+		}
+	}
+	if !foundFailure {
+		t.Fatal("rebuilt history lost the failed team evidence")
+	}
+}
+
+func TestTeamSynthesisFailurePreservesCompletedWorkWithoutClaimingSuccess(t *testing.T) {
+	svc, workspace, script := newTeamTestService(t, false)
+	script.synthesizerErr = errors.New("synthesizer unavailable")
+
+	result, err := svc.SendChatMessage(context.Background(), "创建并审阅验证文件")
+	if err == nil || !strings.Contains(err.Error(), "synthesizer unavailable") {
+		t.Fatalf("team synthesis error = %v", err)
+	}
+	if !result.TurnCommitted || !strings.Contains(result.Content, "未能生成最终汇总") || strings.Contains(result.Content, "AI 团队已完成本轮任务") {
+		t.Fatalf("preserved synthesis result = %#v", result)
+	}
+	if state := svc.WorkbenchState(); state.Team.Status != "failed" || state.Team.Active {
+		t.Fatalf("team state after synthesis failure = %#v", state.Team)
+	}
+	data, readErr := os.ReadFile(filepath.Join(workspace, "generated.txt"))
+	if readErr != nil || strings.ReplaceAll(string(data), "\r\n", "\n") != "first\n" {
+		t.Fatalf("completed implementation was not preserved: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestTeamFinalizeWithoutSynthesizerCannotUseHostGeneratedSuccess(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	defer svc.Close()
+	settings := TeamSettings{Enabled: true, Roles: []TeamRoleSetting{
+		{Role: TeamRolePlanner, Enabled: false},
+		{Role: TeamRoleImplementer, Enabled: false},
+		{Role: TeamRoleTester, Enabled: false},
+		{Role: TeamRoleReviewer, Enabled: false},
+		{Role: TeamRoleSynthesizer, Enabled: false},
+	}}
+	svc.runtimeSettings.Team = settings
+	messages := []protocol.Message{{Role: "system", Content: "system"}, {Role: "user", Content: "team task"}}
+	svc.sessionMessages = cloneProtocolMessages(messages)
+
+	result, err := svc.runTeamTurn(
+		context.Background(),
+		protocol.ChatRequest{Model: "team-model", Messages: cloneProtocolMessages(messages)},
+		chatRoute{Provider: ModelProviderSetting{ID: "team-provider", Name: "Team"}, ModelID: "team-model"},
+		requestPrefixDiagnostic{},
+		cloneProtocolMessages(messages),
+		1,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "缺少可用的模型最终汇总") {
+		t.Fatalf("team finalize error = %v, result=%#v", err, result)
+	}
+	if result.State.Team.Status == "completed" || strings.Contains(result.Content, "设置中未启用 AI 团队汇总角色") {
+		t.Fatalf("host-generated team answer was treated as success: %#v", result)
 	}
 }
 

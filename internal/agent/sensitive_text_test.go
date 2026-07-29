@@ -77,7 +77,7 @@ func TestPrepareScopedUserPromptAcceptsBareIPv4AndRestoresCredentialContext(t *t
 	defer service.Close()
 
 	const password = "temporary-password-for-p"
-	prepared, err := service.prepareScopedUserPrompt("P:154.219.110.33用户名：root\n密码：" + password + "\n帮我部署网站")
+	prepared, err := service.prepareScopedUserPrompt("P:203.0.113.10用户名：root\n密码：" + password + "\n帮我部署网站")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,12 +93,12 @@ func TestPrepareScopedUserPromptAcceptsBareIPv4AndRestoresCredentialContext(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if credential.Host != "154.219.110.33" || credential.Port != 22 || credential.Username != "root" || credential.Password != password {
+	if credential.Host != "203.0.113.10" || credential.Port != 22 || credential.Username != "root" || credential.Password != password {
 		t.Fatalf("stored credential = %#v", credential)
 	}
 
 	currentContext := service.scopedSSHContext(prepared)
-	if !strings.Contains(currentContext, reference) || !strings.Contains(currentContext, "root@154.219.110.33:22") {
+	if !strings.Contains(currentContext, reference) || !strings.Contains(currentContext, "root@203.0.113.10:22") {
 		t.Fatalf("current credential context = %q", currentContext)
 	}
 	if strings.Contains(currentContext, password) {

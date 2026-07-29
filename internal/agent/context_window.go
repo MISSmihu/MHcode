@@ -244,9 +244,18 @@ internalMessagesRead:
 			continue
 		}
 		if message.Role == "assistant" {
-			if checkpoint := extractExecutionCheckpoint(message.Content); checkpoint != "" {
-				existingExecution = checkpoint
+			checkpoint := extractExecutionCheckpoint(message.Content)
+			if checkpoint != "" {
 				message.Content = stripExecutionCheckpoint(message.Content)
+			}
+			if isResumableTerminalAssistant(message) {
+				// A newer interrupted turn replaces any older recovery state. An
+				// empty checkpoint deliberately clears stale compressed state.
+				existingExecution = checkpoint
+			} else if len(message.ToolCalls) == 0 {
+				// A later completed assistant turn closes the previous task. Do
+				// not re-inject an older cancelled/failed checkpoint after it.
+				existingExecution = ""
 			}
 		}
 		filteredBody = append(filteredBody, message)

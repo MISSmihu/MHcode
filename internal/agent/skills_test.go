@@ -52,6 +52,38 @@ func TestTriggeredSkillLoadsFullInstructions(t *testing.T) {
 	}
 }
 
+func TestTriggeredSkillsUseTokenBudgetInsteadOfFixedCount(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"skill-a", "skill-b", "skill-c"} {
+		writeSkillWithTrigger(t, root, name, name, "multi-skill helper", "multi-skill")
+	}
+	service := NewService(ServiceConfig{SkillsDir: root})
+	defer service.Close()
+
+	loaded := service.loadTriggeredSkills("use multi-skill for this task", service.loadSkillsIndex())
+	names, _, tokens := triggeredSkillMetrics(loaded)
+	if len(loaded) != 3 || len(names) != 3 {
+		t.Fatalf("triggered skills = %#v, names = %#v", loaded, names)
+	}
+	if tokens <= 0 || tokens > triggeredSkillTokenBudget(service.reasoning) {
+		t.Fatalf("triggered skill tokens = %d, budget = %d", tokens, triggeredSkillTokenBudget(service.reasoning))
+	}
+}
+
+func TestExplicitlyNamedSkillWinsContextBudgetPriority(t *testing.T) {
+	root := t.TempDir()
+	writeSkillWithTrigger(t, root, "broad", "a-broad-skill", "broad helper", "shared-trigger")
+	writeSkillWithTrigger(t, root, "critical", "z-critical-skill", "critical helper", "manual")
+	service := NewService(ServiceConfig{SkillsDir: root})
+	defer service.Close()
+	service.reasoning = ReasoningLow
+
+	loaded := service.loadTriggeredSkills("shared-trigger and $z-critical-skill", service.loadSkillsIndex())
+	if len(loaded) < 2 || !strings.HasPrefix(loaded[0], "skill: z-critical-skill\n") {
+		t.Fatalf("explicit skill was not prioritized: %#v", loaded)
+	}
+}
+
 func TestCoreSkillDoesNotTriggerOnGenericTechnicalTerms(t *testing.T) {
 	entry := skills.IndexEntry{
 		Name:        "mhcode-agent-core",

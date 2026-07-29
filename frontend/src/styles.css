@@ -836,22 +836,9 @@ body[data-theme="light"],
   overscroll-behavior: contain;
 }
 
-.subagent-reasoning,
 .subagent-output-section,
 .subagent-activity-section { min-width: 0; border-bottom: 1px solid var(--border-color); }
 
-.subagent-reasoning { padding: 0 0 10px; }
-.subagent-reasoning summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--text-muted);
-  font-size: 11px;
-  cursor: pointer;
-  list-style: none;
-}
-.subagent-reasoning[open] summary svg { transform: rotate(90deg); }
-.subagent-reasoning pre,
 .subagent-output-text,
 .subagent-activity pre {
   max-width: 100%;
@@ -864,7 +851,6 @@ body[data-theme="light"],
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.subagent-reasoning pre { max-height: 220px; }
 
 .subagent-output-section { padding: 9px 0 12px; }
 .subagent-output-section > header,
@@ -4080,6 +4066,77 @@ body[data-theme="light"],
 	margin: 0;
 }
 
+.execution-status-dock > .team-pause-control {
+  display: flex;
+  flex: 0 1 460px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: min(100%, 300px);
+  gap: 14px;
+  padding: 10px 12px;
+  color: var(--text-main);
+  background: var(--bg-input);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 22px rgb(0 0 0 / 12%);
+}
+
+.team-pause-control > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.team-pause-control strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.team-pause-control small {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.team-pause-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 7px;
+}
+
+.team-pause-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0 9px;
+  color: var(--text-main);
+  background: var(--bg-main);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.team-pause-actions button:hover:not(:disabled),
+.team-pause-actions button:focus-visible:not(:disabled) {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.team-pause-actions button.danger:hover:not(:disabled),
+.team-pause-actions button.danger:focus-visible:not(:disabled) {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.team-pause-actions button:disabled {
+  cursor: wait;
+  opacity: 0.56;
+}
+
 .composer-box {
   display: grid;
   grid-auto-rows: auto;
@@ -4114,11 +4171,39 @@ body[data-theme="light"],
   border-radius: 7px;
 }
 
+.composer-attachments figure.document {
+  grid-template-rows: 64px auto;
+  flex-basis: 190px;
+}
+
 .composer-attachments img {
   width: 100%;
   height: 64px;
   object-fit: cover;
   background: #ffffff;
+}
+
+.composer-document-preview {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-card) 82%, var(--bg-hover));
+}
+
+.composer-document-preview svg {
+  flex: 0 0 auto;
+  color: var(--text-primary);
+}
+
+.composer-document-preview span {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .composer-attachments figcaption {
@@ -4149,6 +4234,11 @@ body[data-theme="light"],
 .composer-attachments.compact figure {
   grid-template-rows: 52px;
   flex-basis: 68px;
+}
+
+.composer-attachments.compact figure.document {
+  grid-template-rows: 52px auto;
+  flex-basis: 160px;
 }
 
 .composer-attachments.compact img {
@@ -5907,6 +5997,12 @@ code,
 .skills-list {
   display: grid;
   gap: 7px;
+}
+
+.skills-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
 .skill-resource-row {
@@ -8887,6 +8983,31 @@ body[data-theme="light"] .skill-document .code-block .hljs,
 }
 
 @media (max-width: 620px) {
+  .execution-status-dock {
+    align-items: stretch;
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .execution-status-dock > .op-task-progress,
+  .execution-status-dock > .op-team-run,
+  .execution-status-dock > .op-subagent-dock,
+  .execution-status-dock > .team-pause-control {
+    flex-basis: 100%;
+    width: 100%;
+  }
+
+  .execution-status-dock > .team-pause-control {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .team-pause-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
   .drawer-head {
     grid-template-columns: minmax(112px, 1fr) auto 32px;
     gap: 5px;

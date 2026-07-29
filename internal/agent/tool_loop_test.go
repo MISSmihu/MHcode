@@ -50,6 +50,8 @@ type imageAttachmentTool struct{}
 
 type deterministicFailureTool struct{ calls *int }
 
+type structuredResultErrorTool struct{}
+
 type namedSuccessTool struct {
 	name  string
 	calls *int
@@ -73,6 +75,23 @@ func (t deterministicFailureTool) Execute(context.Context, json.RawMessage) (too
 			Stderr: "SyntaxError: unterminated string literal", Output: "SyntaxError: unterminated string literal", ExitCode: &exitCode,
 		}},
 	}, nil
+}
+
+func (structuredResultErrorTool) Name() string { return "structured_result_error" }
+func (structuredResultErrorTool) Description() string {
+	return "returns usable evidence together with an execution error"
+}
+func (structuredResultErrorTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object"}
+}
+func (structuredResultErrorTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	return tools.Result{
+		Summary: "partial inspection result",
+		Parts: []tools.ResultPart{
+			{Kind: tools.PartText, Text: "configuration file was parsed"},
+			{Kind: tools.PartToolCall, Name: "structured_result_error", Status: "ok", Stdout: "parsed 3 entries"},
+		},
+	}, errors.New("post-parse validation failed")
 }
 
 func (t namedSuccessTool) Name() string        { return t.name }
@@ -405,7 +424,7 @@ func TestWebSearchToolLoopFeedsSourcesIntoFinalCompletion(t *testing.T) {
 				t.Errorf("tool feedback missing %q: %s", expected, last.Content)
 			}
 		}
-		return protocol.CompletionResult{Content: "宁波预警信息已整理：[来源](https://weather.example/warning)"}, nil
+		return protocol.CompletionResult{Content: "宁波预警信息已整理：Ningbo warning。"}, nil
 	}
 
 	outcome, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
@@ -415,14 +434,14 @@ func TestWebSearchToolLoopFeedsSourcesIntoFinalCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completionCalls != 2 || !strings.Contains(outcome.Content, "来源") {
+	if completionCalls != 2 {
 		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
 	}
-	if !strings.Contains(outcome.Content, "https://weather.example/warning") {
-		t.Fatalf("final answer missing the source used by the model: %s", outcome.Content)
+	if outcome.Content != "宁波预警信息已整理：Ningbo warning。" {
+		t.Fatalf("host rewrote the model final answer: %q", outcome.Content)
 	}
-	if strings.Contains(outcome.Content, "https://weather.example/forecast") {
-		t.Fatalf("final answer must not append an unused search result: %s", outcome.Content)
+	if strings.Contains(outcome.Content, "https://weather.example/warning") || strings.Contains(outcome.Content, "https://weather.example/forecast") {
+		t.Fatalf("host appended search sources to the model final answer: %s", outcome.Content)
 	}
 	foundSources := false
 	for _, part := range outcome.Parts {
@@ -435,7 +454,7 @@ func TestWebSearchToolLoopFeedsSourcesIntoFinalCompletion(t *testing.T) {
 	}
 }
 
-func TestToolLoopReusesSimilarWebSearchAndMergesSources(t *testing.T) {
+func TestToolLoopReusesIdenticalWebSearchAndMergesSources(t *testing.T) {
 	searchRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		searchRequests++
@@ -463,7 +482,7 @@ func TestToolLoopReusesSimilarWebSearchAndMergesSources(t *testing.T) {
 		case 2:
 			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
 				ID: "search-2", Type: "function", Function: protocol.ToolCallFunction{
-					Name: "web_search", Arguments: json.RawMessage(`{"query":"宁波市气象台 台风预警 2026年7月16日"}`),
+					Name: "web_search", Arguments: json.RawMessage(`{"query":"  宁波  今天 台风预警 2026年 宁波气象台  ","max_results":6}`),
 				},
 			}}}, nil
 		default:
@@ -553,7 +572,11 @@ func TestToolLoopDoesNotRestartUnavailableBrowser(t *testing.T) {
 		if !strings.Contains(request.Messages[len(request.Messages)-1].Content, "已跳过重复启动") {
 			t.Fatalf("browser short-circuit feedback = %q", request.Messages[len(request.Messages)-1].Content)
 		}
-		return protocol.CompletionResult{Content: "浏览器不可用，已保留现有来源。"}, nil
+		feedback := request.Messages[len(request.Messages)-1].Content
+		if !strings.Contains(feedback, "明确说明页面尚无法核验") || strings.Contains(feedback, "已有搜索来源完成回答") {
+			t.Fatalf("browser short-circuit feedback = %q", feedback)
+		}
+		return protocol.CompletionResult{Content: "浏览器不可用，页面暂时无法核验。"}, nil
 	}
 	_, err := svc.runToolLoopWithCompletion(context.Background(), registry, protocol.ChatRequest{
 		Model: "test-model", Messages: []protocol.Message{{Role: "user", Content: "打开网页"}},
@@ -566,7 +589,7 @@ func TestToolLoopDoesNotRestartUnavailableBrowser(t *testing.T) {
 	}
 }
 
-func TestToolLoopSuppressesUnrequestedExternalBrowserAfterSearch(t *testing.T) {
+func TestToolLoopAllowsModelSelectedBrowserAfterSearch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
 		_, _ = w.Write([]byte(`<?xml version="1.0"?><rss><channel>
@@ -601,10 +624,8 @@ func TestToolLoopSuppressesUnrequestedExternalBrowserAfterSearch(t *testing.T) {
 			}}}, nil
 		default:
 			feedback := request.Messages[len(request.Messages)-1].Content
-			for _, expected := range []string{"网页未打开", "直接基于来源整理完整回答", "完整 URL"} {
-				if !strings.Contains(feedback, expected) {
-					t.Fatalf("suppression feedback missing %q: %s", expected, feedback)
-				}
+			if !strings.Contains(feedback, "浏览器") {
+				t.Fatalf("browser execution feedback missing: %s", feedback)
 			}
 			return protocol.CompletionResult{Content: "宁波预警信息已整理。\n\n来源：\n- Ningbo warning\n  https://weather.example/warning"}, nil
 		}
@@ -616,53 +637,64 @@ func TestToolLoopSuppressesUnrequestedExternalBrowserAfterSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if browserCalls != 0 {
-		t.Fatalf("browser executed %d times, want 0", browserCalls)
+	if browserCalls != 1 {
+		t.Fatalf("browser executed %d times, want 1", browserCalls)
 	}
+	browserEvent := false
 	for _, event := range events {
 		if event.Type == "tool" && event.ToolName == "browser" {
-			t.Fatalf("suppressed browser call leaked into activity events: %+v", events)
+			browserEvent = true
 		}
+	}
+	if !browserEvent {
+		t.Fatalf("model-selected browser call was missing from activity events: %+v", events)
 	}
 	for _, expected := range []string{"Ningbo warning", "https://weather.example/warning"} {
 		if !strings.Contains(outcome.Content, expected) {
 			t.Fatalf("final answer missing visible source detail %q: %s", expected, outcome.Content)
 		}
 	}
+	browserPart := false
 	for _, part := range outcome.Parts {
 		if part.Kind == tools.PartToolCall && part.Name == "browser" {
-			t.Fatalf("suppressed browser call leaked into result parts: %+v", outcome.Parts)
+			browserPart = true
 		}
 	}
-}
-
-func TestBrowserUseExplicitlyRequested(t *testing.T) {
-	if browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "搜索宁波天气并附来源"}}) {
-		t.Fatal("ordinary search should not opt into browser navigation")
-	}
-	if !browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "请打开 https://example.com 查看网页"}}) {
-		t.Fatal("explicit URL opening should opt into browser navigation")
-	}
-	if browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "不要打开网页，只列出链接"}}) {
-		t.Fatal("negated browser request should remain disabled")
-	}
-	if !browserUseExplicitlyRequested([]protocol.Message{{Role: "user", Content: "去官网下载适合 Windows x64 的最新版安装包到 D 盘"}}) {
-		t.Fatal("official website download should authorize browser discovery for a dynamic asset")
+	if !browserPart {
+		t.Fatalf("model-selected browser call was missing from result parts: %+v", outcome.Parts)
 	}
 }
 
-func TestSearchQueriesSimilarKeepsSiteRefinementsDistinct(t *testing.T) {
-	if !searchQueriesSimilar(
-		"宁波 今天 台风预警 2026年 宁波气象台",
-		"宁波市气象台 台风预警 2026年7月16日",
-	) {
-		t.Fatal("general refinements should be considered similar")
+func TestToolLoopGuardLeavesBrowserSelectionToModel(t *testing.T) {
+	guard := toolLoopGuard{}
+	call := protocol.ToolCall{
+		ID: "browser-open",
+		Function: protocol.ToolCallFunction{
+			Name:      "browser",
+			Arguments: json.RawMessage(`{"action":"open","url":"https://example.com"}`),
+		},
 	}
-	if searchQueriesSimilar("宁波台风预警", "site:nmc.cn 宁波台风预警") {
-		t.Fatal("site-specific refinement should remain distinct")
+	if _, _, guarded, _ := guard.before(call); guarded {
+		t.Fatal("the host must not keyword-route a browser call selected by the model")
 	}
-	if searchQueriesSimilar("site:nmc.cn 宁波台风预警", "site:qx121.com 宁波台风预警") {
-		t.Fatal("different site filters should remain distinct")
+}
+
+func TestWebSearchRequestSignatureUsesAllEffectiveArguments(t *testing.T) {
+	base := webSearchRequestSignature(json.RawMessage(`{"query":"  宁波 台风预警  "}`))
+	if base == "" {
+		t.Fatal("default search signature is empty")
+	}
+	if same := webSearchRequestSignature(json.RawMessage(`{"max_results":6,"query":"宁波   台风预警"}`)); same != base {
+		t.Fatalf("equivalent search requests must share a signature: %q vs %q", base, same)
+	}
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"query":"宁波 台风预警","max_results":7}`),
+		json.RawMessage(`{"query":"site:nmc.cn 宁波 台风预警","max_results":6}`),
+		json.RawMessage(`{"query":"Claude 今天版本","max_results":6}`),
+	} {
+		if signature := webSearchRequestSignature(raw); signature == base {
+			t.Fatalf("distinct model-selected search was suppressed: %s", raw)
+		}
 	}
 }
 
@@ -745,9 +777,6 @@ func TestWebSearchEvidenceCannotCompleteFailedTurn(t *testing.T) {
 	if !hasWebSearchSources(outcome.Parts) {
 		t.Fatal("structured search sources should remain available as activity evidence")
 	}
-	if hasUsablePartialToolResult(outcome.Parts) {
-		t.Fatal("search snippets are discovery evidence, not a usable completed result")
-	}
 	content := partialToolFailureContent(outcome)
 	for _, expected := range []string{"工具结果已经保留", "尚未形成可用结论"} {
 		if !strings.Contains(content, expected) {
@@ -781,7 +810,9 @@ func TestToolLoopContinuesInvestigationAfterEmptySearchCompletion(t *testing.T) 
 			return protocol.CompletionResult{}, nil
 		case 3:
 			last := request.Messages[len(request.Messages)-1]
-			if last.InternalKind != toolResultRecoveryKind || !strings.Contains(last.Content, "Continue investigating") {
+			if last.InternalKind != toolResultRecoveryKind ||
+				!strings.Contains(last.Content, "Continue the task autonomously in this same turn") ||
+				!strings.Contains(last.Content, "call a substantive tool now") {
 				t.Fatalf("first empty completion did not request further investigation: %+v", last)
 			}
 			if len(request.Tools) == 0 || request.ToolChoice == "none" {
@@ -806,14 +837,14 @@ func TestToolLoopContinuesInvestigationAfterEmptySearchCompletion(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completionCalls != 4 || !strings.Contains(outcome.Content, "已读取官方资料") || !hasSuccessfulWebpageRead(outcome.Parts) {
+	if completionCalls != 4 || !strings.Contains(outcome.Content, "已读取官方资料") || !hasSuccessfulToolEvidence(outcome.Parts, "read_webpage") {
 		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
 	}
 }
 
-func TestToolLoopUsesToolFreeFinalSynthesisAfterRepeatedEmptyCompletion(t *testing.T) {
+func TestToolLoopKeepsToolsAvailableAfterRepeatedEmptyCompletion(t *testing.T) {
 	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
-	registry := tools.NewRegistry(staticSearchEvidenceTool{})
+	registry := tools.NewRegistry(staticSearchEvidenceTool{}, staticWebpageTool{})
 	completionCalls := 0
 	complete := func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
 		completionCalls++
@@ -829,12 +860,18 @@ func TestToolLoopUsesToolFreeFinalSynthesisAfterRepeatedEmptyCompletion(t *testi
 				t.Fatalf("investigation tools were disabled on the first recovery request: %+v", request)
 			}
 			return protocol.CompletionResult{}, nil
-		default:
+		case 4:
 			last := request.Messages[len(request.Messages)-1]
-			if request.ToolChoice != "none" || len(request.Tools) != 0 || last.InternalKind != toolResultRecoveryKind || !strings.Contains(last.Content, "Produce the final user-facing answer") {
-				t.Fatalf("final synthesis request is not tool-free: request=%+v last=%+v", request, last)
+			if request.ToolChoice != "required" || len(request.Tools) == 0 || last.InternalKind != toolResultRecoveryKind || !strings.Contains(last.Content, "call a substantive tool now") {
+				t.Fatalf("repeated empty completion did not require a real tool action: request=%+v last=%+v", request, last)
 			}
-			return protocol.CompletionResult{Content: "目前只有搜索候选，尚未读取本机配置，需要授权后继续。"}, nil
+			return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+				ID: "page-1", Type: "function", Function: protocol.ToolCallFunction{
+					Name: "read_webpage", Arguments: json.RawMessage(`{"url":"https://github.com/example/ccswitch"}`),
+				},
+			}}}, nil
+		default:
+			return protocol.CompletionResult{Content: "已读取实际页面并完成核验。"}, nil
 		}
 	}
 
@@ -844,7 +881,7 @@ func TestToolLoopUsesToolFreeFinalSynthesisAfterRepeatedEmptyCompletion(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completionCalls != 4 || !strings.Contains(outcome.Content, "需要授权") {
+	if completionCalls != 5 || !strings.Contains(outcome.Content, "完成核验") || !hasSuccessfulToolEvidence(outcome.Parts, "read_webpage") {
 		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
 	}
 }
@@ -869,29 +906,11 @@ func TestToolLoopFailsWhenFinalToolResultSynthesisIsEmpty(t *testing.T) {
 	if !errors.Is(err, errEmptyToolResultSynthesis) {
 		t.Fatalf("error=%v, want %v", err, errEmptyToolResultSynthesis)
 	}
-	if completionCalls != 4 || !hasWebSearchSources(outcome.Parts) {
+	if completionCalls != 1+maxEmptyCompletionRecoveries || !hasWebSearchSources(outcome.Parts) {
 		t.Fatalf("calls=%d outcome=%+v", completionCalls, outcome)
 	}
 	if strings.Contains(outcome.Content, "CCSwitch official repository") || strings.Contains(outcome.Content, "https://github.com/example/ccswitch") {
 		t.Fatalf("raw search evidence became a successful answer: %q", outcome.Content)
-	}
-}
-
-func TestEnsureWebSearchSourcesListedOnlyAddsSourcesUsedByTheAnswer(t *testing.T) {
-	parts := []tools.ResultPart{{
-		Kind: tools.PartWebSearch,
-		Sources: []tools.SearchSource{
-			{Title: "Relevant Pitch Tool", URL: "https://example.com/pitch"},
-			{Title: "Unrelated AI Directory", URL: "https://example.com/directory"},
-		},
-	}}
-	content := "建议使用 Relevant Pitch Tool，它支持直接调整歌曲音高。"
-	result := ensureWebSearchSourcesListed(content, parts)
-	if !strings.Contains(result, "https://example.com/pitch") {
-		t.Fatalf("used source URL missing: %q", result)
-	}
-	if strings.Contains(result, "https://example.com/directory") {
-		t.Fatalf("unrelated source must not be appended: %q", result)
 	}
 }
 
@@ -912,7 +931,7 @@ func TestWebSearchFallbackIncludesEverySource(t *testing.T) {
 	}
 }
 
-func TestRepositoryReadFailureFallsBackToReadableRepositoryContent(t *testing.T) {
+func TestRepositoryReadFailureKeepsEvidenceWithoutHostSynthesizingAnswer(t *testing.T) {
 	part := tools.ResultPart{
 		Kind:   tools.PartToolCall,
 		Name:   "read_repository",
@@ -936,36 +955,17 @@ func TestRepositoryReadFailureFallsBackToReadableRepositoryContent(t *testing.T)
 		}, "\n"),
 	}
 	outcome := toolLoopOutcome{Parts: []tools.ResultPart{part}}
-	if !hasUsablePartialToolResult(outcome.Parts) || !hasSuccessfulRepositoryRead(outcome.Parts) {
+	if !hasSuccessfulToolEvidence(outcome.Parts, "read_repository") {
 		t.Fatal("a successful repository read should remain usable when final synthesis fails")
 	}
 	content := partialToolFailureContent(outcome)
-	for _, expected := range []string{
-		"GitHub 仓库读取已完成",
-		"https://github.com/MISSmihu/MHcode",
-		"Commit: abc123",
-		"README（截取）",
-		"A coding agent workbench.",
-		"目录树（截取）",
-		"frontend/",
-	} {
-		if !strings.Contains(content, expected) {
-			t.Fatalf("repository fallback missing %q: %s", expected, content)
-		}
+	if !strings.Contains(content, "工具结果已经保留") {
+		t.Fatalf("repository failure did not explain retained evidence: %s", content)
 	}
-}
-
-func TestRepositoryReadFallbackTruncatesLargeSectionsIndependently(t *testing.T) {
-	content := repositoryReadFallbackContent(tools.ResultPart{
-		Kind:   tools.PartToolCall,
-		Name:   "read_repository",
-		Status: "ok",
-		Input:  "https://github.com/example/large",
-		Output: "Repository: example/large\nRef: main\nCommit: deadbeef\n\nREADME:\n" +
-			strings.Repeat("R", 4_000) + "\nRepository tree:\ncmd/\ninternal/\nREADME.md",
-	})
-	if !strings.Contains(content, "内容已截取") || !strings.Contains(content, "internal/") {
-		t.Fatalf("large README should not hide the repository tree: %s", content)
+	for _, forbidden := range []string{"GitHub 仓库读取已完成", "Commit: abc123", "A coding agent workbench.", "frontend/"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("host synthesized repository evidence %q into business content: %s", forbidden, content)
+		}
 	}
 }
 
@@ -998,9 +998,18 @@ func TestRepositoryReadToolLoopKeepsResultAfterFinalSynthesisEOF(t *testing.T) {
 		t.Fatalf("completion calls = %d, want %d", completionCalls, 2+postToolCompletionRetries)
 	}
 	content := partialToolFailureContent(outcome)
-	if !hasUsablePartialToolResult(outcome.Parts) || !strings.Contains(content, "Commit: abc123") || !strings.Contains(content, "frontend/") {
+	if !hasSuccessfulToolEvidence(outcome.Parts, "read_repository") || !strings.Contains(content, "工具结果已经保留") || strings.Contains(content, "Commit: abc123") || strings.Contains(content, "frontend/") {
 		t.Fatalf("repository partial result was lost: outcome=%+v content=%s", outcome, content)
 	}
+}
+
+func hasSuccessfulToolEvidence(parts []tools.ResultPart, name string) bool {
+	for _, part := range parts {
+		if part.Kind == tools.PartToolCall && part.Name == name && part.Status != "error" && strings.TrimSpace(part.Output) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func TestToolLoopEmitsAndPersistsTaskProgressWithDiffStats(t *testing.T) {
@@ -1429,37 +1438,42 @@ func TestToolLoopStopsProviderThatIgnoresDisabledTools(t *testing.T) {
 			Function: protocol.ToolCallFunction{Name: "cycle_probe", Arguments: json.RawMessage(`{"target":"same"}`)},
 		}}}, nil
 	}, nil)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, errProviderIgnoredDisabledTools) {
+		t.Fatalf("tool-disable violation error = %v", err)
 	}
 	if toolCalls != 3 || completionCalls != 4 {
 		t.Fatalf("provider loop was not stopped: toolCalls=%d completionCalls=%d", toolCalls, completionCalls)
 	}
-	if !strings.Contains(outcome.Content, "工具已禁用后仍请求调用工具") || !strings.Contains(outcome.Content, "provider ignored") {
-		t.Fatalf("unexpected safe-stop content: %q", outcome.Content)
+	if outcome.Content != "provider ignored the request" {
+		t.Fatalf("host rewrote provider content: %q", outcome.Content)
+	}
+	for _, part := range outcome.Parts {
+		if part.Kind == tools.PartProgress && part.TaskStatus == "completed" {
+			t.Fatalf("tool-disable violation was marked completed: %#v", outcome.Parts)
+		}
 	}
 }
 
-func TestToolLoopGuardStopsRepeatedSSHLookup(t *testing.T) {
+func TestToolLoopGuardDeduplicatesRepeatedSSHConnectivityTest(t *testing.T) {
 	call := protocol.ToolCall{
-		ID: "ssh-lookup",
+		ID: "ssh-test",
 		Function: protocol.ToolCallFunction{
 			Name:      "ssh",
-			Arguments: json.RawMessage("{\"action\":\"run\",\"credential_id\":\"mhcode-credential://ssh-test\",\"command\":\"cat /tmp/account\"}"),
+			Arguments: json.RawMessage("{\"action\":\"test\",\"credential_id\":\"mhcode-credential://ssh-test\"}"),
 		},
 	}
-	guard := toolLoopGuard{remoteLookup: true, completedSSHCalls: map[string]bool{}}
+	guard := toolLoopGuard{completedSSHCalls: map[string]bool{}}
 	if _, _, guarded, _ := guard.before(call); guarded {
-		t.Fatal("first SSH lookup was unexpectedly guarded")
+		t.Fatal("first SSH connectivity test was unexpectedly guarded")
 	}
 	guard.after(call, tools.Result{Summary: "ok"}, &protocol.Message{})
-	result, _, guarded, hidden := guard.before(call)
-	if !guarded || !hidden || !guard.forceFinalResponse {
-		t.Fatalf("repeat guard = guarded:%v hidden:%v forceFinal:%v result:%#v", guarded, hidden, guard.forceFinalResponse, result)
+	_, _, guarded, hidden := guard.before(call)
+	if !guarded || !hidden || guard.forceFinalResponse {
+		t.Fatalf("repeat guard = guarded:%v hidden:%v forceFinal:%v", guarded, hidden, guard.forceFinalResponse)
 	}
 }
 
-func TestToolLoopGuardStopsAfterSecretCapture(t *testing.T) {
+func TestToolLoopGuardKeepsModelInControlAfterSecretCapture(t *testing.T) {
 	guard := toolLoopGuard{}
 	call := protocol.ToolCall{
 		ID: "ssh-secret",
@@ -1472,8 +1486,8 @@ func TestToolLoopGuardStopsAfterSecretCapture(t *testing.T) {
 		Kind:     tools.PartSecretResult,
 		SecretID: "secret-result",
 	}}}, &protocol.Message{})
-	if !guard.objectiveSatisfied || !guard.forceFinalResponse {
-		t.Fatalf("secret capture did not close discovery: %#v", guard)
+	if guard.forceFinalResponse {
+		t.Fatalf("capturing a secret must not make the host declare the whole task complete: %#v", guard)
 	}
 }
 
@@ -1609,6 +1623,137 @@ func TestToolLoopGuardDoesNotMergeDifferentFailedOperations(t *testing.T) {
 	}
 }
 
+func TestToolLoopDowngradesUnsupportedParallelCallsWithoutDisablingTools(t *testing.T) {
+	svc, _ := newNativeToolLoopService(t)
+	registry := svc.buildToolRegistry()
+	requests := make([]protocol.ChatRequest, 0, 3)
+	outcome, err := svc.runToolLoopWithCompletion(
+		context.Background(),
+		registry,
+		protocol.ChatRequest{
+			Messages:          []protocol.Message{{Role: "user", Content: "read fixture.txt"}},
+			ParallelToolCalls: true,
+		},
+		func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+			requests = append(requests, request)
+			switch len(requests) {
+			case 1:
+				return protocol.CompletionResult{}, protocol.NewProviderError(protocol.ProviderErrorInfo{
+					HTTPStatus: 400,
+					Code:       "unknown_parameter",
+					Message:    "Unknown parameter: parallel_tool_calls",
+				})
+			case 2:
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID: "read-after-downgrade",
+					Function: protocol.ToolCallFunction{
+						Name: "read_file", Arguments: json.RawMessage(`{"path":"fixture.txt"}`),
+					},
+				}}}, nil
+			default:
+				return protocol.CompletionResult{Content: "兼容重试后完成"}, nil
+			}
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Content != "兼容重试后完成" || len(requests) != 3 {
+		t.Fatalf("outcome=%#v requests=%d", outcome, len(requests))
+	}
+	if !requests[0].ParallelToolCalls || requests[1].ParallelToolCalls || requests[2].ParallelToolCalls {
+		t.Fatalf("parallel compatibility sequence = %#v", []bool{
+			requests[0].ParallelToolCalls, requests[1].ParallelToolCalls, requests[2].ParallelToolCalls,
+		})
+	}
+	if len(requests[1].Tools) == 0 || len(requests[2].Tools) == 0 || requests[1].ToolChoice == "none" {
+		t.Fatal("parallel field downgrade incorrectly disabled function calling")
+	}
+}
+
+func TestToolLoopDowngradesUnsupportedRequiredToolChoiceWithoutDisablingTools(t *testing.T) {
+	svc, _ := newNativeToolLoopService(t)
+	registry := svc.buildToolRegistry()
+	requests := make([]protocol.ChatRequest, 0, 6)
+	outcome, err := svc.runToolLoopWithCompletion(
+		context.Background(),
+		registry,
+		protocol.ChatRequest{Messages: []protocol.Message{{Role: "user", Content: "读取并检查 fixture.txt"}}},
+		func(_ context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
+			requests = append(requests, request)
+			switch len(requests) {
+			case 1:
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID:       "read-first",
+					Function: protocol.ToolCallFunction{Name: "read_file", Arguments: json.RawMessage(`{"path":"fixture.txt"}`)},
+				}}}, nil
+			case 2, 3:
+				return protocol.CompletionResult{}, nil
+			case 4:
+				if request.ToolChoice != "required" {
+					t.Fatalf("recovery request tool choice = %q, want required", request.ToolChoice)
+				}
+				return protocol.CompletionResult{}, protocol.NewProviderError(protocol.ProviderErrorInfo{
+					HTTPStatus: 400,
+					Code:       "invalid_request_error",
+					Message:    "Unsupported value for tool_choice: required",
+				})
+			case 5:
+				if request.ToolChoice == "required" || request.ToolChoice == "none" || len(request.Tools) == 0 {
+					t.Fatalf("compatibility retry disabled tools: %+v", request)
+				}
+				return protocol.CompletionResult{ToolCalls: []protocol.ToolCall{{
+					ID:       "inspect-after-downgrade",
+					Function: protocol.ToolCallFunction{Name: "file_info", Arguments: json.RawMessage(`{"path":"fixture.txt"}`)},
+				}}}, nil
+			default:
+				return protocol.CompletionResult{Content: "已自动继续并完成检查。"}, nil
+			}
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 6 || outcome.Content != "已自动继续并完成检查。" || !hasSuccessfulToolEvidence(outcome.Parts, "file_info") {
+		t.Fatalf("requests=%d outcome=%#v", len(requests), outcome)
+	}
+}
+
+func TestReadOnlyRuntimeAdvertisesOnlyExecutableCapabilities(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	defer svc.Close()
+	svc.runtimeSettings.WorkspaceRoot = t.TempDir()
+	svc.runtimeSettings.SandboxMode = "read-only"
+	svc.runtimeSettings.FilesystemAccess = "read-only"
+	svc.runtimeSettings.NetworkAccess = true
+	svc.runtimeSettings.ShellAccess = true
+
+	registry := svc.buildToolRegistry()
+	for _, name := range []string{"read_file", "file_info", "list_dir", "search", "read_repository", "read_webpage", "web_search"} {
+		if _, ok := registry.Get(name); !ok {
+			t.Fatalf("read-only runtime omitted available tool %q", name)
+		}
+	}
+	for _, name := range []string{
+		"write_file", "apply_patch", "copy_file", "delete_file", "download_file",
+		"git_repository", "run_command", "ssh", "terminal",
+	} {
+		if _, ok := registry.Get(name); ok {
+			t.Fatalf("read-only runtime advertised unavailable tool %q", name)
+		}
+	}
+	delegation, ok := registry.Get("delegate_task")
+	if !ok {
+		t.Fatal("read-only runtime omitted read-only delegation")
+	}
+	delegateTool, ok := delegation.(DelegateTaskTool)
+	if !ok || !delegateTool.ReadOnly {
+		t.Fatalf("read-only runtime registered writable delegation: %#v", delegation)
+	}
+}
+
 func TestRepeatedPlanUpdateDoesNotEndToolLoop(t *testing.T) {
 	svc, _ := newNativeToolLoopService(t)
 	registry := svc.buildToolRegistry()
@@ -1692,15 +1837,118 @@ func TestExecuteToolCallRendersValidationFailureAsToolCard(t *testing.T) {
 			Arguments: json.RawMessage(`{"path":"~"}`),
 		},
 	})
-	if !result.IsError || len(result.Parts) != 1 {
+	if !result.IsError || len(result.Parts) == 0 {
 		t.Fatalf("invalid path result = %+v", result)
 	}
 	part := result.Parts[0]
 	if part.Kind != "tool_call" || part.Name != "list_dir" || part.Status != "error" || part.Input != "~" {
 		t.Fatalf("failure card = %+v", part)
 	}
-	if message.Content != result.Summary {
-		t.Fatalf("tool feedback should contain one summary, got %q", message.Content)
+	if !strings.HasPrefix(message.Content, result.Summary+"\n\nMHcode tool execution metadata:\n") {
+		t.Fatalf("tool feedback should keep the summary before structured metadata, got %q", message.Content)
+	}
+	if !strings.Contains(message.Content, `"tool":"list_dir"`) ||
+		!strings.Contains(message.Content, `"callId":"call-bad-path"`) ||
+		!strings.Contains(message.Content, `"status":"error"`) ||
+		!strings.Contains(message.Content, `"input":"~"`) {
+		t.Fatalf("tool feedback is missing execution metadata: %q", message.Content)
+	}
+	foundEvidence := false
+	for _, resultPart := range result.Parts[1:] {
+		if resultPart.Kind == tools.PartText && strings.Contains(resultPart.Text, "相对于当前工作区") {
+			foundEvidence = true
+			break
+		}
+	}
+	if !foundEvidence {
+		t.Fatalf("validation failure discarded structured evidence: %#v", result.Parts)
+	}
+}
+
+func TestFormatToolResultFeedbackIncludesExecutionEvidence(t *testing.T) {
+	exitCode := 17
+	feedback := formatToolResultFeedback(tools.Result{
+		Summary: "command failed",
+		IsError: true,
+		Parts: []tools.ResultPart{{
+			Kind:             tools.PartToolCall,
+			Name:             "run_command",
+			ToolCallID:       "call-shell",
+			Status:           "error",
+			Input:            "go test ./...",
+			WorkingDirectory: `C:\work\project`,
+			ExitCode:         &exitCode,
+			DurationMs:       1250,
+			Stdout:           "partial output",
+			Stderr:           "compile failed",
+		}},
+	}, "run_command")
+
+	marker := "MHcode tool execution metadata:\n"
+	index := strings.Index(feedback, marker)
+	if index < 0 {
+		t.Fatalf("structured execution metadata missing from %q", feedback)
+	}
+	var metadata toolResultFeedbackMetadata
+	if err := json.Unmarshal([]byte(feedback[index+len(marker):]), &metadata); err != nil {
+		t.Fatalf("decode execution metadata: %v\nfeedback=%q", err, feedback)
+	}
+	if metadata.Tool != "run_command" || metadata.CallID != "call-shell" || metadata.Status != "error" ||
+		metadata.Input != "go test ./..." || metadata.WorkingDirectory != `C:\work\project` ||
+		metadata.ExitCode == nil || *metadata.ExitCode != exitCode || metadata.DurationMs != 1250 ||
+		metadata.Stdout != "partial output" || metadata.Stderr != "compile failed" {
+		t.Fatalf("execution metadata = %#v", metadata)
+	}
+}
+
+func TestExecuteToolCallPreservesStructuredResultReturnedWithError(t *testing.T) {
+	svc := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	result, message := svc.executeToolCall(
+		context.Background(),
+		tools.NewRegistry(structuredResultErrorTool{}),
+		protocol.ToolCall{
+			ID: "call-partial-error", Type: "function",
+			Function: protocol.ToolCallFunction{Name: "structured_result_error", Arguments: json.RawMessage(`{}`)},
+		},
+	)
+	if !result.IsError || !strings.Contains(result.Summary, "partial inspection result") || !strings.Contains(result.Summary, "post-parse validation failed") {
+		t.Fatalf("partial tool error result = %#v", result)
+	}
+	foundText := false
+	foundErrorCard := false
+	for _, part := range result.Parts {
+		if part.Kind == tools.PartText && part.Text == "configuration file was parsed" {
+			foundText = true
+		}
+		if part.Kind == tools.PartToolCall && part.Name == "structured_result_error" {
+			if part.Status != "error" || part.Stdout != "parsed 3 entries" || !strings.Contains(part.Stderr, "post-parse validation failed") {
+				t.Fatalf("partial tool execution evidence = %#v", part)
+			}
+			foundErrorCard = true
+		}
+	}
+	if !foundText || !foundErrorCard {
+		t.Fatalf("structured evidence was discarded: %#v", result.Parts)
+	}
+	if !strings.Contains(message.Content, `"status":"error"`) ||
+		!strings.Contains(message.Content, `"stdout":"parsed 3 entries"`) ||
+		!strings.Contains(message.Content, `"stderr":"post-parse validation failed"`) {
+		t.Fatalf("model feedback lost partial execution evidence: %q", message.Content)
+	}
+}
+
+func TestEnsureToolErrorPartPreservesNonToolEvidence(t *testing.T) {
+	result := ensureToolErrorPart(tools.Result{
+		Summary: "validation failed",
+		IsError: true,
+		Parts: []tools.ResultPart{
+			{Kind: tools.PartFile, Path: `C:\work\report.xlsx`},
+			{Kind: tools.PartDiff, Path: `C:\work\report.xlsx`, Patch: "binary workbook updated"},
+		},
+	}, "office_edit", json.RawMessage(`{"path":"C:\\work\\report.xlsx"}`))
+	if len(result.Parts) != 3 || result.Parts[0].Kind != tools.PartToolCall ||
+		result.Parts[1].Kind != tools.PartFile || result.Parts[2].Kind != tools.PartDiff {
+		t.Fatalf("error evidence parts = %#v", result.Parts)
 	}
 }
 

@@ -23,6 +23,7 @@ type RuntimeSettings struct {
 	ExtraWritableRoots     []string                `json:"extraWritableRoots"`
 	ToolTimeoutSeconds     int                     `json:"toolTimeoutSeconds"`
 	TaskIdleTimeoutSeconds int                     `json:"taskIdleTimeoutSeconds"`
+	MaxConcurrentSubagents int                     `json:"maxConcurrentSubagents"`
 	MaxCommandSeconds      int                     `json:"maxCommandSeconds"`
 	MaxCommandMemoryMB     int                     `json:"maxCommandMemoryMb"`
 	MaxCommandCPUPercent   int                     `json:"maxCommandCpuPercent"`
@@ -44,7 +45,7 @@ type RuntimeSettings struct {
 	Memory                 MemorySettings          `json:"memory"`
 }
 
-const runtimeSettingsSchemaVersion = 12
+const runtimeSettingsSchemaVersion = 13
 
 type SkillsSettings struct {
 	Disabled []string `json:"disabled"`
@@ -222,6 +223,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		ExtraWritableRoots:     []string{},
 		ToolTimeoutSeconds:     180,
 		TaskIdleTimeoutSeconds: 300,
+		MaxConcurrentSubagents: defaultMaxConcurrentSubagents,
 		MaxCommandSeconds:      120,
 		MaxCommandMemoryMB:     4096,
 		MaxCommandCPUPercent:   100,
@@ -458,6 +460,7 @@ func (settings RuntimeSettings) Normalized() RuntimeSettings {
 	if settings.TaskIdleTimeoutSeconds > 7200 {
 		settings.TaskIdleTimeoutSeconds = 7200
 	}
+	settings.MaxConcurrentSubagents = normalizeSubagentConcurrencyLimit(settings.MaxConcurrentSubagents)
 	if settings.MaxCommandSeconds < 5 {
 		settings.MaxCommandSeconds = 5
 	}

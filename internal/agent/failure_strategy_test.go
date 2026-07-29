@@ -183,3 +183,33 @@ func TestTransientFailureGetsOneEquivalentRetry(t *testing.T) {
 		t.Fatal("second transient failure should require a different strategy")
 	}
 }
+
+func TestNetworkFailurePreservesSpecificEvidencePath(t *testing.T) {
+	networkFailure := tools.Result{
+		Summary: "connection reset by peer",
+		IsError: true,
+		Parts:   []tools.ResultPart{{Kind: tools.PartToolCall, Output: "connection reset by peer"}},
+	}
+	cases := []struct {
+		name string
+		tool string
+		args string
+		want string
+	}{
+		{name: "webpage", tool: "read_webpage", args: `{"url":"https://example.com"}`, want: "browser"},
+		{name: "repository", tool: "read_repository", args: `{"url":"https://github.com/example/project"}`, want: "git_repository"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			diagnosis := diagnoseToolFailure(protocol.ToolCall{
+				Function: protocol.ToolCallFunction{Name: test.tool, Arguments: json.RawMessage(test.args)},
+			}, networkFailure)
+			if !containsString(diagnosis.Alternatives, test.want) {
+				t.Fatalf("alternatives=%#v, want %q", diagnosis.Alternatives, test.want)
+			}
+			if containsString(diagnosis.Alternatives, "web_search") {
+				t.Fatalf("specific evidence failure fell back to web_search: %#v", diagnosis.Alternatives)
+			}
+		})
+	}
+}

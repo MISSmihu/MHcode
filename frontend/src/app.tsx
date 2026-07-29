@@ -93,6 +93,8 @@ import {
   saveDeepSeekAPIKey,
   saveModelProviderAPIKey,
   startChatMessageForSession,
+	resumePausedTeamTask,
+	abandonPausedTeamTask,
   getActiveChatTasks,
   guideChatMessage,
   stopChatMessage,
@@ -138,7 +140,8 @@ import {
   previewWorkspaceFile,
   openBrowserURL,
   openURLInSystemBrowser,
-  revealSecretResult,
+	revealSecretResult,
+  importSkillMarkdown,
 } from "./services/workbench";
 import { defaultReasoningLevel, reasoningOptions as fallbackReasoningOptions } from "./state/reasoning";
 import type {
@@ -157,6 +160,7 @@ import type {
   ModelProviderSetting,
   ReasoningLevel,
   RuntimeSettings,
+  SkillImportResult,
   UsageMetrics,
   WorkbenchState,
   WorkspaceFileRequest,
@@ -194,7 +198,7 @@ import {
 } from "./lib/composer-history";
 import type { ComposerHistory, ComposerSnapshot } from "./lib/composer-history";
 import { hasMeaningfulTurnOutput } from "./lib/chat-results";
-import { appendLiveAssistantText, displayMessageParts, liveTaskStatus, updateLiveTimelineParts } from "./lib/timeline";
+import { appendLiveAssistantText, displayMessageParts, liveTaskStatus, settleLiveTimelineParts, updateLiveTimelineParts } from "./lib/timeline";
 import { redactSensitiveTextForDisplay } from "./lib/sensitive-text";
 import type { UIAppearancePreferences } from "./ui-appearance";
 import {
@@ -306,6 +310,7 @@ function App() {
   const [clearingKey, setClearingKey] = createSignal(false);
   const [savingRuntime, setSavingRuntime] = createSignal(false);
   const [sendingMessage, setSendingMessage] = createSignal(false);
+	const [teamLifecycleBusy, setTeamLifecycleBusy] = createSignal(false);
   const [activeChatTaskID, setActiveChatTaskID] = createSignal("");
   const [streamingMessageID, setStreamingMessageID] = createSignal("");
   const [activeTaskProgress, setActiveTaskProgress] = createSignal<TaskProgressPart>();
@@ -327,6 +332,7 @@ function App() {
   const [composerUndoDepth, setComposerUndoDepth] = createSignal(0);
   const [composerRedoDepth, setComposerRedoDepth] = createSignal(0);
   const [addingImages, setAddingImages] = createSignal(false);
+  const [addingDocuments, setAddingDocuments] = createSignal(false);
   const [pendingLinkURL, setPendingLinkURL] = createSignal("");
   const [linkOpenBusy, setLinkOpenBusy] = createSignal<"internal" | "external" | "">("");
   const [previewAttachment, setPreviewAttachment] = createSignal<ChatAttachment>();
@@ -394,6 +400,7 @@ function App() {
   let workbenchRef: HTMLDivElement | undefined;
 	let composerEditorRef: HTMLTextAreaElement | undefined;
   let composerImageInputRef: HTMLInputElement | undefined;
+  let composerMarkdownInputRef: HTMLInputElement | undefined;
   let workspaceFileRequestID = 0;
   let projectActionMenuRef: HTMLDivElement | undefined;
   let sessionActionMenuRef: HTMLDivElement | undefined;
@@ -566,6 +573,10 @@ function App() {
   };
   const planMode = createMemo(() => state()?.planMode ?? false);
   const teamMode = createMemo(() => runtimeSettings().team.enabled);
+	const pausedTeamTask = createMemo(() => {
+		const team = state()?.team;
+		return !currentSessionBusy() && team?.status === "paused";
+	});
   const activeTeamParts = createMemo<TeamPart[]>(() => {
     const task = activeSessionTask();
     if (!task) return [];
@@ -1115,7 +1126,7 @@ function App() {
         if (previousResult) {
           updateSessionStreamingMessage(projectID, sessionID, (message) => ({
             ...message,
-            content: previousResult.content || message.content || previousResult.reasoning || "本轮没有返回可展示内容。",
+            content: previousResult.content || message.content || "本轮没有返回可展示内容。",
             reasoning: previousResult.reasoning,
             model: previousResult.model,
             usage: previousResult.usage,
@@ -1133,7 +1144,7 @@ function App() {
         const result = event.result;
         updateSessionStreamingMessage(projectID, sessionID, (message) => ({
           ...message,
-          content: result?.content || message.content || result?.reasoning || "本轮没有返回可展示内容。",
+          content: result?.content || message.content || "本轮没有返回可展示内容。",
           reasoning: result?.reasoning || message.reasoning,
           model: result?.model || message.model,
           usage: result?.usage || message.usage,
@@ -1405,7 +1416,7 @@ function App() {
           setState(previousResult.state);
           updateStreamingMessage((message) => ({
             ...message,
-            content: previousResult.content || message.content || previousResult.reasoning || "本轮没有返回可展示内容。",
+            content: previousResult.content || message.content || "本轮没有返回可展示内容。",
             reasoning: previousResult.reasoning,
             model: previousResult.model,
             usage: previousResult.usage,
@@ -1443,7 +1454,7 @@ function App() {
           setState(result.state);
           updateStreamingMessage((message) => ({
             ...message,
-            content: result.content || message.content || result.reasoning || "本轮没有返回可展示内容。",
+            content: result.content || message.content || "本轮没有返回可展示内容。",
             reasoning: result.reasoning,
             model: result.model,
             usage: result.usage,
@@ -1893,6 +1904,13 @@ function App() {
 		}
 	};
 
+  const importUserSkillMarkdown = async (fileName: string, content: string): Promise<SkillImportResult> => {
+    setError("");
+    const result = await importSkillMarkdown(fileName, content);
+    setState(result.state);
+    return result;
+  };
+
 	const removeInstalledPlugin = async (id: string) => {
 		setPluginBusy(`uninstall:${id}`);
 		setError("");
@@ -2148,7 +2166,8 @@ function App() {
 
   const addComposerImages = async (files: File[]) => {
     if (files.length === 0 || addingImages()) return;
-    const available = 4 - composerAttachments().length;
+    const imageCount = composerAttachments().filter(isImageChatAttachment).length;
+    const available = 4 - imageCount;
     if (available <= 0) {
       setError("一次最多添加 4 张图片。");
       return;
@@ -2159,7 +2178,9 @@ function App() {
       const selected = files.slice(0, available);
       const next = await Promise.all(selected.map((file, index) => readChatImage(file, composerAttachments().length + index)));
       const combined = [...composerAttachments(), ...next];
-      const totalBytes = combined.reduce((sum, attachment) => sum + approximateBase64Bytes(attachment.data), 0);
+      const totalBytes = combined
+        .filter(isImageChatAttachment)
+        .reduce((sum, attachment) => sum + approximateBase64Bytes(attachment.data), 0);
       if (totalBytes > 12 * 1024 * 1024) {
         throw new Error("图片总大小不能超过 12 MB。");
       }
@@ -2173,16 +2194,49 @@ function App() {
     }
   };
 
+  const addComposerMarkdown = async (files: File[]) => {
+    if (files.length === 0 || addingDocuments()) return;
+    const documentCount = composerAttachments().filter(isMarkdownChatAttachment).length;
+    const available = 5 - documentCount;
+    if (available <= 0) {
+      setError("一次最多添加 5 个 Markdown 文件。");
+      return;
+    }
+    setAddingDocuments(true);
+    setError("");
+    try {
+      const selected = files.slice(0, available);
+      const next = await Promise.all(selected.map((file, index) => readChatMarkdown(file, documentCount + index)));
+      const combined = [...composerAttachments(), ...next];
+      const totalBytes = combined
+        .filter(isMarkdownChatAttachment)
+        .reduce((sum, attachment) => sum + (attachment.size ?? approximateBase64Bytes(attachment.data)), 0);
+      if (totalBytes > 256 * 1024) {
+        throw new Error("Markdown 文件总大小不能超过 256 KiB。");
+      }
+      commitComposerSnapshot({ ...currentComposerSnapshot(), attachments: combined });
+      if (files.length > available) setError("一次最多添加 5 个 Markdown 文件，其余文件未加入。");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setAddingDocuments(false);
+      if (composerMarkdownInputRef) composerMarkdownInputRef.value = "";
+    }
+  };
+
 	const handleComposerPaste = (event: ClipboardEvent) => {
-    const files = Array.from(event.clipboardData?.items ?? [])
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => Boolean(file));
+	  const pastedFiles = Array.from(event.clipboardData?.items ?? [])
+	    .filter((item) => item.kind === "file")
+	    .map((item) => item.getAsFile())
+	    .filter((file): file is File => Boolean(file));
+    const files = pastedFiles.filter((file) => file.type.startsWith("image/"));
+    const documents = pastedFiles.filter(isMarkdownFile);
     const pastedText = event.clipboardData?.getData("text/plain") ?? "";
     const links = extractComposerLinks(pastedText);
-    if (files.length === 0 && links.length === 0) return;
+    if (files.length === 0 && documents.length === 0 && links.length === 0) return;
     event.preventDefault();
     if (files.length > 0) void addComposerImages(files);
+    if (documents.length > 0) void addComposerMarkdown(documents);
     const remainingText = links.length > 0 ? removeComposerURLs(pastedText, links) : pastedText;
 	const editor = composerEditorRef;
     if (remainingText) insertTextAtSelection(editor, remainingText);
@@ -2289,6 +2343,109 @@ function App() {
       void applyPendingReasoning(finishChatTask(projectID, sessionID, taskID));
     }
   };
+
+	const resumePausedTeamRun = async () => {
+		const projectID = activeProjectID();
+		const sessionID = activeSessionID();
+		if (teamLifecycleBusy() || currentSessionBusy()) return;
+		if (!projectID || !sessionID) {
+			setError("当前没有可继续团队任务的会话。");
+			return;
+		}
+
+		const taskStartedAt = new Date().toISOString();
+		const assistantMessage: ChatMessage = {
+			id: `assistant-team-resume-${Date.now()}`,
+			role: "assistant",
+			content: "",
+			createdAt: taskStartedAt,
+			model: activeChatModel(),
+			streaming: true,
+			status: "正在恢复 AI 团队任务",
+		};
+		const sessionKey = sessionIdentityKey(projectID, sessionID);
+		setActiveTaskProgress(undefined);
+		setChatNearBottom(true);
+		setMessages((current) => [...current, assistantMessage]);
+		setStreamingMessageID(assistantMessage.id);
+		setSendingMessage(true);
+		setSessionTaskRuntimes((current) => ({
+			...current,
+			[sessionKey]: {
+				taskID: "",
+				projectID,
+				sessionID,
+				userMessageID: "",
+				messageID: assistantMessage.id,
+				prompt: "",
+				tail: "",
+				attachments: [],
+				links: [],
+				startedAt: taskStartedAt,
+				assistantMessage,
+			},
+		}));
+		setError("");
+
+		let taskID = "";
+		try {
+			taskID = await resumePausedTeamTask(projectID, sessionID);
+			let registered = false;
+			setSessionTaskRuntimes((current) => {
+				const task = current[sessionKey];
+				if (!task) return current;
+				registered = true;
+				return { ...current, [sessionKey]: { ...task, taskID } };
+			});
+			if (registered && projectID === activeProjectID() && sessionID === activeSessionID()) {
+				setActiveChatTaskID(taskID);
+			}
+		} catch (err) {
+			const message = errorMessage(err);
+			if (projectID === activeProjectID() && sessionID === activeSessionID()) {
+				setError(message);
+				setMessages((current) => current.filter((item) => item.id !== assistantMessage.id));
+				setSendingMessage(false);
+				setActiveChatTaskID("");
+				setStreamingMessageID("");
+			}
+			setSessionTaskRuntimes((current) => {
+				const next = { ...current };
+				delete next[sessionKey];
+				return next;
+			});
+		}
+	};
+
+	const abandonPausedTeamRun = async () => {
+		const projectID = activeProjectID();
+		const sessionID = activeSessionID();
+		if (teamLifecycleBusy() || currentSessionBusy()) return;
+		if (!projectID || !sessionID) {
+			setError("当前没有可结束团队任务的会话。");
+			return;
+		}
+		const confirmed = await confirmAction({
+			title: "结束 AI 团队任务",
+			message: "已完成的角色结果和文件修改会保留，但该团队任务将不能再继续。",
+			confirmLabel: "结束任务",
+			cancelLabel: "取消",
+			tone: "danger",
+		});
+		if (!confirmed) return;
+		setTeamLifecycleBusy(true);
+		setError("");
+		try {
+			const next = await abandonPausedTeamTask(projectID, sessionID);
+			setState(next);
+			await restoreSessionMessages(false, projectID, sessionID);
+			void refreshProjectsAndSessions();
+		} catch (err) {
+			setError(errorMessage(err));
+		} finally {
+			setTeamLifecycleBusy(false);
+		}
+	};
 
   const enqueueCurrentMessage = (guidance = false) => {
     const draft = promptDraft().trim();
@@ -4145,21 +4302,31 @@ function App() {
                             <div class="op-user-images">
                               <For each={message.attachments}>
                                 {(attachment) => (
-                                  <img
-                                    class="previewable-image"
-                                    src={chatAttachmentURL(attachment)}
-                                    alt={attachment.name}
-                                    title="双击查看原图"
-                                    tabIndex={0}
-                                    draggable={false}
-                                    onDblClick={() => setPreviewAttachment(attachment)}
-                                    onKeyDown={(event) => {
-                                      if (event.key === "Enter" || event.key === " ") {
-                                        event.preventDefault();
-                                        setPreviewAttachment(attachment);
-                                      }
-                                    }}
-                                  />
+                                  <Show
+                                    when={isImageChatAttachment(attachment)}
+                                    fallback={
+                                      <div class="op-user-document" title={attachment.name}>
+                                        <FileText size={18} />
+                                        <span><strong>{attachment.name}</strong><small>{formatAttachmentMeta(attachment)}</small></span>
+                                      </div>
+                                    }
+                                  >
+                                    <img
+                                      class="previewable-image"
+                                      src={chatAttachmentURL(attachment)}
+                                      alt={attachment.name}
+                                      title="双击查看原图"
+                                      tabIndex={0}
+                                      draggable={false}
+                                      onDblClick={() => setPreviewAttachment(attachment)}
+                                      onKeyDown={(event) => {
+                                        if (event.key === "Enter" || event.key === " ") {
+                                          event.preventDefault();
+                                          setPreviewAttachment(attachment);
+                                        }
+                                      }}
+                                    />
+                                  </Show>
                                 )}
                               </For>
                             </div>
@@ -4180,23 +4347,29 @@ function App() {
                           <div class="composer-attachments compact">
                             <For each={editMessageAttachments()}>
                               {(attachment, index) => (
-                                <figure>
-                                  <img
-                                    class="previewable-image"
-                                    src={chatAttachmentURL(attachment)}
-                                    alt={attachment.name}
-                                    title="双击查看原图"
-                                    tabIndex={0}
-                                    draggable={false}
-                                    onDblClick={() => setPreviewAttachment(attachment)}
-                                    onKeyDown={(event) => {
-                                      if (event.key === "Enter" || event.key === " ") {
-                                        event.preventDefault();
-                                        setPreviewAttachment(attachment);
-                                      }
-                                    }}
-                                  />
-                                  <button type="button" title="移除图片" aria-label={`移除 ${attachment.name}`} onClick={() => setEditMessageAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index()))}><X size={12} /></button>
+                                <figure classList={{ document: isMarkdownChatAttachment(attachment) }}>
+                                  <Show
+                                    when={isImageChatAttachment(attachment)}
+                                    fallback={<div class="composer-document-preview"><FileText size={20} /><span>{formatAttachmentMeta(attachment)}</span></div>}
+                                  >
+                                    <img
+                                      class="previewable-image"
+                                      src={chatAttachmentURL(attachment)}
+                                      alt={attachment.name}
+                                      title="双击查看原图"
+                                      tabIndex={0}
+                                      draggable={false}
+                                      onDblClick={() => setPreviewAttachment(attachment)}
+                                      onKeyDown={(event) => {
+                                        if (event.key === "Enter" || event.key === " ") {
+                                          event.preventDefault();
+                                          setPreviewAttachment(attachment);
+                                        }
+                                      }}
+                                    />
+                                  </Show>
+                                  <figcaption>{attachment.name}</figcaption>
+                                  <button type="button" title="移除附件" aria-label={`移除 ${attachment.name}`} onClick={() => setEditMessageAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index()))}><X size={12} /></button>
                                 </figure>
                               )}
                             </For>
@@ -4290,10 +4463,10 @@ function App() {
           </Show>
         </div>
 
-        <Show when={Boolean(activeTaskProgress()) || activeTeamParts().length > 0 || activeSubagentParts().length > 0}>
+		<Show when={Boolean(activeTaskProgress()) || activeTeamParts().length > 0 || activeSubagentParts().length > 0 || pausedTeamTask()}>
           <section
             class="execution-status-dock"
-			classList={{ combined: [Boolean(activeTaskProgress()), activeTeamParts().length > 0, activeSubagentParts().length > 0].filter(Boolean).length > 1 }}
+			classList={{ combined: [Boolean(activeTaskProgress()), activeTeamParts().length > 0, activeSubagentParts().length > 0, pausedTeamTask()].filter(Boolean).length > 1 }}
             aria-label="当前执行状态"
             aria-live="polite"
           >
@@ -4311,6 +4484,24 @@ function App() {
 				onStop={stopOneSubagent}
 			  />
 			</Show>
+			<Show when={pausedTeamTask()}>
+			  <section class="team-pause-control" aria-label="暂停的 AI 团队任务">
+				<div>
+				  <strong>AI 团队已暂停</strong>
+				  <small>{state()?.team.currentRole ? `将从 ${teamStageLabel(state()!.team.currentRole!)} 继续` : "已保留当前团队进度"}</small>
+				</div>
+				<div class="team-pause-actions">
+				  <button type="button" disabled={teamLifecycleBusy()} onClick={() => void resumePausedTeamRun()}>
+					<ArrowRight size={14} />
+					继续任务
+				  </button>
+				  <button class="danger" type="button" disabled={teamLifecycleBusy()} onClick={() => void abandonPausedTeamRun()}>
+					<X size={14} />
+					结束任务
+				  </button>
+				</div>
+			  </section>
+			</Show>
           </section>
         </Show>
 
@@ -4326,26 +4517,31 @@ function App() {
               <div class="composer-attachments">
                 <For each={composerAttachments()}>
                   {(attachment, index) => (
-                    <figure>
-                      <img
-                        class="previewable-image"
-                        src={chatAttachmentURL(attachment)}
-                        alt={attachment.name}
-                        title="双击查看原图"
-                        tabIndex={0}
-                        draggable={false}
-                        onDblClick={() => setPreviewAttachment(attachment)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === " ") {
-                            event.preventDefault();
-                            setPreviewAttachment(attachment);
-                          }
-                        }}
-                      />
+                    <figure classList={{ document: isMarkdownChatAttachment(attachment) }}>
+                      <Show
+                        when={isImageChatAttachment(attachment)}
+                        fallback={<div class="composer-document-preview"><FileText size={23} /><span>{formatAttachmentMeta(attachment)}</span></div>}
+                      >
+                        <img
+                          class="previewable-image"
+                          src={chatAttachmentURL(attachment)}
+                          alt={attachment.name}
+                          title="双击查看原图"
+                          tabIndex={0}
+                          draggable={false}
+                          onDblClick={() => setPreviewAttachment(attachment)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.preventDefault();
+                              setPreviewAttachment(attachment);
+                            }
+                          }}
+                        />
+                      </Show>
                       <figcaption>{attachment.name}</figcaption>
                       <button
                         type="button"
-                        title="移除图片"
+                        title="移除附件"
                         aria-label={`移除 ${attachment.name}`}
                         onClick={() => commitComposerSnapshot({
                           ...currentComposerSnapshot(),
@@ -4369,7 +4565,7 @@ function App() {
                         {index() + 1}
                       </span>
                       <button class="composer-queue-copy" type="button" disabled={queued.guidance} title={queued.guidance ? "等待当前 Agent 应用" : "编辑这条排队消息"} onClick={() => editQueuedMessage(queued.id)}>
-                        {redactSensitiveTextForDisplay(composeComposerPrompt(queued.draft, queued.links, queued.tail)) || `${queued.attachments.length} 张图片`}
+                        {redactSensitiveTextForDisplay(composeComposerPrompt(queued.draft, queued.links, queued.tail)) || `${queued.attachments.length} 个附件`}
                       </button>
                       <button
                         class="composer-queue-guide"
@@ -4437,11 +4633,25 @@ function App() {
                   multiple
                   onChange={(event) => void addComposerImages(Array.from(event.currentTarget.files ?? []))}
                 />
-                <button type="button" title="添加图片" aria-label="添加图片" disabled={addingImages() || composerAttachments().length >= 4} onClick={() => composerImageInputRef?.click()}>
+                <input
+                  ref={composerMarkdownInputRef}
+                  class="composer-image-input"
+                  type="file"
+                  accept=".md,.markdown,text/markdown,text/x-markdown"
+                  multiple
+                  onChange={(event) => void addComposerMarkdown(Array.from(event.currentTarget.files ?? []))}
+                />
+                <button type="button" title="添加图片" aria-label="添加图片" disabled={addingImages() || composerAttachments().filter(isImageChatAttachment).length >= 4} onClick={() => composerImageInputRef?.click()}>
                   <ImagePlus size={17} />
                 </button>
-                <button type="button" title="添加上下文" onClick={() => openSettings("index")}>
-                  <Plus size={17} />
+                <button
+                  type="button"
+                  title="添加 Markdown 参考资料"
+                  aria-label="添加 Markdown 参考资料"
+                  disabled={addingDocuments() || composerAttachments().filter(isMarkdownChatAttachment).length >= 5}
+                  onClick={() => composerMarkdownInputRef?.click()}
+                >
+                  <FileText size={17} />
                 </button>
                 <button
                   type="button"
@@ -4656,6 +4866,7 @@ function App() {
 			plugins={pluginStatuses()}
 			pluginBusy={pluginBusy()}
 			installPlugin={installLocalPlugin}
+			importSkillMarkdown={importUserSkillMarkdown}
 			refreshPlugins={refreshPluginRuntime}
 			revealPlugin={openInstalledPlugin}
 			uninstallPlugin={removeInstalledPlugin}
@@ -4776,6 +4987,36 @@ function chatAttachmentURL(attachment: ChatAttachment): string {
   return `data:${attachment.mimeType};base64,${attachment.data}`;
 }
 
+function chatAttachmentKind(attachment: ChatAttachment): "image" | "document" | "unknown" {
+  if (attachment.kind === "image" || attachment.kind === "document") return attachment.kind;
+  const mimeType = attachment.mimeType.toLowerCase();
+  if (mimeType.startsWith("image/")) return "image";
+  if (["text/markdown", "text/x-markdown", "text/plain"].includes(mimeType)) return "document";
+  return "unknown";
+}
+
+function isImageChatAttachment(attachment: ChatAttachment): boolean {
+  return chatAttachmentKind(attachment) === "image";
+}
+
+function isMarkdownChatAttachment(attachment: ChatAttachment): boolean {
+  return chatAttachmentKind(attachment) === "document";
+}
+
+function isMarkdownFile(file: File): boolean {
+  const extension = file.name.toLowerCase();
+  return extension.endsWith(".md") || extension.endsWith(".markdown") || ["text/markdown", "text/x-markdown"].includes(file.type.toLowerCase());
+}
+
+function formatAttachmentMeta(attachment: ChatAttachment): string {
+  if (isMarkdownChatAttachment(attachment)) {
+    const characters = attachment.characterCount;
+    if (typeof characters === "number" && characters >= 0) return `${characters.toLocaleString("zh-CN")} 字符`;
+    return "Markdown";
+  }
+  return attachment.mimeType;
+}
+
 function approximateBase64Bytes(data: string): number {
   const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
   return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
@@ -4798,10 +5039,44 @@ async function readChatImage(file: File, index: number): Promise<ChatAttachment>
   if (comma < 0 || !dataURL.slice(comma + 1)) throw new Error("读取图片失败。");
   const extension = mimeType === "image/jpeg" ? "jpg" : mimeType.slice("image/".length);
   return {
+    kind: "image",
     name: file.name || `clipboard-${Date.now()}-${index + 1}.${extension}`,
     mimeType,
     data: dataURL.slice(comma + 1),
+    size: file.size,
   };
+}
+
+async function readChatMarkdown(file: File, index: number): Promise<ChatAttachment> {
+  if (!isMarkdownFile(file)) {
+    throw new Error(`不支持文档格式 ${file.type || file.name}，请选择 .md 或 .markdown 文件。`);
+  }
+  if (file.size === 0) throw new Error(`${file.name || "Markdown 文件"} 为空。`);
+  if (file.size > 128 * 1024) throw new Error(`${file.name || "Markdown 文件"} 超过 128 KiB。`);
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer()).replace(/^\uFEFF/, "");
+  } catch {
+    throw new Error(`${file.name || "Markdown 文件"} 不是有效的 UTF-8 文本。`);
+  }
+  if (!text || text.includes("\0")) throw new Error(`${file.name || "Markdown 文件"} 不是有效的 Markdown 文本。`);
+  const bytes = new TextEncoder().encode(text);
+  return {
+    kind: "document",
+    name: file.name || `reference-${Date.now()}-${index + 1}.md`,
+    mimeType: "text/markdown",
+    data: bytesToBase64(bytes),
+    size: bytes.byteLength,
+    characterCount: Array.from(text).length,
+  };
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
 }
 
 function extractComposerLinks(value: string): ComposerLink[] {
@@ -4967,7 +5242,7 @@ function updateLiveToolParts(parts: MessagePart[] | undefined, event: ChatTaskEv
     : event.status === "running"
       ? "running"
       : "ok";
-  const next = [...(parts ?? [])];
+  const next = settleLiveTimelineParts(parts);
   const index = next.findIndex(
     (part) => part.kind === "tool_call" && part.toolCallId === toolCallId,
   );
@@ -5063,6 +5338,18 @@ function teamRoleLabel(role: TeamPart["role"]): string {
     case "tester": return "测试";
     case "reviewer": return "审阅";
     case "synthesizer": return "汇总";
+    default: {
+      const normalized = String(role || "").trim();
+      return normalized ? `协作任务（${normalized}）` : "协作任务";
+    }
+  }
+}
+
+function teamStageLabel(stage: string): string {
+  switch (stage) {
+    case "plan_approval": return "计划确认";
+    case "finalize": return "结果整理";
+    default: return teamRoleLabel(stage as TeamPart["role"]);
   }
 }
 
@@ -5116,6 +5403,22 @@ function mergeLiveToolResultParts(
     if (part.kind === "task_progress") {
       continue;
     }
+	if (part.kind === "timeline_note") {
+	  const index = next.findIndex((item) => item.kind === "timeline_note" && (
+		part.toolCallId ? item.toolCallId === part.toolCallId : item.message === part.message
+	  ));
+	  if (index >= 0) {
+		const currentPart = next[index] as Extract<MessagePart, { kind: "timeline_note" }>;
+		const currentTerminal = ["completed", "failed", "cancelled", "interrupted"].includes(currentPart.status || "");
+		const incomingTerminal = ["completed", "failed", "cancelled", "interrupted"].includes(part.status || "");
+		next[index] = currentTerminal && !incomingTerminal
+		  ? { ...part, status: currentPart.status, startedAt: currentPart.startedAt, completedAt: currentPart.completedAt }
+		  : { ...currentPart, ...part };
+	  } else {
+		next.push(part);
+	  }
+	  continue;
+	}
     if (part.kind === "web_search_results") {
       const index = next.findIndex((item) => item.kind === "web_search_results");
       if (index >= 0) {

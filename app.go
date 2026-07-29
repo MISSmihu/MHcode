@@ -62,6 +62,7 @@ func NewApp() *App {
 	app.service = agent.NewService(agent.ServiceConfig{
 		AppVersion:             appVersion,
 		SkillsDir:              "skills",
+		UserSkillsDir:          userSkillsDir(),
 		SkillsFS:               bundledSkills,
 		SettingsPath:           runtimeSettingsPath(),
 		SessionsDir:            sessionsDir(),
@@ -540,6 +541,12 @@ func (a *App) ReadSkillDetail(name string) (agent.SkillDetail, error) {
 	return a.service.ReadSkillDetail(name)
 }
 
+// ImportSkillMarkdown installs a user-authored Markdown file into MHcode's
+// durable per-user Skills directory and returns the refreshed workbench state.
+func (a *App) ImportSkillMarkdown(fileName, content string) (agent.SkillImportResult, error) {
+	return a.service.ImportSkillMarkdown(fileName, content)
+}
+
 // OpenSkillFile opens a disk-backed Skill source through the host application.
 func (a *App) OpenSkillFile(name string) error {
 	return a.service.OpenSkillFile(name)
@@ -672,6 +679,14 @@ func pluginsDir() string {
 		return "mhcode-plugins"
 	}
 	return filepath.Join(configDir, "MHcode", "plugins")
+}
+
+func userSkillsDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return filepath.Join(".mhcode", "skills")
+	}
+	return filepath.Join(configDir, "MHcode", "skills")
 }
 
 func temporaryWorkspaceRoot() string {

@@ -15,14 +15,15 @@ type ContextSection struct {
 }
 
 type StableContext struct {
-	ProductIdentity string               `json:"productIdentity"`
-	SystemRules     []string             `json:"systemRules"`
-	RuntimePolicy   string               `json:"runtimePolicy"`
-	Reasoning       ReasoningProfile     `json:"reasoning"`
-	SkillsIndex     []skills.IndexEntry  `json:"skillsIndex"`
-	MCPSnapshots    []mcp.ServerSnapshot `json:"mcpSnapshots"`
-	ProjectSummary  string               `json:"projectSummary"`
-	RoutingPolicy   string               `json:"routingPolicy"`
+	ProductIdentity  string               `json:"productIdentity"`
+	SystemRules      []string             `json:"systemRules"`
+	RuntimePolicy    string               `json:"runtimePolicy"`
+	Reasoning        ReasoningProfile     `json:"reasoning"`
+	SkillsIndex      []skills.IndexEntry  `json:"skillsIndex"`
+	PersistentSkills []string             `json:"persistentSkills,omitempty"`
+	MCPSnapshots     []mcp.ServerSnapshot `json:"mcpSnapshots"`
+	ProjectSummary   string               `json:"projectSummary"`
+	RoutingPolicy    string               `json:"routingPolicy"`
 }
 
 type VolatileContext struct {
@@ -58,6 +59,7 @@ func (ContextBuilder) Build(stable StableContext, volatile VolatileContext) Requ
 		{Name: "runtime_policy", Content: stable.RuntimePolicy},
 		{Name: "reasoning", Content: string(stable.Reasoning.ID) + ":" + stable.Reasoning.Budget.CachePolicy},
 		{Name: "skills_index", Content: skills.FormatStableIndex(stable.SkillsIndex)},
+		{Name: "persistent_user_rules", Content: joinLines(stable.PersistentSkills)},
 		{Name: "mcp_schema_snapshot", Content: mcp.FormatSnapshots(stable.MCPSnapshots)},
 		{Name: "project_summary", Content: stable.ProjectSummary},
 		{Name: "routing_policy", Content: stable.RoutingPolicy},

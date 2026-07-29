@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, OpenSourceLicense, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
+import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, OpenSourceLicense, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillImportResult, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -16,6 +16,8 @@ type WailsAppBinding = {
   StartChatMessageForSessionWithAttachments?: (sessionID: string, prompt: string, attachments: ChatAttachment[]) => Promise<string>;
   StartChatMessageForProjectSession?: (projectID: string, sessionID: string, prompt: string) => Promise<string>;
   StartChatMessageForProjectSessionWithAttachments?: (projectID: string, sessionID: string, prompt: string, attachments: ChatAttachment[]) => Promise<string>;
+	ResumePausedTeamTask?: (projectID: string, sessionID: string) => Promise<string>;
+	AbandonPausedTeamTask?: (projectID: string, sessionID: string) => Promise<WorkbenchState>;
   GuideChatMessage?: (taskID: string, guidanceID: string, prompt: string) => Promise<boolean>;
   GuideChatMessageWithAttachments?: (taskID: string, guidanceID: string, prompt: string, attachments: ChatAttachment[]) => Promise<boolean>;
   StopChatMessage?: (taskID: string) => Promise<boolean>;
@@ -87,6 +89,7 @@ type WailsAppBinding = {
   OpenWorkspaceFile?: (path: string) => Promise<void>;
   ReadWorkspaceFile?: (path: string) => Promise<WorkspaceFilePreview>;
   ReadSkillDetail?: (name: string) => Promise<SkillDetail>;
+  ImportSkillMarkdown?: (fileName: string, content: string) => Promise<SkillImportResult>;
   OpenSkillFile?: (name: string) => Promise<void>;
   RevealSkillFile?: (name: string) => Promise<void>;
   ListWorkspaceDirectory?: (path: string) => Promise<WorkspaceDirectoryListing>;
@@ -446,6 +449,22 @@ export async function startChatMessageForSession(projectID: string, sessionID: s
   return taskID;
 }
 
+export async function resumePausedTeamTask(projectID: string, sessionID: string): Promise<string> {
+  const binding = wailsBinding();
+  if (!binding?.ResumePausedTeamTask) {
+    throw new Error("当前桌面后端版本不支持继续 AI 团队任务，请重启 MHcode。");
+  }
+  return binding.ResumePausedTeamTask(projectID, sessionID);
+}
+
+export async function abandonPausedTeamTask(projectID: string, sessionID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (!binding?.AbandonPausedTeamTask) {
+    throw new Error("当前桌面后端版本不支持结束 AI 团队任务，请重启 MHcode。");
+  }
+  return binding.AbandonPausedTeamTask(projectID, sessionID);
+}
+
 export async function stopChatMessage(taskID: string): Promise<boolean> {
   const binding = wailsBinding();
   if (binding?.StopChatMessage) {
@@ -529,7 +548,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.9",
+  version: "0.3.11",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",
@@ -1230,6 +1249,14 @@ export async function readSkillDetail(name: string): Promise<SkillDetail> {
   };
 }
 
+export async function importSkillMarkdown(fileName: string, content: string): Promise<SkillImportResult> {
+  const binding = wailsBinding();
+  if (binding?.ImportSkillMarkdown) {
+    return binding.ImportSkillMarkdown(fileName, content);
+  }
+  throw new Error("Skill 导入功能仅在 MHcode 桌面应用中可用。");
+}
+
 export async function openSkillFile(name: string): Promise<void> {
   const binding = wailsBinding();
   if (binding?.OpenSkillFile) {
@@ -1746,6 +1773,7 @@ function defaultRuntimeSettings(): RuntimeSettings {
     extraWritableRoots: [],
     toolTimeoutSeconds: 180,
     taskIdleTimeoutSeconds: 300,
+    maxConcurrentSubagents: 4,
     maxCommandSeconds: 120,
     maxCommandMemoryMb: 4096,
     maxCommandCpuPercent: 100,

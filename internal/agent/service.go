@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MISSmihu/MHcode/internal/cache"
 	"github.com/MISSmihu/MHcode/internal/eventlog"
@@ -28,6 +30,7 @@ import (
 type ServiceConfig struct {
 	AppVersion             string
 	SkillsDir              string
+	UserSkillsDir          string
 	SkillsFS               fs.FS
 	DeepSeekBaseURL        string
 	Vault                  vault.Vault
@@ -97,9 +100,12 @@ type ChatResult struct {
 }
 
 type ChatAttachment struct {
-	Name     string `json:"name"`
-	MIMEType string `json:"mimeType"`
-	Data     string `json:"data"`
+	Kind           string `json:"kind,omitempty"`
+	Name           string `json:"name"`
+	MIMEType       string `json:"mimeType"`
+	Data           string `json:"data"`
+	Size           int    `json:"size,omitempty"`
+	CharacterCount int    `json:"characterCount,omitempty"`
 }
 
 type DeepSeekState struct {
@@ -146,7 +152,8 @@ type DeepSeekSessionState struct {
 type Service struct {
 	activityMu                  sync.Mutex
 	subagentMu                  sync.Mutex
-	toolMutationMu              sync.Mutex
+	toolMutationMu              sync.Mutex // fallback for zero-value/test services
+	toolMutationGates           *sync.Map  // shared by detached runtimes, keyed by workspace
 	failureMu                   sync.Mutex
 	artifactMu                  sync.Mutex
 	visualMu                    sync.Mutex
@@ -185,8 +192,11 @@ type Service struct {
 	usageStore                  UsageStore
 	usageLedger                 UsageLedgerState
 	providerFactory             func(chatRoute) (protocol.Provider, error)
+	providerStatusSink          func(string, string, string)
 	anthropicCompatibilityCache *protocol.AnthropicCompatibilityCache
+	anthropicCompatibilitySink  func(protocol.AnthropicCompatibilityFeedback)
 	installationID              string
+	detachedSessionRuntime      bool
 	subagents                   map[string]*subagentControl
 	taskRuntime                 TaskRuntimeState
 	taskRuntimeLastWrite        time.Time
@@ -325,6 +335,7 @@ func NewService(config ServiceConfig) *Service {
 		teamState:                   TeamState{Enabled: runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
 		anthropicCompatibilityCache: protocol.NewAnthropicCompatibilityCache(),
 		installationID:              stableInstallationID(config),
+		toolMutationGates:           &sync.Map{},
 	}
 	if config.UsageStore != nil {
 		svc.usageLedger.Path = config.UsageStore.Path()
@@ -673,14 +684,29 @@ func (s *Service) SendChatGuidanceWithAttachmentsAndEvents(ctx context.Context, 
 	return s.sendChatMessage(context.WithValue(ctx, chatTurnKindKey{}, chatTurnGuidance), prompt, attachments, sink)
 }
 
+// ResumePausedTeamTaskWithEvents resumes a durable AI Team checkpoint without
+// fabricating a user message. Resuming is an explicit user action from the UI;
+// it must never depend on matching conversational wording such as "continue".
+func (s *Service) ResumePausedTeamTaskWithEvents(ctx context.Context, sink ChatEventSink) (ChatResult, error) {
+	return s.sendChatMessage(context.WithValue(ctx, chatTurnKindKey{}, chatTurnTeamResume), "", nil, sink)
+}
+
 type chatTurnKindKey struct{}
 type chatTurnStartedAtKey struct{}
 
-const chatTurnGuidance = "guidance"
+const (
+	chatTurnGuidance   = "guidance"
+	chatTurnTeamResume = "team_resume"
+)
 
 func isGuidanceChatTurn(ctx context.Context) bool {
 	value, _ := ctx.Value(chatTurnKindKey{}).(string)
 	return value == chatTurnGuidance
+}
+
+func isTeamResumeChatTurn(ctx context.Context) bool {
+	value, _ := ctx.Value(chatTurnKindKey{}).(string)
+	return value == chatTurnTeamResume
 }
 
 func chatTurnDurationMs(ctx context.Context) int64 {
@@ -706,7 +732,7 @@ func terminalTurnContent(status string, cause error) string {
 	return "本轮执行失败：" + message
 }
 
-func retainedTurnContent(status, content string, parts []tools.ResultPart, reasoning string) string {
+func retainedTurnContent(status, content string, parts []tools.ResultPart) string {
 	if content = sanitizeModelContent(content); content != "" {
 		return content
 	}
@@ -715,12 +741,6 @@ func retainedTurnContent(status, content string, parts []tools.ResultPart, reaso
 			return "本轮已停止。已经完成的工具与文件操作记录已保留，可以发送“继续”接着执行。"
 		}
 		return "本轮在模型连接失败前已经执行了部分操作。执行记录已保留，可以直接重试或继续。"
-	}
-	if strings.TrimSpace(reasoning) != "" {
-		if status == "cancelled" {
-			return "本轮已停止。模型已经开始处理任务，会话上下文已保留，可以发送“继续”。"
-		}
-		return "模型已经开始处理任务，但未能完成最终回复。会话上下文已保留，可以继续。"
 	}
 	return ""
 }
@@ -767,7 +787,6 @@ func hasMeaningfulResultParts(parts []tools.ResultPart) bool {
 
 func chatResultHasMeaningfulOutput(result ChatResult) bool {
 	return strings.TrimSpace(result.Content) != "" ||
-		strings.TrimSpace(result.Reasoning) != "" ||
 		hasMeaningfulResultParts(result.Parts)
 }
 
@@ -785,14 +804,18 @@ func (s *Service) retainInterruptedTurn(
 		return
 	}
 
-	result.Content = retainedTurnContent(status, result.Content, result.Parts, result.Reasoning)
+	result.Content = retainedTurnContent(status, result.Content, result.Parts)
 	result.Parts = appendTextPartIfMissing(result.Parts, result.Content)
 	var appended bool
 	s.sessionMessages, appended = appendCommittedTurnRequest(s.sessionMessages[:baseMessageCount], requestMessages, baseMessageCount)
 	if !appended {
 		return
 	}
+	assistantStart := len(s.sessionMessages)
 	s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, result.Content, result.Parts)
+	if assistantStart < len(s.sessionMessages) && s.sessionMessages[assistantStart].Role == "assistant" {
+		s.sessionMessages[assistantStart].InternalKind = terminalTurnInternalKind(status)
+	}
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
 	s.sessionState.TurnCount++
@@ -856,6 +879,15 @@ func applyRouteToChatRequest(request *protocol.ChatRequest, route chatRoute) {
 	request.ModelReasoningLevels = append([]string(nil), route.Model.ReasoningLevels...)
 	request.ModelThinkingModes = append([]string(nil), route.Model.ThinkingModes...)
 	request.ModelUnsupportedParameters = append([]string(nil), route.Model.UnsupportedParameters...)
+	resolved := protocol.ResolveReasoningOptionsWithProfile(
+		route.Provider.ReasoningProfile,
+		route.Provider.Protocol,
+		route.Provider.BaseURL,
+		route.ModelID,
+		request.ReasoningLevel,
+	)
+	request.ThinkingMode = resolved.Mode
+	request.ReasoningEffort = resolved.Effort
 }
 
 func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatResult, error) {
@@ -863,6 +895,13 @@ func (s *Service) SendDeepSeekMessage(ctx context.Context, prompt string) (ChatR
 }
 
 func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachments []ChatAttachment, sink ChatEventSink) (result ChatResult, err error) {
+	teamResumeTurn := isTeamResumeChatTurn(ctx)
+	if teamResumeTurn && !s.hasPausedTeamRun() {
+		return ChatResult{State: s.WorkbenchState()}, errors.New("当前会话没有可继续的 AI 团队任务")
+	}
+	if !teamResumeTurn && !isGuidanceChatTurn(ctx) && s.hasPausedTeamRun() {
+		return ChatResult{State: s.WorkbenchState()}, errors.New("当前会话有一个暂停的 AI 团队任务，请先使用“继续任务”或“结束任务”操作")
+	}
 	turnStartedAt := time.Now()
 	ctx = context.WithValue(ctx, chatTurnStartedAtKey{}, turnStartedAt)
 	watchdogTimeout := time.Duration(s.runtimeSettings.TaskIdleTimeoutSeconds) * time.Second
@@ -903,35 +942,42 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if err != nil {
 		return ChatResult{State: s.workbenchStateLocked()}, err
 	}
-	if prompt == "" && len(attachments) == 0 {
+	if prompt == "" && len(attachments) == 0 && !teamResumeTurn {
 		return ChatResult{State: s.workbenchStateLocked()}, errors.New("消息内容不能为空")
 	}
-	ctx, turnWritableRoots, err := s.prepareTurnPathAccess(ctx, prompt)
-	if err != nil {
-		return ChatResult{State: s.workbenchStateLocked()}, err
-	}
-	prompt, err = s.prepareScopedUserPrompt(prompt)
-	if err != nil {
-		return ChatResult{State: s.workbenchStateLocked()}, fmt.Errorf("保存本轮授权凭据失败: %w", err)
+	var turnWritableRoots []string
+	if !teamResumeTurn {
+		ctx, turnWritableRoots, err = s.prepareTurnPathAccess(ctx, prompt)
+		if err != nil {
+			return ChatResult{State: s.workbenchStateLocked()}, err
+		}
+		prompt, err = s.prepareScopedUserPrompt(prompt)
+		if err != nil {
+			return ChatResult{State: s.workbenchStateLocked()}, fmt.Errorf("保存本轮授权凭据失败: %w", err)
+		}
 	}
 
 	route, err := s.selectChatRoute()
 	if err != nil {
 		return ChatResult{State: s.workbenchStateLocked()}, err
 	}
-	if len(attachments) > 0 && strings.EqualFold(route.Provider.Protocol, "deepseek") {
+	if hasImageChatAttachments(attachments) && strings.EqualFold(route.Provider.Protocol, "deepseek") {
 		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errors.New("当前 DeepSeek 原生协议不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
 	}
-	preview := s.contextPreviewForInput(prompt)
+	preview := withMarkdownReferenceDocuments(s.contextPreviewForInputLocked(prompt), attachments)
 	thinkingMode, reasoningEffort := s.thinkingConfigForRoute(route)
 	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
 	turn := s.captureTurnSnapshot()
 	defer func() {
+		err = resolvedTaskContextError(ctx, err)
+		subagentParts := s.finishSubagentTurnWithContext(ctx, err != nil || ctx.Err() != nil)
 		if taskWatchdog != nil {
 			taskWatchdog.pause()
 		}
+		// A silent child can cause the task watchdog to fire while the parent
+		// is joining workers. Re-resolve after the join so this turn rolls back
+		// instead of committing a watchdog-expired result.
 		err = resolvedTaskContextError(ctx, err)
-		subagentParts := s.finishSubagentTurn(err != nil || ctx.Err() != nil)
 		if len(subagentParts) > 0 {
 			result.Parts = mergeOutcomeParts(result.Parts, subagentParts)
 		}
@@ -979,7 +1025,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		}
 		result.Parts = terminalTurnParts(result.Parts, terminalStatus, terminalPlan)
 		if result.TurnCommitted {
-			result.Content = retainedTurnContent(terminalStatus, result.Content, result.Parts, result.Reasoning)
+			result.Content = retainedTurnContent(terminalStatus, result.Content, result.Parts)
 		} else {
 			result.Content = terminalTurnContent(terminalStatus, err)
 		}
@@ -991,30 +1037,36 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		}
 		result.State = s.workbenchStateLocked()
 	}()
-	resumeTeamRun := s.teamModeEnabled() && !isGuidanceChatTurn(ctx) && s.teamResume != nil && isTeamResumePrompt(prompt)
-	if s.teamResume != nil && !resumeTeamRun && !isGuidanceChatTurn(ctx) {
-		abandoned := cloneTeamRunCheckpoint(s.teamResume)
-		abandoned.Status = "abandoned"
-		abandoned.Team.Active = false
-		abandoned.Team.Status = "abandoned"
-		abandoned.Team.CurrentRole = ""
-		if checkpointErr := s.persistTeamRunCheckpoint(abandoned); checkpointErr != nil {
-			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, checkpointErr
-		}
-	}
+	resumeTeamRun := teamResumeTurn
 	s.turnChanges = s.turnChanges[:turn.changeStart]
-	s.sessionMessages = appendTurnRequestMessages(
-		s.sessionMessages,
-		preview,
-		prompt,
-		protocolAttachments(attachments),
-	)
+	baseMessageCount := len(s.sessionMessages)
+	if !resumeTeamRun {
+		s.sessionMessages = appendTurnRequestMessages(
+			s.sessionMessages,
+			preview,
+			prompt,
+			protocolAttachments(attachments),
+		)
+		baseMessageCount = currentTurnMessageStart(s.sessionMessages)
+	}
 	compression, compressionErr := s.prepareSessionContextWithEvents(route, sink)
 	if compressionErr != nil {
-		s.sessionMessages = s.sessionMessages[:currentTurnMessageStart(s.sessionMessages)]
+		if baseMessageCount >= 0 && baseMessageCount <= len(s.sessionMessages) {
+			s.sessionMessages = s.sessionMessages[:baseMessageCount]
+		}
 		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, compressionErr
 	}
-	baseMessageCount := currentTurnMessageStart(s.sessionMessages)
+	// Compression rebuilds the message slice and can move the current turn.
+	// Every later rollback/retention slice must use an index into that rebuilt
+	// request, not the pre-compression message count.
+	if resumeTeamRun {
+		baseMessageCount = len(s.sessionMessages)
+	} else {
+		baseMessageCount = currentTurnMessageStart(s.sessionMessages)
+		if baseMessageCount >= len(s.sessionMessages) {
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errors.New("自动压缩后无法定位当前用户消息")
+		}
+	}
 	if !compression.Compressed {
 		emitChatEvent(sink, ChatStreamEvent{
 			Type:    "status",
@@ -1022,7 +1074,9 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 			Model:   route.ModelID,
 		})
 	}
-	s.recordUserEventWithAttachments(prompt, attachments)
+	if !resumeTeamRun {
+		s.recordUserEventWithAttachments(prompt, attachments)
+	}
 	requestMessages := cloneProtocolMessages(s.sessionMessages)
 	prefixDiagnostic := s.compareRequestPrefix(requestMessages)
 
@@ -1052,7 +1106,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 			"approval_policy":   strings.TrimSpace(requestSettings.ApprovalPolicy),
 		},
 		ToolChoice:        "auto",
-		ParallelToolCalls: false,
+		ParallelToolCalls: true,
 		Store:             false,
 		Include:           []string{"reasoning.encrypted_content"},
 		PromptCacheKey:    requestSessionID,
@@ -1076,7 +1130,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	// 工具循环按任务需要持续运行。推理档位只控制模型推理、上下文和规划策略，
 	// 不再以固定调用次数截断长任务。
 	profile, _ := ReasoningProfileFor(s.reasoning)
-	if s.teamModeEnabled() && !isGuidanceChatTurn(ctx) {
+	if (s.teamModeEnabled() || resumeTeamRun) && !isGuidanceChatTurn(ctx) {
 		if !profile.Budget.Planner {
 			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errTeamModeRequiresPlanner
 		}
@@ -1123,6 +1177,19 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 
 	answer := sanitizeModelContent(completion.Content)
 	noticeParts := providerNoticeParts(completion.Notices)
+	if answer == "" {
+		s.sessionMessages = s.sessionMessages[:baseMessageCount]
+		s.markChatProviderStatus(route.Provider.ID, "error", errEmptyModelResponse.Error())
+		result := ChatResult{
+			Reasoning: completion.Reasoning,
+			Model:     route.ModelID,
+			Usage:     s.metrics,
+			State:     s.workbenchStateLocked(),
+			Parts:     noticeParts,
+		}
+		s.retainInterruptedTurn(&result, "failed", requestMessages, baseMessageCount, prefixDiagnostic)
+		return result, errEmptyModelResponse
+	}
 	s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, noticeParts)
 	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
 	s.sessionState.MessageCount = len(s.sessionMessages)
@@ -1176,7 +1243,7 @@ func cloneWorkbenchState(state WorkbenchState) WorkbenchState {
 }
 
 func (s *Service) workbenchStateLocked() WorkbenchState {
-	preview := s.contextPreview()
+	preview := s.contextPreviewForInputLocked("")
 	return s.workbenchStateWithPreview(preview)
 }
 
@@ -1196,6 +1263,9 @@ func (s *Service) ConfigureMCP(ctx context.Context, serverID string) WorkbenchSt
 }
 
 func (s *Service) Close() {
+	if s.detachedSessionRuntime {
+		return
+	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.mcpManager != nil {
@@ -1267,7 +1337,12 @@ func (s *Service) builtinToolSnapshot() mcp.ServerSnapshot {
 }
 
 func (s *Service) contextPreview() RequestContext {
-	return s.contextPreviewForInput("")
+	if s == nil {
+		return RequestContext{}
+	}
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.contextPreviewForInputLocked("")
 }
 
 func (s *Service) providerSessionID() string {
@@ -1283,6 +1358,18 @@ func (s *Service) providerSessionID() string {
 }
 
 func (s *Service) contextPreviewForInput(userInput string) RequestContext {
+	if s == nil {
+		return RequestContext{}
+	}
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.contextPreviewForInputLocked(userInput)
+}
+
+// contextPreviewForInputLocked is called while stateMu is already held by
+// task, settings, and workbench-state paths. The public helper above remains
+// safe for callers that only need an inspection snapshot.
+func (s *Service) contextPreviewForInputLocked(userInput string) RequestContext {
 	profile, _ := ReasoningProfileFor(s.reasoning)
 	index := s.loadSkillsIndex()
 	snapshots := s.mcpSnapshots()
@@ -1295,53 +1382,34 @@ func (s *Service) contextPreviewForInput(userInput string) RequestContext {
 		"完整、准确地回答当前任务；内容结构和详细程度应与任务复杂度及用户要求匹配，不强制使用固定摘要模板。",
 		"涉及代码、产物或外部对象时，保留有助于用户核验的文件路径、行号和对象 ID。",
 	}
-	if localEnvironmentDiagnosticRequest(userInput) {
-		outputRequirements = append(outputRequirements,
-			"这是本机状态诊断任务。优先使用已授权的本机结构化工具核验真实配置、环境和运行状态；权限不足时明确请求所需权限，不能用网络搜索结果冒充本机检查。",
-			"网络搜索只用于定位官方文档、官网或真实仓库；找到候选来源后必须读取权威页面，并将其与本机证据对照后再下结论。",
-		)
-	}
 	if sshContext := s.scopedSSHContext(userInput); sshContext != "" {
 		outputRequirements = append(outputRequirements, sshContext)
 	}
 	return s.builder.Build(StableContext{
 		ProductIdentity: "MHcode 是面向开发、研究与文档工作的可执行 AI 工作台。",
 		SystemRules: []string{
-			"工具结果先摘要，再用 raw_result_id 引用原文。",
-			"遇到 1-3 个彼此独立且能明显并行推进的探索、审阅或实现子任务时，可使用 delegate_task；它会立即返回，子代理在后台运行且不得递归委派。",
-			"启动子代理后，先继续主 Agent 可独立完成且文件范围不重叠的工作；只在需要结果或准备最终综合时调用 await_subagents，不要启动后立刻空等。",
+			"工具结果通过结构化摘要、工具调用 ID、文件路径和持久化时间线保留；需要更多证据时继续调用对应读取工具，不得假设存在未公开的原始结果接口。",
+			"模型负责理解任务并决定是否澄清、规划、调用工具、委派、重试或直接回答；宿主只执行已选择的动作，并强制权限、审批、路径、超时和安全边界。",
+			"长任务可在已确认事实、开始验证或改变失败策略等可核验节点调用 report_progress 更新用户时间线；不得把私有思维链、未验证猜测或敏感信息写入进展。",
+			"彼此独立的读取或检查可以在同一模型回合提出多个工具调用；可能冲突的写入仍由宿主串行化并执行审批。",
+			"子代理只应用于真正独立、可并行且文件范围不重叠的子任务。是否委派及何时收集结果由模型根据任务证据决定。",
 			"密码 SSH 通过主机托管的不透明凭据引用直接认证，不需要 SSH Key、ssh-agent 或外部授权条目。",
-			"用户明确要求读取已授权目标系统中的账号、密码或令牌时，使用 ssh.capture_secret 将目标值交给本机凭据库；模型和事件日志不得接收明文。SSH 登录密码永远不可返回。",
+			"用户明确要求读取已授权目标系统中的账号、密码或令牌时，使用 ssh.capture_secret 将目标值交给本机凭据库；每个请求字段必须分别生成独立的受保护结果，全部字段均已捕获后才能宣称交付完成。相关账号和密码会由 UI 自动合并为一张登录凭据卡，不要向用户解释逐字段捕获的内部实现。连接凭据不得进入模型、事件日志或普通回复；目标系统字段即使恰好与连接密码相同，仍可通过受保护结果交付。",
 		},
-		RuntimePolicy:  s.runtimePolicyContext(),
-		Reasoning:      profile,
-		SkillsIndex:    index,
-		MCPSnapshots:   snapshots,
-		ProjectSummary: stableProject,
-		RoutingPolicy:  "Use the selected provider and protocol; preserve history across compatible route changes.",
+		RuntimePolicy:    s.runtimePolicyContext(),
+		Reasoning:        profile,
+		SkillsIndex:      index,
+		PersistentSkills: s.loadPersistentSkills(index),
+		MCPSnapshots:     snapshots,
+		ProjectSummary:   stableProject,
+		RoutingPolicy:    "Use the selected provider and protocol; preserve history across compatible route changes.",
 	}, VolatileContext{
 		UserInput:          volatileInput,
 		TriggeredSkills:    s.loadTriggeredSkills(userInput, index),
 		ProjectContext:     volatileProject,
-		ExecutionState:     s.continuationExecutionContext(userInput),
+		ExecutionState:     s.continuationExecutionContextLocked(userInput),
 		OutputRequirements: outputRequirements,
 	})
-}
-
-func localEnvironmentDiagnosticRequest(input string) bool {
-	input = strings.ToLower(strings.TrimSpace(input))
-	if input == "" {
-		return false
-	}
-	local := containsAny(input,
-		"我的", "本机", "电脑", "桌面版", "当前安装", "当前配置", "appdata", "%appdata%",
-		"my computer", "my pc", "local machine", "desktop app", "installed app",
-	)
-	diagnostic := containsAny(input,
-		"检查", "看看", "问题", "配置", "设置", "环境变量", "中转", "型号", "模型", "仍然", "还是", "生效", "出了问题",
-		"diagnos", "config", "setting", "environment", "provider", "model", "still", "not working",
-	)
-	return local && diagnostic
 }
 
 func (s *Service) runtimePolicyContext() string {
@@ -1595,44 +1663,93 @@ func cloneProtocolMessages(messages []protocol.Message) []protocol.Message {
 
 func normalizeChatAttachments(attachments []ChatAttachment) ([]ChatAttachment, error) {
 	const (
-		maxAttachments = 4
-		maxImageBytes  = 6 * 1024 * 1024
-		maxTotalBytes  = 12 * 1024 * 1024
+		maxImages             = 4
+		maxMarkdownDocuments  = 5
+		maxImageBytes         = 6 * 1024 * 1024
+		maxImageTotalBytes    = 12 * 1024 * 1024
+		maxMarkdownBytes      = 128 * 1024
+		maxMarkdownTotalBytes = 256 * 1024
 	)
-	if len(attachments) > maxAttachments {
-		return nil, fmt.Errorf("一次最多粘贴 %d 张图片", maxAttachments)
-	}
-	allowed := map[string]bool{
+	allowedImages := map[string]bool{
 		"image/png":  true,
 		"image/jpeg": true,
 		"image/webp": true,
 		"image/gif":  true,
 	}
 	normalized := make([]ChatAttachment, 0, len(attachments))
-	totalBytes := 0
+	imageCount := 0
+	markdownCount := 0
+	imageTotalBytes := 0
+	markdownTotalBytes := 0
 	for index, attachment := range attachments {
 		attachment.Name = filepath.Base(strings.TrimSpace(attachment.Name))
-		if attachment.Name == "" || attachment.Name == "." {
-			attachment.Name = fmt.Sprintf("image-%d.png", index+1)
-		}
 		attachment.MIMEType = strings.ToLower(strings.TrimSpace(attachment.MIMEType))
 		attachment.Data = strings.TrimSpace(attachment.Data)
-		if !allowed[attachment.MIMEType] {
-			return nil, fmt.Errorf("不支持图片格式 %q，仅支持 PNG、JPEG、WebP 和 GIF", attachment.MIMEType)
-		}
 		decoded, err := base64.StdEncoding.DecodeString(attachment.Data)
 		if err != nil {
-			return nil, fmt.Errorf("图片 %s 的数据无效", attachment.Name)
+			return nil, fmt.Errorf("附件 %s 的数据无效", attachment.Name)
 		}
 		if len(decoded) == 0 {
-			return nil, fmt.Errorf("图片 %s 为空", attachment.Name)
+			return nil, fmt.Errorf("附件 %s 为空", attachment.Name)
 		}
-		if len(decoded) > maxImageBytes {
-			return nil, fmt.Errorf("图片 %s 超过 6 MB", attachment.Name)
-		}
-		totalBytes += len(decoded)
-		if totalBytes > maxTotalBytes {
-			return nil, errors.New("图片总大小不能超过 12 MB")
+
+		switch chatAttachmentKind(attachment) {
+		case chatAttachmentKindImage:
+			imageCount++
+			if imageCount > maxImages {
+				return nil, fmt.Errorf("一次最多添加 %d 张图片", maxImages)
+			}
+			if attachment.Name == "" || attachment.Name == "." {
+				attachment.Name = fmt.Sprintf("image-%d.png", index+1)
+			}
+			if !allowedImages[attachment.MIMEType] {
+				return nil, fmt.Errorf("不支持图片格式 %q，仅支持 PNG、JPEG、WebP 和 GIF", attachment.MIMEType)
+			}
+			if len(decoded) > maxImageBytes {
+				return nil, fmt.Errorf("图片 %s 超过 6 MB", attachment.Name)
+			}
+			imageTotalBytes += len(decoded)
+			if imageTotalBytes > maxImageTotalBytes {
+				return nil, errors.New("图片总大小不能超过 12 MB")
+			}
+			attachment.Kind = chatAttachmentKindImage
+			attachment.Size = len(decoded)
+			attachment.CharacterCount = 0
+
+		case chatAttachmentKindDocument:
+			markdownCount++
+			if markdownCount > maxMarkdownDocuments {
+				return nil, fmt.Errorf("一次最多添加 %d 个 Markdown 文件", maxMarkdownDocuments)
+			}
+			if attachment.Name == "" || attachment.Name == "." {
+				attachment.Name = fmt.Sprintf("reference-%d.md", index+1)
+			}
+			extension := strings.ToLower(filepath.Ext(attachment.Name))
+			if extension != ".md" && extension != ".markdown" {
+				return nil, fmt.Errorf("Markdown 附件 %s 的扩展名无效", attachment.Name)
+			}
+			if attachment.MIMEType != "text/markdown" && attachment.MIMEType != "text/x-markdown" && attachment.MIMEType != "text/plain" {
+				return nil, fmt.Errorf("不支持文档格式 %q，仅支持 Markdown", attachment.MIMEType)
+			}
+			decoded = []byte(strings.TrimPrefix(string(decoded), "\ufeff"))
+			if !utf8.Valid(decoded) || strings.ContainsRune(string(decoded), '\x00') {
+				return nil, fmt.Errorf("Markdown 文件 %s 必须是有效的 UTF-8 文本", attachment.Name)
+			}
+			if len(decoded) > maxMarkdownBytes {
+				return nil, fmt.Errorf("Markdown 文件 %s 超过 128 KiB", attachment.Name)
+			}
+			markdownTotalBytes += len(decoded)
+			if markdownTotalBytes > maxMarkdownTotalBytes {
+				return nil, errors.New("Markdown 文件总大小不能超过 256 KiB")
+			}
+			attachment.Kind = chatAttachmentKindDocument
+			attachment.MIMEType = "text/markdown"
+			attachment.Data = base64.StdEncoding.EncodeToString(decoded)
+			attachment.Size = len(decoded)
+			attachment.CharacterCount = utf8.RuneCount(decoded)
+
+		default:
+			return nil, fmt.Errorf("不支持附件格式 %q", attachment.MIMEType)
 		}
 		normalized = append(normalized, attachment)
 	}
@@ -1645,6 +1762,9 @@ func protocolAttachments(attachments []ChatAttachment) []protocol.Attachment {
 	}
 	converted := make([]protocol.Attachment, 0, len(attachments))
 	for _, attachment := range attachments {
+		if chatAttachmentKind(attachment) != chatAttachmentKindImage {
+			continue
+		}
 		converted = append(converted, protocol.Attachment{
 			Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
 		})
@@ -1885,6 +2005,22 @@ func (s *Service) chatProviderForRoute(route chatRoute) (protocol.Provider, erro
 }
 
 func (s *Service) rememberAnthropicCompatibility(feedback protocol.AnthropicCompatibilityFeedback) {
+	if s.anthropicCompatibilitySink != nil {
+		s.anthropicCompatibilitySink(feedback)
+		return
+	}
+	s.rememberAnthropicCompatibilityLocal(feedback)
+}
+
+func (s *Service) applySessionAnthropicCompatibility(feedback protocol.AnthropicCompatibilityFeedback) {
+	s.stateMu.Lock()
+	s.rememberAnthropicCompatibilityLocal(feedback)
+	state := s.workbenchStateLocked()
+	s.stateMu.Unlock()
+	s.storeWorkbenchSnapshot(state)
+}
+
+func (s *Service) rememberAnthropicCompatibilityLocal(feedback protocol.AnthropicCompatibilityFeedback) {
 	providerID := strings.TrimSpace(feedback.ProviderID)
 	modelID := strings.TrimSpace(feedback.ModelID)
 	parameters := normalizeProviderUnsupportedParameters(feedback.UnsupportedParameters)
@@ -2022,11 +2158,14 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- MHcode supports direct password-based SSH when the user supplies a host, username, and password. No SSH key, ssh-agent, or external provider authorization entry is required.",
 		"- A token beginning with mhcode-credential:// is an opaque host-managed password reference, not an SSH key or an external authorization entry. Use its ID with the ssh tool; never claim that the referenced password is unavailable or ask the user to paste it into a shell command.",
 		"- Password-based SSH authentication does not use ssh-add or ssh-agent. Never run ssh-add unless the user explicitly asks to inspect or manage local SSH keys.",
-		"- For an authorized remote deployment, use ssh test first when needed, then ssh run, upload_file, or upload_directory. Never place passwords in command text, environment variables, files, plans, tool summaries, or replies.",
-		"- When the user explicitly asks to retrieve an account password, token, or other sensitive value from an authorized target system, use ssh action=capture_secret with a command that prints only the requested value. The host will store it and show the user reveal/copy controls; never use ordinary ssh run for that value, never echo it in model-visible text, and stop further discovery once capture_secret succeeds.",
-		"- For an authorized remote credential lookup, inspect the named target over SSH before using web search or repository tools. Check the running service, its launch configuration, environment, and actual config files. If the stored value is a one-way hash, explain that the original cannot be recovered and offer a confirmed rotation; do not browse unrelated repositories or reset the value without approval.",
-		"- For a substantive multi-step task, call update_plan before implementation and when a plan step materially changes state. Send the full checklist each time, keep at most one step in_progress, skip it for simple questions, and do not interrupt useful work with unchanged or cosmetic plan updates.",
-		"- During long-running work, provide one brief user-facing progress sentence before a meaningful batch of tool calls and after a material result changes the approach. State what evidence is being checked and the next action without exposing private reasoning. Do not narrate routine heartbeats or unchanged status.",
+		"- Decide the task strategy yourself from the user request and verified evidence. Do not wait for host keyword routing to choose tools, plans, or a retry path.",
+		"- First decide whether the current request warrants a direct answer, a concise clarification, investigation, visible planning, or tool execution. Do not use tools merely to appear active; when action is warranted, keep the user informed with verifiable progress and evidence.",
+		"- Complete ordinary autonomous work in the current turn. After a preliminary check or progress update, continue with the necessary tools without asking the user to reply with 'continue'. Ask for user input only when a decision, missing information, permission, approval, or external action genuinely blocks further progress.",
+		"- For authorized remote work, choose ssh test, ssh run, upload_file, upload_directory, or capture_secret only when each action is useful to the current objective. Never place passwords in command text, environment variables, files, plans, tool summaries, or replies.",
+		"- When the user explicitly asks to retrieve one or more account names, passwords, tokens, or other sensitive values from an authorized target system, use ssh action=capture_secret with a command that prints exactly one requested field. Call it separately for every requested field so each field has its own protected result; a stored account does not satisfy a requested password, and you must not claim that any uncaptured field was delivered.",
+		"- Connection credentials must never appear in model-visible text, tool summaries, event logs, plans, or ordinary replies. If a requested target-system field happens to equal the SSH connection password, capture_secret may still deliver that field through the protected reveal/copy result because its plaintext remains host-managed.",
+		"- Use update_plan when a visible plan will materially help the user follow a substantive task. Keep it current when you use it, but do not create a cosmetic plan for simple work.",
+		"- For a task requiring multiple substantive tool actions, call report_progress before the first action and after each meaningful evidence, wait/retry, or strategy change. Do not defer all progress until completion. State verified evidence and the next action without exposing private reasoning; actual tool activity is shown separately by MHcode.",
 		"- Workspace tools are already rooted at the active project. Start ordinary project exploration with list_dir path '.' and use relative paths. When the user explicitly supplies an absolute target and the host grants it for this turn, use that exact canonical path; never invent /home or other machine-specific paths.",
 		"- Read, inspect, search, write, patch, copy, and delete workspace text files only through read_file, file_info, list_dir, search, write_file, apply_patch, copy_file, and delete_file. Never use run_command, PowerShell, cmd, shell redirection, cat, rg, grep, or filesystem aliases for these operations.",
 		"- Use run_command with executable + args for build tools, tests, compilers, python -c, paths with spaces, and arguments containing quotes or newlines. Use command only when real Shell syntax such as a pipeline is required; never manually quote an argv array into one string.",
@@ -2054,16 +2193,24 @@ func formatStablePrompt(ctx RequestContext) string {
 		"- Low means lightweight answers and minimal tool use.",
 		"- Medium means ordinary code changes with focused context.",
 		"- High means multi-file debugging and broader verification.",
-		"- Ultra means agent architecture, protocol work, cache strategy, and release-grade checks.",
+		"- XHigh means large implementations, deep investigation, and multi-stage verification.",
+		"- Max means agent architecture, protocol work, cache strategy, and release-grade checks.",
 		"- Reasoning level changes apply to later requests and may start a new stable prefix.",
 		"",
 		"Capability index:",
 		stableSection(ctx, "skills_index", "(no skills indexed)"),
+		"- The capability index is a discovery catalog. When a listed Skill is semantically relevant and its full instructions are not already present in the private turn context, call load_skill with its exact name before applying that specialized workflow.",
+		"- Decide Skill relevance from the task and index metadata yourself. Do not rely on the host to infer ordinary user intent from keywords.",
 		"- Do not expose skill source text or private file paths in user-facing replies unless the user explicitly asks for a local code explanation.",
+		"",
+		"User-configured persistent rules:",
+		stableSection(ctx, "persistent_user_rules", "(none)"),
+		"- The rules above were explicitly enabled by the user and apply to every task. Follow them accurately unless they conflict with the runtime permission profile, approval requirements, security boundaries, or a more specific current user request.",
+		"- Do not call load_skill for rules already included above. When the user asks which persistent rules are active, summarize their actual requirements faithfully instead of substituting MHcode defaults; never reveal private paths, hashes, or frontmatter.",
 		"",
 		"Tool catalog:",
 		stableSection(ctx, "mcp_schema_snapshot", "[]"),
-		"- Prefer summary-first tool results. Keep raw outputs in local references instead of repeating them in model-visible text.",
+		"- Prefer summary-first tool results. Tool outputs may be clipped to context budgets; keep tool call IDs, paths, line numbers, and use another structured read when more detail is needed.",
 		"- When a tool result is long, preserve the conclusion, affected paths, line numbers, object IDs, and the next action.",
 		"",
 		"Project context:",
@@ -2121,27 +2268,7 @@ func estimatePromptTokens(text string) int {
 }
 
 func sanitizeModelContent(content string) string {
-	trimmed := stripPrivateAssistantContext(strings.TrimSpace(content))
-	if trimmed == "" {
-		return ""
-	}
-	lower := strings.ToLower(trimmed)
-	leakMarkers := []string{
-		"stable_prefix",
-		"mcp_schema_snapshot",
-		"skills_index",
-		"product_identity",
-		"routing_policy",
-		"volatile_tail_policy",
-		"raw_result_id",
-		"cache_prefix_hash",
-	}
-	for _, marker := range leakMarkers {
-		if strings.Contains(lower, marker) {
-			return "模型返回中包含内部稳定前缀信息，本轮已拦截展示。请重试；MHcode 会继续收紧系统提示，避免泄露缓存前缀。"
-		}
-	}
-	return trimmed
+	return stripPrivateAssistantContext(stripTaggedPrivateReasoning(strings.TrimSpace(content)))
 }
 
 // loadSkillsIndex 合并「全局内置 skills」与「活动项目工作区下的 skills/」。
@@ -2175,12 +2302,15 @@ func (s *Service) loadSkillsIndex() []skills.IndexEntry {
 }
 
 func (s *Service) skillLoaders() []skills.Loader {
-	loaders := make([]skills.Loader, 0, 3)
+	loaders := make([]skills.Loader, 0, 4)
 	if s.config.SkillsFS != nil {
 		loaders = append(loaders, skills.NewFSLoader(s.config.SkillsFS, "skills").WithOrigin("bundled"))
 	}
 	if dir := strings.TrimSpace(s.config.SkillsDir); dir != "" {
 		loaders = append(loaders, skills.NewLoader(dir).WithOrigin("local"))
+	}
+	if dir := strings.TrimSpace(s.config.UserSkillsDir); dir != "" && !sameFilesystemPath(dir, s.config.SkillsDir) {
+		loaders = append(loaders, skills.NewLoader(dir).WithOrigin("user"))
 	}
 	if root := strings.TrimSpace(s.runtimeSettings.WorkspaceRoot); root != "" {
 		loaders = append(loaders, skills.NewLoader(filepath.Join(root, "skills")).WithOrigin("project"))
@@ -2188,19 +2318,90 @@ func (s *Service) skillLoaders() []skills.Loader {
 	return loaders
 }
 
+func sameFilesystemPath(left, right string) bool {
+	left = filepath.Clean(strings.TrimSpace(left))
+	right = filepath.Clean(strings.TrimSpace(right))
+	if left == "." || right == "." || left == "" || right == "" {
+		return left == right
+	}
+	return strings.EqualFold(left, right)
+}
+
+const (
+	triggeredSkillBudgetMinimalTokens  = 2_048
+	triggeredSkillBudgetStandardTokens = 4_096
+	triggeredSkillBudgetExpandedTokens = 8_192
+	triggeredSkillBudgetFullTokens     = 12_288
+	persistentSkillBudgetTokens        = 12_288
+)
+
+type triggeredSkillCandidate struct {
+	entry    skills.IndexEntry
+	priority int
+	order    int
+}
+
+func (s *Service) loadPersistentSkills(index []skills.IndexEntry) []string {
+	entries := make([]skills.IndexEntry, 0, len(index))
+	for _, entry := range index {
+		if !entry.Disabled && isPersistentSkillEntry(entry) {
+			entries = append(entries, entry)
+		}
+	}
+	return s.loadSkillContents(entries, persistentSkillBudgetTokens)
+}
+
+func isPersistentSkillEntry(entry skills.IndexEntry) bool {
+	mode := strings.ToLower(strings.TrimSpace(entry.TriggerMode))
+	if mode == "always" {
+		return true
+	}
+	// UserSkillsDir was introduced before activation sidecars. Treat those
+	// existing imports as persistent rules so upgrading does not require users
+	// to delete and re-import their Markdown files.
+	return strings.EqualFold(strings.TrimSpace(entry.Source), "user") && mode == "description"
+}
+
 func (s *Service) loadTriggeredSkills(prompt string, index []skills.IndexEntry) []string {
 	if strings.TrimSpace(prompt) == "" || len(index) == 0 {
 		return nil
 	}
+	candidates := make([]triggeredSkillCandidate, 0, len(index))
+	for order, entry := range index {
+		if entry.Disabled || isPersistentSkillEntry(entry) {
+			continue
+		}
+		priority := skillMatchPriority(entry, prompt)
+		if priority == 0 {
+			continue
+		}
+		candidates = append(candidates, triggeredSkillCandidate{entry: entry, priority: priority, order: order})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.SliceStable(candidates, func(left, right int) bool {
+		if candidates[left].priority != candidates[right].priority {
+			return candidates[left].priority > candidates[right].priority
+		}
+		return candidates[left].order < candidates[right].order
+	})
+
+	entries := make([]skills.IndexEntry, 0, len(candidates))
+	for _, candidate := range candidates {
+		entries = append(entries, candidate.entry)
+	}
+	return s.loadSkillContents(entries, triggeredSkillTokenBudget(s.reasoning))
+}
+
+func (s *Service) loadSkillContents(entries []skills.IndexEntry, budget int) []string {
+	if len(entries) == 0 || budget <= 0 {
+		return nil
+	}
 	loaders := s.skillLoaders()
-	loaded := make([]string, 0, 2)
-	for _, entry := range index {
-		if entry.Disabled {
-			continue
-		}
-		if !skillMatchesPrompt(entry, prompt) {
-			continue
-		}
+	remaining := budget
+	loaded := make([]string, 0, len(entries))
+	for _, entry := range entries {
 		var skill skills.LoadedSkill
 		var err error
 		for loaderIndex := len(loaders) - 1; loaderIndex >= 0; loaderIndex-- {
@@ -2212,8 +2413,20 @@ func (s *Service) loadTriggeredSkills(prompt string, index []skills.IndexEntry) 
 		if err != nil || skill.Content == "" {
 			continue
 		}
-		loaded = append(loaded, fmt.Sprintf("skill: %s\nsha256: %s\n%s", skill.Name, skill.SHA256, skill.Content))
-		if len(loaded) >= 2 {
+		content := fmt.Sprintf("skill: %s\nsha256: %s\n%s", skill.Name, skill.SHA256, skill.Content)
+		tokens := estimatePromptTokens(content)
+		if tokens > remaining {
+			if len(loaded) == 0 && remaining > 0 {
+				content = clipTextToTokenBudget(content, remaining)
+				if strings.TrimSpace(content) != "" {
+					loaded = append(loaded, content)
+				}
+			}
+			break
+		}
+		loaded = append(loaded, content)
+		remaining -= tokens
+		if remaining <= 0 {
 			break
 		}
 	}
@@ -2221,35 +2434,76 @@ func (s *Service) loadTriggeredSkills(prompt string, index []skills.IndexEntry) 
 }
 
 func skillMatchesPrompt(entry skills.IndexEntry, prompt string) bool {
+	return skillMatchPriority(entry, prompt) > 0
+}
+
+func skillMatchPriority(entry skills.IndexEntry, prompt string) int {
+	if isPersistentSkillEntry(entry) {
+		return 0
+	}
 	prompt = strings.ToLower(strings.TrimSpace(prompt))
 	if prompt == "" {
-		return false
+		return 0
 	}
 	if containsSkillTrigger(prompt, entry.Name) {
-		return true
+		return 3
 	}
 
 	switch strings.ToLower(strings.TrimSpace(entry.TriggerMode)) {
 	case "manual":
-		return false
+		return 0
 	case "explicit":
 		for _, trigger := range splitSkillTriggers(entry.Trigger) {
 			if containsSkillTrigger(prompt, trigger) {
-				return true
+				return 2
 			}
 		}
-		return false
+		return 0
 	}
 
-	// Legacy third-party skills did not have an explicit trigger field. Keep
-	// exact description matching for them, but never split a skill name into
-	// generic fragments such as "agent" or "core".
-	for _, candidate := range []string{entry.Trigger, entry.Description} {
-		if containsSkillTrigger(prompt, candidate) {
-			return true
+	// Legacy skills without explicit activation metadata remain discoverable
+	// through the stable index and load_skill. Their prose descriptions must
+	// not become host-side intent routing rules.
+	return 0
+}
+
+func triggeredSkillTokenBudget(level ReasoningLevel) int {
+	switch level {
+	case ReasoningNone, ReasoningLow:
+		return triggeredSkillBudgetMinimalTokens
+	case ReasoningMedium:
+		return triggeredSkillBudgetStandardTokens
+	case ReasoningHigh:
+		return triggeredSkillBudgetExpandedTokens
+	case ReasoningXHigh, ReasoningMax:
+		return triggeredSkillBudgetFullTokens
+	default:
+		return triggeredSkillBudgetStandardTokens
+	}
+}
+
+func clipTextToTokenBudget(value string, budget int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || budget <= 0 {
+		return ""
+	}
+	if estimatePromptTokens(value) <= budget {
+		return value
+	}
+	runes := []rune(value)
+	low, high := 1, len(runes)
+	best := ""
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := clipContextText(value, middle)
+		if estimatePromptTokens(candidate) <= budget {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
 		}
 	}
-	return false
+	return strings.TrimSpace(best)
 }
 
 func splitSkillTriggers(value string) []string {
@@ -2379,6 +2633,22 @@ func (s *Service) syncDeepSeekStateFromProvider(provider ModelProviderSetting, m
 }
 
 func (s *Service) markChatProviderStatus(providerID string, status string, message string) {
+	if s.providerStatusSink != nil {
+		s.providerStatusSink(providerID, status, message)
+		return
+	}
+	s.markChatProviderStatusLocal(providerID, status, message)
+}
+
+func (s *Service) applySessionProviderStatus(providerID string, status string, message string) {
+	s.stateMu.Lock()
+	s.markChatProviderStatusLocal(providerID, status, message)
+	state := s.workbenchStateLocked()
+	s.stateMu.Unlock()
+	s.storeWorkbenchSnapshot(state)
+}
+
+func (s *Service) markChatProviderStatusLocal(providerID string, status string, message string) {
 	s.modelCapabilityMu.Lock()
 	defer s.modelCapabilityMu.Unlock()
 	settings := s.runtimeSettings.Normalized()

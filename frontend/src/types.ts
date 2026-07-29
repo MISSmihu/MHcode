@@ -31,6 +31,12 @@ export type SkillDetail = SkillIndexEntry & {
   canOpen: boolean;
 };
 
+export type SkillImportResult = {
+  name: string;
+  skill: SkillDetail;
+  state: WorkbenchState;
+};
+
 export type ToolDescriptor = {
   name: string;
   inputSchemaHash: string;
@@ -162,6 +168,7 @@ export type RuntimeSettings = {
   extraWritableRoots: string[];
   toolTimeoutSeconds: number;
   taskIdleTimeoutSeconds: number;
+  maxConcurrentSubagents: number;
   maxCommandSeconds: number;
   maxCommandMemoryMb: number;
   maxCommandCpuPercent: number;
@@ -665,7 +672,7 @@ export type TeamState = {
   enabled: boolean;
   active: boolean;
   runId?: string;
-  status: "idle" | "running" | "completed" | "failed" | "cancelled" | string;
+  status: "idle" | "running" | "paused" | "completed" | "failed" | "cancelled" | string;
   currentRole?: TeamRole | string;
   roles: TeamRoleState[];
   startedAt?: string;
@@ -677,7 +684,7 @@ export type TeamRoleState = {
   role: TeamRole;
   label: string;
   enabled: boolean;
-  status: "pending" | "running" | "completed" | "error" | "skipped" | string;
+  status: "pending" | "running" | "paused" | "completed" | "error" | "cancelled" | "skipped" | string;
   providerId?: string;
   model?: string;
   attempt: number;
@@ -742,9 +749,12 @@ export type ChatTaskState = {
 };
 
 export type ChatAttachment = {
+  kind?: "image" | "document" | string;
   name: string;
   mimeType: string;
   data: string;
+  size?: number;
+  characterCount?: number;
 };
 
 export type LiveUsageState = {
@@ -1009,6 +1019,7 @@ export type MessagePart =
       kind: "timeline_note";
       message: string;
       status?: "running" | "waiting" | "retrying" | "completed" | "failed" | "cancelled" | "interrupted" | string;
+	  toolCallId?: string;
       startedAt?: string;
       completedAt?: string;
       durationMs?: number;

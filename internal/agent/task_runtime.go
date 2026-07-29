@@ -102,6 +102,10 @@ func (s *Service) RecordTaskStreamEvent(taskID string, event ChatStreamEvent) er
 	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) || s.taskRuntime.Terminal() {
 		return nil
 	}
+	// Live stream states are deliberately non-terminal. FinishTaskRuntime owns
+	// the final merge and remains allowed to replace a prior live snapshot; once
+	// it has committed a terminal state, late provider or tool events must not
+	// revive or mutate the completed task.
 	applyTaskStreamEvent(&s.taskRuntime, event)
 	force := taskRuntimeEventRequiresFlush(event)
 	return s.persistTaskRuntimeLocked(force)
@@ -146,7 +150,14 @@ func (s *Service) FinishTaskRuntime(taskID, status, message string, result ChatR
 			StartedAt: time.Now().UTC().Format(time.RFC3339Nano), TurnSequence: 1,
 		}
 	}
-	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) || s.taskRuntime.Terminal() {
+	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) {
+		return nil
+	}
+	// The application normally guards this with chatTask.terminalOnce, but the
+	// runtime is also used during recovery and must defend its own one-shot
+	// boundary. Live stream phases never mark a task terminal, so the first
+	// final merge remains writable while duplicate or late finalizers are ignored.
+	if s.taskRuntime.Terminal() {
 		return nil
 	}
 	s.taskRuntime.Status = normalizeTaskRuntimeStatus(status)
@@ -199,6 +210,7 @@ func applyTaskStreamEvent(state *TaskRuntimeState, event ChatStreamEvent) {
 	case "reasoning":
 		state.Reasoning += event.Delta
 	case "tool":
+		settleOpenTimelineNotes(state.Parts, "completed")
 		upsertTaskRuntimeToolPart(state, event)
 		state.Parts = mergeTaskRuntimeParts(state.Parts, redactTaskRuntimeParts(event.Parts))
 	case "progress":
@@ -234,23 +246,34 @@ func appendTaskRuntimeTimelineNote(state *TaskRuntimeState, event ChatStreamEven
 		if part.Kind != tools.PartTimelineNote {
 			continue
 		}
-		if part.Message == message && part.Status == status {
+		if event.ToolCallID != "" && part.ToolCallID == event.ToolCallID ||
+			event.ToolCallID == "" && part.Message == message {
+			state.Parts[index] = mergeTimelineNoteParts(part, tools.ResultPart{
+				Kind: tools.PartTimelineNote, Message: redactSensitiveText(message), Status: status,
+				ToolCallID: strings.TrimSpace(event.ToolCallID),
+			})
 			return
 		}
-		break
 	}
+	settleOpenTimelineNotes(state.Parts, "completed")
 	state.Parts = append(state.Parts, tools.ResultPart{
 		Kind: tools.PartTimelineNote, Message: redactSensitiveText(message), Status: status,
-		StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		ToolCallID: strings.TrimSpace(event.ToolCallID),
+		StartedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 	})
 }
 
 func taskRuntimeStatusFromStreamEvent(event ChatStreamEvent) string {
 	switch event.Type {
 	case "status", "started":
-		if status := strings.TrimSpace(event.Status); status != "" {
-			return status
+		switch strings.TrimSpace(event.Status) {
+		case "waiting", "retrying":
+			return strings.TrimSpace(event.Status)
 		}
+		// Stream status describes a phase, not the task's final state. Only
+		// FinishTaskRuntime may persist completed, failed, cancelled, or
+		// interrupted, otherwise a premature provider finish can make later
+		// output and tool records disappear from the crash-recovery snapshot.
 		return "running"
 	case "heartbeat":
 		return ""
@@ -475,12 +498,58 @@ func mergeTaskRuntimeParts(existing, incoming []tools.ResultPart) []tools.Result
 					break
 				}
 			}
+		case tools.PartSecretResult:
+			if strings.TrimSpace(part.SecretID) == "" {
+				break
+			}
+			for index := range existing {
+				if existing[index].Kind == tools.PartSecretResult && existing[index].SecretID == part.SecretID {
+					existing[index] = mergeSecretResultParts(existing[index], part)
+					replaced = true
+					break
+				}
+			}
+		case tools.PartTimelineNote:
+			for index, current := range existing {
+				if current.Kind != tools.PartTimelineNote {
+					continue
+				}
+				if part.ToolCallID != "" && part.ToolCallID == current.ToolCallID ||
+					part.ToolCallID == "" && part.Message == current.Message && part.Status == current.Status {
+					existing[index] = mergeTimelineNoteParts(current, part)
+					replaced = true
+					break
+				}
+			}
 		}
 		if !replaced {
 			existing = append(existing, part)
 		}
 	}
 	return existing
+}
+
+func mergeTimelineNoteParts(existing, incoming tools.ResultPart) tools.ResultPart {
+	if taskRuntimePartTerminal(existing.Status) && !taskRuntimePartTerminal(incoming.Status) {
+		incoming.Status = existing.Status
+		incoming.CompletedAt = existing.CompletedAt
+	}
+	if incoming.Message == "" {
+		incoming.Message = existing.Message
+	}
+	if incoming.ToolCallID == "" {
+		incoming.ToolCallID = existing.ToolCallID
+	}
+	if incoming.StartedAt == "" {
+		incoming.StartedAt = existing.StartedAt
+	}
+	if incoming.CompletedAt == "" && taskRuntimePartTerminal(incoming.Status) {
+		incoming.CompletedAt = existing.CompletedAt
+	}
+	if incoming.DurationMs == 0 {
+		incoming.DurationMs = existing.DurationMs
+	}
+	return incoming
 }
 
 func taskRuntimeTeamPart(event TeamRoleEvent) tools.ResultPart {

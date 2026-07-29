@@ -506,16 +506,20 @@ func (s *Service) rebuildSessionFromEvents() {
 	if systemMsg != nil {
 		rebuilt = append(rebuilt, *systemMsg)
 	}
-	appendAssistant := func(content string, parts []tools.ResultPart) {
+	appendAssistant := func(content string, parts []tools.ResultPart, terminalStatus string) {
+		assistantIndex := len(rebuilt)
 		if !hasArtifactRegistry {
 			rebuilt = s.appendProtocolAssistantMessage(rebuilt, content, parts)
-			return
+		} else {
+			message := s.protocolAssistantMessage(stripPrivateAssistantContext(content), parts)
+			message.Content = stripLocalArtifactContext(message.Content)
+			rebuilt = append(rebuilt, message)
+			if context := formatFailureStrategyContext(s.failureStrategySnapshot()); context != "" {
+				rebuilt = append(rebuilt, protocol.Message{Role: "system", Content: context, InternalKind: contextFailureStrategyKind})
+			}
 		}
-		message := s.protocolAssistantMessage(stripPrivateAssistantContext(content), parts)
-		message.Content = stripLocalArtifactContext(message.Content)
-		rebuilt = append(rebuilt, message)
-		if context := formatFailureStrategyContext(s.failureStrategySnapshot()); context != "" {
-			rebuilt = append(rebuilt, protocol.Message{Role: "system", Content: context, InternalKind: contextFailureStrategyKind})
+		if strings.TrimSpace(terminalStatus) != "" && assistantIndex < len(rebuilt) && rebuilt[assistantIndex].Role == "assistant" {
+			rebuilt[assistantIndex].InternalKind = terminalTurnInternalKind(terminalStatus)
 		}
 	}
 	turns := 0
@@ -524,19 +528,28 @@ func (s *Service) rebuildSessionFromEvents() {
 	s.replaceFailureStrategyState(failureStrategyState{})
 	s.teamResume = nil
 	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
+	teamFailureAwaitingTerminal := false
 	for _, ev := range events {
 		switch ev.Type {
 		case eventlog.EventUserMessage:
+			teamFailureAwaitingTerminal = false
+			attachments := fromEventAttachments(ev.Payload.Attachments)
+			if context := markdownReferenceRequestContext(attachments); context != "" {
+				rebuilt = append(rebuilt, protocol.Message{
+					Role: "user", Content: context, InternalKind: contextRequestKind,
+				})
+			}
 			rebuilt = append(rebuilt, protocol.Message{
-				Role: "user", Content: ev.Payload.Content, Attachments: protocolAttachments(fromEventAttachments(ev.Payload.Attachments)),
+				Role: "user", Content: ev.Payload.Content, Attachments: protocolAttachments(attachments),
 			})
 			pendingUser = true
 		case eventlog.EventAssistantMessage:
+			teamFailureAwaitingTerminal = false
 			if failureState, ok := fromEventFailureStrategyState(ev.Payload.FailureState); ok {
 				s.replaceFailureStrategyState(failureState)
 			}
 			content, parts := restoredAssistantMessage(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
-			appendAssistant(content, parts)
+			appendAssistant(content, parts, "")
 			pendingUser = false
 		case eventlog.EventTurnTerminal:
 			if failureState, ok := fromEventFailureStrategyState(ev.Payload.FailureState); ok {
@@ -545,12 +558,14 @@ func (s *Service) rebuildSessionFromEvents() {
 			// A retained interrupted turn has its user event on the branch. A
 			// zero-output failure is rolled back before the terminal marker, so it
 			// must not become an orphan assistant message in future model context.
-			if pendingUser {
-				appendAssistant(ev.Payload.Content, fromEventParts(ev.Payload.Parts))
+			if pendingUser || (teamFailureAwaitingTerminal && ev.Payload.Status == "failed") {
+				appendAssistant(ev.Payload.Content, fromEventParts(ev.Payload.Parts), ev.Payload.Status)
 				pendingUser = false
 				turns++
 			}
+			teamFailureAwaitingTerminal = false
 		case eventlog.EventCheckpoint:
+			teamFailureAwaitingTerminal = false
 			turns++
 		case eventlog.EventPlanUpdate:
 			steps := make([]tools.ProgressStep, 0, len(ev.Payload.PlanSteps))
@@ -579,6 +594,7 @@ func (s *Service) rebuildSessionFromEvents() {
 				}
 			}
 			s.teamState = cloneTeamState(checkpoint.Team)
+			teamFailureAwaitingTerminal = checkpoint.Status == "failed"
 			if checkpoint.Status == "paused" {
 				s.teamResume = checkpoint
 			} else {
@@ -729,7 +745,8 @@ func toEventAttachments(attachments []ChatAttachment) []eventlog.MessageAttachme
 	converted := make([]eventlog.MessageAttachment, 0, len(attachments))
 	for _, attachment := range attachments {
 		converted = append(converted, eventlog.MessageAttachment{
-			Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
+			Kind: attachment.Kind, Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
+			Size: attachment.Size, CharacterCount: attachment.CharacterCount,
 		})
 	}
 	return converted
@@ -742,7 +759,8 @@ func fromEventAttachments(attachments []eventlog.MessageAttachment) []ChatAttach
 	converted := make([]ChatAttachment, 0, len(attachments))
 	for _, attachment := range attachments {
 		converted = append(converted, ChatAttachment{
-			Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
+			Kind: attachment.Kind, Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
+			Size: attachment.Size, CharacterCount: attachment.CharacterCount,
 		})
 	}
 	return converted

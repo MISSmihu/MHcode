@@ -104,6 +104,62 @@ func TestExecuteToolCallFeedsCanonicalArtifactContextToModelImmediately(t *testi
 	}
 }
 
+func TestExecuteToolCallPreservesDeclaredArtifactAfterPartialFailure(t *testing.T) {
+	workspace := t.TempDir()
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: filepath.Join(t.TempDir(), "sessions")})
+	defer service.Close()
+	configureArtifactTestService(service, workspace)
+	service.recordUserEvent("create report")
+
+	path := filepath.Join(workspace, "reports", "incomplete.txt")
+	registry := tools.NewRegistry(partialArtifactFailureTool{path: path})
+	result, message := service.executeToolCall(context.Background(), registry, protocol.ToolCall{
+		ID: "call-partial-artifact", Type: "function",
+		Function: protocol.ToolCallFunction{Name: "partial_artifact_failure", Arguments: json.RawMessage(`{}`)},
+	})
+
+	canonicalPath := canonicalArtifactTestPath(t, path)
+	if !result.IsError {
+		t.Fatalf("partial failure must remain an error: %#v", result)
+	}
+	if !strings.Contains(message.Content, localArtifactContextStart) || !strings.Contains(message.Content, canonicalPath) {
+		t.Fatalf("partial failure lost artifact context: %q", message.Content)
+	}
+	records := service.ListSessionArtifacts()
+	if len(records) != 1 || records[0].Path != canonicalPath || records[0].Action != "created" || records[0].Status != "available" {
+		t.Fatalf("partial failure registry = %#v", records)
+	}
+}
+
+type partialArtifactFailureTool struct {
+	path string
+}
+
+func (t partialArtifactFailureTool) Name() string { return "partial_artifact_failure" }
+
+func (t partialArtifactFailureTool) Description() string { return "test-only partial artifact failure" }
+
+func (t partialArtifactFailureTool) InputSchema() map[string]any {
+	return map[string]any{"type": "object", "additionalProperties": false}
+}
+
+func (t partialArtifactFailureTool) Execute(context.Context, json.RawMessage) (tools.Result, error) {
+	if err := os.MkdirAll(filepath.Dir(t.path), 0o755); err != nil {
+		return tools.Result{}, err
+	}
+	if err := os.WriteFile(t.path, []byte("partial artifact\n"), 0o600); err != nil {
+		return tools.Result{}, err
+	}
+	return tools.Result{
+		Summary: "文件已写入，但后续校验失败",
+		IsError: true,
+		Parts: []tools.ResultPart{
+			{Kind: tools.PartToolCall, Name: t.Name(), Status: "error", Output: "文件已写入，但后续校验失败"},
+			{Kind: tools.PartFile, Path: t.path, FileAction: "created", Created: true},
+		},
+	}, nil
+}
+
 func TestArtifactRegistryFollowsRewindAndBranchSwitch(t *testing.T) {
 	base := t.TempDir()
 	workspace := filepath.Join(base, "workspace")

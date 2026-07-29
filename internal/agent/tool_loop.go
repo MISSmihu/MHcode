@@ -10,8 +10,6 @@ import (
 	"net"
 	"strings"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -64,10 +62,6 @@ func (s *Service) runToolLoopTurn(
 	execRequest := baseRequest
 	planStarted := false
 	reg := s.buildToolRegistryForContext(ctx)
-	preflight := s.runDeploymentSSHPreflight(ctx, reg, baseRequest.Messages, sink)
-	if preflight.Attempted {
-		execRequest.Messages = appendDeploymentSSHPreflight(baseRequest.Messages, preflight)
-	}
 
 	// Plan 两段式：需用户显式开启 Plan 模式，且当前档位 Planner=true 时启用。
 	// 默认关闭，避免每轮翻倍调用、破坏缓存经济性（符合真实工具的显式规划做法）。
@@ -75,21 +69,18 @@ func (s *Service) runToolLoopTurn(
 	if s.planMode && !isGuidanceChatTurn(ctx) && profile.Budget.Planner && strings.TrimSpace(s.runtimeSettings.WorkspaceRoot) != "" {
 		emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "正在生成执行计划", Model: route.ModelID})
 		planRequest := baseRequest
-		if preflight.Attempted {
-			planRequest.Messages = appendDeploymentSSHPreflightSummary(baseRequest.Messages, preflight)
-		}
 		plan, _, planErr := s.runPlanPhase(ctx, caller, planRequest, route, sink)
 		if planErr != nil {
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
 			s.markChatProviderStatus(route.Provider.ID, "error", planErr.Error())
-			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planErr
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planErr
 		}
 		if plan != "" {
 			planSteps := planStepsFromText(plan)
 			if len(planSteps) > 0 {
 				if planStateErr := s.startPlanState(planSteps); planStateErr != nil {
 					s.sessionMessages = s.sessionMessages[:baseMessageCount]
-					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planStateErr
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
 				}
 				planStarted = true
 			}
@@ -97,7 +88,7 @@ func (s *Service) runToolLoopTurn(
 			if apprErr != nil {
 				s.sessionMessages = s.sessionMessages[:baseMessageCount]
 				apprErr = s.failStartedPlan(planStarted, apprErr)
-				return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, apprErr
+				return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, apprErr
 			}
 			if !approved {
 				if planStarted {
@@ -107,7 +98,7 @@ func (s *Service) runToolLoopTurn(
 				}
 				// 用户否决计划：不执行，直接把计划作为回复返回。
 				answer := "已生成执行计划，但你选择不执行。\n\n" + plan
-				parts := mergeOutcomeParts(append([]tools.ResultPart{}, preflight.Result.Parts...), []tools.ResultPart{{Kind: tools.PartText, Text: plan}})
+				parts := []tools.ResultPart{{Kind: tools.PartText, Text: plan}}
 				s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
 				s.sessionState.MessageCount = len(s.sessionMessages)
 				s.recordAssistantAndCheckpoint(answer, route.ModelID, parts, chatTurnDurationMs(ctx))
@@ -124,7 +115,7 @@ func (s *Service) runToolLoopTurn(
 				planSteps[0].Status = "in_progress"
 				if planStateErr := s.updatePlanState(planSteps); planStateErr != nil {
 					planStateErr = s.failStartedPlan(planStarted, planStateErr)
-					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID, Parts: preflight.Result.Parts}, planStateErr
+					return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, planStateErr
 				}
 			}
 			// 批准：把计划注入执行阶段的消息尾部，让模型据此执行。
@@ -143,7 +134,7 @@ func (s *Service) runToolLoopTurn(
 		usageRoute := resolvedProviderRoute(streamProvider, route)
 		s.recordLiveUsage(usage, usageRoute, sink)
 	}
-	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, sink, preflight, usageObserver)
+	outcome, err := s.runStreamingToolLoopWithState(executionCtx, streamProvider, reg, execRequest, sink, usageObserver)
 	resolvedRoute := resolvedProviderRoute(streamProvider, route)
 	if resolvedRoute.Provider.ID != route.Provider.ID {
 		route = resolvedRoute
@@ -173,8 +164,8 @@ func (s *Service) runToolLoopTurn(
 		if partialContent == "" && !cancelled {
 			partialContent = partialToolFailureContent(outcome)
 		}
-		if partialContent == "" && (strings.TrimSpace(outcome.Reasoning) != "" || hasMeaningfulResultParts(outcome.Parts)) {
-			partialContent = retainedTurnContent(terminalStatus, "", outcome.Parts, outcome.Reasoning)
+		if partialContent == "" && hasMeaningfulResultParts(outcome.Parts) {
+			partialContent = retainedTurnContent(terminalStatus, "", outcome.Parts)
 		}
 		partialParts := appendTextPartIfMissing(outcome.Parts, partialContent)
 		result := ChatResult{
@@ -225,51 +216,7 @@ func partialToolFailureContent(outcome toolLoopOutcome) string {
 }
 
 func partialToolEvidenceContent(outcome toolLoopOutcome) string {
-	if content := sanitizeModelContent(outcome.Content); content != "" {
-		return content
-	}
-	for _, part := range outcome.Parts {
-		if isSuccessfulRepositoryRead(part) {
-			return repositoryReadFallbackContent(part)
-		}
-	}
-	return ""
-}
-
-func hasUsablePartialToolResult(parts []tools.ResultPart) bool {
-	return hasSuccessfulRepositoryRead(parts) || hasSuccessfulWebpageRead(parts)
-}
-
-func hasSuccessfulRepositoryRead(parts []tools.ResultPart) bool {
-	for _, part := range parts {
-		if isSuccessfulRepositoryRead(part) {
-			return true
-		}
-	}
-	return false
-}
-
-func isSuccessfulRepositoryRead(part tools.ResultPart) bool {
-	return part.Kind == tools.PartToolCall &&
-		part.Name == "read_repository" &&
-		part.Status != "error" &&
-		strings.TrimSpace(part.Output) != ""
-}
-
-func hasSuccessfulWebpageRead(parts []tools.ResultPart) bool {
-	for _, part := range parts {
-		if isSuccessfulWebpageRead(part) {
-			return true
-		}
-	}
-	return false
-}
-
-func isSuccessfulWebpageRead(part tools.ResultPart) bool {
-	return part.Kind == tools.PartToolCall &&
-		part.Name == "read_webpage" &&
-		part.Status != "error" &&
-		strings.TrimSpace(part.Output) != ""
+	return sanitizeModelContent(outcome.Content)
 }
 
 func hasWebSearchSources(parts []tools.ResultPart) bool {
@@ -302,164 +249,11 @@ func webSearchFallbackContent(part tools.ResultPart) string {
 	return content.String()
 }
 
-func ensureWebSearchSourcesListed(content string, parts []tools.ResultPart) string {
-	content = strings.TrimSpace(content)
-	sources := make([]tools.SearchSource, 0)
-	seen := map[string]bool{}
-	for _, part := range parts {
-		if part.Kind != tools.PartWebSearch {
-			continue
-		}
-		for _, source := range part.Sources {
-			url := strings.TrimSpace(source.URL)
-			if url == "" || seen[url] {
-				continue
-			}
-			seen[url] = true
-			source.URL = url
-			sources = append(sources, source)
-		}
-	}
-	if len(sources) == 0 {
-		return content
-	}
-
-	missing := make([]tools.SearchSource, 0, len(sources))
-	for _, source := range sources {
-		title := strings.TrimSpace(source.Title)
-		hasURL := strings.Contains(content, source.URL)
-		hasTitle := sourceTitleIsMentioned(content, title)
-		// Search engines can return loosely related results. Only surface a URL
-		// automatically when the model has actually named that source; the full
-		// search record remains available in the activity stream for inspection.
-		if hasTitle && !hasURL {
-			missing = append(missing, source)
-		}
-	}
-	if len(missing) == 0 {
-		return content
-	}
-
-	var result strings.Builder
-	if content != "" {
-		result.WriteString(content)
-		result.WriteString("\n\n")
-	}
-	if len(missing) == len(sources) {
-		result.WriteString("来源链接：")
-	} else {
-		result.WriteString("补充来源链接：")
-	}
-	for _, source := range missing {
-		title := strings.TrimSpace(source.Title)
-		if title == "" {
-			title = source.URL
-		}
-		result.WriteString("\n- ")
-		result.WriteString(title)
-		result.WriteString("\n  <")
-		result.WriteString(strings.ReplaceAll(source.URL, ">", "%3E"))
-		result.WriteString(">")
-	}
-	return result.String()
-}
-
-func sourceTitleIsMentioned(content, title string) bool {
-	title = strings.TrimSpace(title)
-	if utf8.RuneCountInString(title) < 4 {
-		return false
-	}
-	return strings.Contains(strings.ToLower(content), strings.ToLower(title))
-}
-
 func compactFallbackSnippet(value string, maxRunes int) string {
 	value = strings.Join(strings.Fields(value), " ")
 	runes := []rune(value)
 	if maxRunes > 0 && len(runes) > maxRunes {
 		return string(runes[:maxRunes]) + "..."
-	}
-	return value
-}
-
-func repositoryReadFallbackContent(part tools.ResultPart) string {
-	output := strings.TrimSpace(strings.ReplaceAll(part.Output, "\r\n", "\n"))
-	if output == "" {
-		return ""
-	}
-
-	metadata, readme, tree, entries, fileContent := splitRepositoryFallbackOutput(output)
-	var content strings.Builder
-	content.WriteString("GitHub 仓库读取已完成，但上游模型未能继续整理。以下内容直接来自仓库工具结果：")
-	if repositoryURL := strings.TrimSpace(part.Input); repositoryURL != "" {
-		content.WriteString("\n\n仓库地址：<")
-		content.WriteString(strings.ReplaceAll(repositoryURL, ">", "%3E"))
-		content.WriteString(">")
-	}
-	appendRepositoryFallbackSection(&content, "仓库信息", metadata, 1_200)
-	appendRepositoryFallbackSection(&content, "README（截取）", readme, 3_200)
-	appendRepositoryFallbackSection(&content, "目录树（截取）", tree, 2_400)
-	appendRepositoryFallbackSection(&content, "目录内容（截取）", entries, 2_400)
-	appendRepositoryFallbackSection(&content, "文件内容（截取）", fileContent, 4_000)
-	content.WriteString("\n\n完整原始结果仍保留在上方“读取仓库”记录中，可展开查看或直接重试整理。")
-	return content.String()
-}
-
-func webpageReadFallbackContent(part tools.ResultPart) string {
-	output := compactMultilineFallback(strings.TrimSpace(strings.ReplaceAll(part.Output, "\r\n", "\n")), 7_000)
-	if output == "" {
-		return ""
-	}
-	return "已读取网页正文。以下内容直接来自网页读取结果，可展开上方记录查看完整内容：\n\n" + output
-}
-
-func splitRepositoryFallbackOutput(output string) (metadata, readme, tree, entries, fileContent string) {
-	metadata = strings.TrimSpace(output)
-	if before, after, ok := strings.Cut(metadata, "\nREADME:\n"); ok {
-		metadata = strings.TrimSpace(before)
-		readme = strings.TrimSpace(after)
-		if beforeTree, afterTree, hasTree := strings.Cut(readme, "\nRepository tree:\n"); hasTree {
-			readme = strings.TrimSpace(beforeTree)
-			tree = strings.TrimSpace(afterTree)
-		}
-		return
-	}
-	if before, after, ok := strings.Cut(metadata, "\nRepository tree:\n"); ok {
-		metadata = strings.TrimSpace(before)
-		tree = strings.TrimSpace(after)
-		return
-	}
-	if before, after, ok := strings.Cut(metadata, "\nEntries:\n"); ok {
-		metadata = strings.TrimSpace(before)
-		entries = strings.TrimSpace(after)
-		return
-	}
-	if before, after, ok := strings.Cut(metadata, "\n\n"); ok {
-		metadata = strings.TrimSpace(before)
-		fileContent = strings.TrimSpace(after)
-	}
-	return
-}
-
-func appendRepositoryFallbackSection(content *strings.Builder, title, value string, maxRunes int) {
-	value = compactMultilineFallback(value, maxRunes)
-	if value == "" {
-		return
-	}
-	content.WriteString("\n\n**")
-	content.WriteString(title)
-	content.WriteString("**\n\n")
-	for _, line := range strings.Split(value, "\n") {
-		content.WriteString("    ")
-		content.WriteString(line)
-		content.WriteByte('\n')
-	}
-}
-
-func compactMultilineFallback(value string, maxRunes int) string {
-	value = strings.TrimSpace(value)
-	runes := []rune(value)
-	if maxRunes > 0 && len(runes) > maxRunes {
-		return strings.TrimSpace(string(runes[:maxRunes])) + "\n... [内容已截取]"
 	}
 	return value
 }
@@ -504,7 +298,11 @@ func (s *Service) buildWorkerToolRegistryForContext(ctx context.Context) *tools.
 
 func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includePlan, includeDelegation bool) *tools.Registry {
 	policy := s.sandboxPolicyForContext(ctx)
+	readOnly := strings.EqualFold(strings.TrimSpace(policy.FilesystemAccess), "read-only") ||
+		strings.EqualFold(strings.TrimSpace(policy.SandboxMode), "read-only")
 	reg := tools.NewRegistry()
+	reg.Add(ReportProgressTool{})
+	reg.Add(LoadSkillTool{Service: s})
 	if includePlan {
 		reg.Add(tools.UpdatePlanTool{OnUpdate: s.updatePlanState})
 	}
@@ -520,8 +318,10 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 		reg.Add(tools.ReadRepositoryTool{Policy: policy})
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
-		reg.Add(tools.DownloadFileTool{Policy: policy})
-		reg.Add(tools.GitRepositoryTool{Policy: policy})
+		if !readOnly {
+			reg.Add(tools.DownloadFileTool{Policy: policy})
+			reg.Add(tools.GitRepositoryTool{Policy: policy})
+		}
 	}
 	if s.config.OpenFile != nil || s.config.PreviewFile != nil {
 		reg.Add(tools.OpenFileTool{Policy: policy, Open: s.config.OpenFile, Preview: s.config.PreviewFile})
@@ -534,18 +334,20 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 		reg.Add(tools.ComputerTool{Policy: policy, Controller: s.config.Computer})
 	}
 	if includeDelegation {
-		reg.Add(DelegateTaskTool{Service: s})
+		reg.Add(DelegateTaskTool{Service: s, ReadOnly: readOnly})
 		reg.Add(AwaitSubagentsTool{Service: s})
 	}
-	reg.Add(tools.WriteFileTool{Policy: policy})
-	reg.Add(tools.ApplyPatchTool{Policy: policy})
-	reg.Add(tools.CopyFileTool{Policy: policy})
-	reg.Add(tools.DeleteFileTool{Policy: policy})
+	if !readOnly {
+		reg.Add(tools.WriteFileTool{Policy: policy})
+		reg.Add(tools.ApplyPatchTool{Policy: policy})
+		reg.Add(tools.CopyFileTool{Policy: policy})
+		reg.Add(tools.DeleteFileTool{Policy: policy})
+	}
 	// run_command 仅在 ShellAccess 开启时注册（文件操作绝不经 shell）。
-	if s.runtimeSettings.ShellAccess {
+	if s.runtimeSettings.ShellAccess && !readOnly {
 		reg.Add(tools.RunCommandTool{Policy: policy})
 	}
-	if s.runtimeSettings.NetworkAccess && s.runtimeSettings.ShellAccess {
+	if s.runtimeSettings.NetworkAccess && s.runtimeSettings.ShellAccess && !readOnly {
 		reg.Add(SSHCredentialTool{
 			Policy:         policy,
 			Resolve:        s.resolveScopedSSHCredential,
@@ -554,18 +356,24 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 		})
 	}
 	if s.config.Git != nil {
-		reg.Add(GitTool{Policy: policy, Controller: s.config.Git})
+		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: readOnly})
 	}
-	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess {
+	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess && !readOnly {
 		reg.Add(TerminalTool{Policy: policy, Controller: s.config.Terminal})
 	}
 	if s.mcpManager != nil {
 		for _, remoteTool := range s.mcpManager.Tools() {
+			if readOnly {
+				readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
+				if !ok || !readOnlyTool.ReadOnly() {
+					continue
+				}
+			}
 			reg.Add(remoteTool)
 		}
 	}
 	if s.pluginManager != nil {
-		for _, pluginTool := range s.pluginManager.Tools(s.runtimeSettings.Plugins, policy, false) {
+		for _, pluginTool := range s.pluginManager.Tools(s.runtimeSettings.Plugins, policy, readOnly) {
 			reg.Add(pluginTool)
 		}
 	}
@@ -584,6 +392,8 @@ func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Re
 	policy.ShellAccess = false
 	policy.AllowDestructiveOps = false
 	reg := tools.NewRegistry(
+		ReportProgressTool{},
+		LoadSkillTool{Service: s},
 		tools.ReadFileTool{Policy: policy},
 		tools.FileInfoTool{Policy: policy},
 		tools.ListDirTool{Policy: policy},
@@ -671,7 +481,7 @@ func (s *Service) runStreamingToolLoop(
 	req protocol.ChatRequest,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, sink, deploymentSSHPreflight{}, nil)
+	return s.runStreamingToolLoopWithState(ctx, provider, reg, req, sink, nil)
 }
 
 type usageObserver func(*protocol.TokenUsage)
@@ -682,7 +492,6 @@ func (s *Service) runStreamingToolLoopWithState(
 	reg *tools.Registry,
 	req protocol.ChatRequest,
 	sink ChatEventSink,
-	preflight deploymentSSHPreflight,
 	observeUsage usageObserver,
 ) (toolLoopOutcome, error) {
 	complete := func(ctx context.Context, request protocol.ChatRequest) (protocol.CompletionResult, error) {
@@ -693,12 +502,14 @@ func (s *Service) runStreamingToolLoopWithState(
 		}
 		return completion, err
 	}
-	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink, preflight)
+	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink)
 }
 
 type completionFunc func(context.Context, protocol.ChatRequest) (protocol.CompletionResult, error)
 
 const postToolCompletionRetries = 2
+
+const maxEmptyCompletionRecoveries = 4
 
 const toolResultRecoveryKind = "tool-result-recovery"
 
@@ -710,28 +521,22 @@ const (
 )
 
 type completedWebSearch struct {
-	query   string
-	sources []tools.SearchSource
+	signature string
+	query     string
+	sources   []tools.SearchSource
 }
 
 type toolLoopGuard struct {
-	searches                   []completedWebSearch
-	browserUnavailable         bool
-	browserExplicitlyRequested bool
-	externalBrowserSuppressed  bool
-	remoteLookup               bool
-	remoteTargetInspected      bool
-	completedSSHCalls          map[string]bool
-	lastPlanSignature          string
-	planUpdates                int
-	objectiveSatisfied         bool
-	forceFinalResponse         bool
-	maxPlanUpdates             int
-	failureStrategy            failureStrategyState
-	resolvedFailures           map[string]bool
-	blockedFailures            map[string]int
-	turnIndex                  int
-	cycles                     toolLoopCycleGuard
+	searches           []completedWebSearch
+	browserUnavailable bool
+	completedSSHCalls  map[string]bool
+	lastPlanSignature  string
+	forceFinalResponse bool
+	failureStrategy    failureStrategyState
+	resolvedFailures   map[string]bool
+	blockedFailures    map[string]int
+	turnIndex          int
+	cycles             toolLoopCycleGuard
 }
 
 type toolLoopCycleGuard struct {
@@ -785,10 +590,6 @@ func newAwaitSubagentsToolCall() protocol.ToolCall {
 	}
 }
 
-const (
-	maxLookupPlanUpdates = 4
-)
-
 func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.Message, bool, bool) {
 	name := call.Function.Name
 	input := toolInputForDisplay(name, call.Function.Arguments)
@@ -798,56 +599,19 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 			summary := "计划内容与状态没有变化，已跳过重复更新。"
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
 		}
-		if g.maxPlanUpdates > 0 && g.planUpdates >= g.maxPlanUpdates {
-			summary := "计划更新过于频繁，已保留最近一次有效状态；请继续执行或直接总结。"
-			g.forceFinalResponse = true
-			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
-		}
-	}
-	if g.remoteLookup && !g.remoteTargetInspected && name != "ssh" && name != "update_plan" {
-		summary := "远程凭据查找必须先通过 SSH 检查目标主机的运行服务、启动参数、环境变量和实际配置；在获得目标机证据前，不执行本地命令、网络搜索、仓库读取或子代理任务。请改用 ssh action=run。"
-		return tools.Result{Summary: summary}, protocol.Message{
-			Role:       "tool",
-			ToolCallID: call.ID,
-			Name:       name,
-			Content:    summary,
-		}, true, true
 	}
 	if result, message, blocked := g.beforeEquivalentFailure(call); blocked {
 		return result, message, true, false
 	}
 	if name == "ssh" {
 		signature := sshToolCallSignature(call.Function.Arguments)
-		if signature != "" && g.completedSSHCalls[signature] && (g.remoteLookup || strings.HasPrefix(signature, "test\x00")) {
+		if signature != "" && g.completedSSHCalls[signature] && strings.HasPrefix(signature, "test\x00") {
 			summary := "相同的 SSH 操作本轮已经成功执行，已跳过重复调用；请复用先前结果继续任务。"
-			if g.remoteLookup {
-				g.forceFinalResponse = true
-			}
 			return tools.Result{Summary: summary}, protocol.Message{Role: "tool", ToolCallID: call.ID, Name: name, Content: summary}, true, true
 		}
 	}
-	if name == "browser" && !g.browserExplicitlyRequested {
-		rawArgs := normalizeToolArgs(call.Function.Arguments)
-		if g.externalBrowserSuppressed || browserNavigationNeedsApproval(rawArgs) {
-			g.externalBrowserSuppressed = true
-			sourceCount := 0
-			for _, search := range g.searches {
-				sourceCount += len(search.sources)
-			}
-			summary := "网页未打开：用户没有要求浏览器导航。若需检索公开信息，请使用 web_search，并直接整理回答、列出来源标题和完整 URL。"
-			if sourceCount > 0 {
-				summary = fmt.Sprintf("网页未打开：用户没有要求浏览器导航。本轮已获得 %d 条搜索来源，请直接基于来源整理完整回答，并逐条列出标题和完整 URL；不要再次调用 browser。", sourceCount)
-			}
-			return tools.Result{Summary: summary}, protocol.Message{
-				Role:       "tool",
-				ToolCallID: call.ID,
-				Name:       name,
-				Content:    summary,
-			}, true, true
-		}
-	}
 	if name == "browser" && g.browserUnavailable {
-		summary := "内置浏览器本轮仍不可用，已跳过重复启动。请使用已有搜索来源完成回答。"
+		summary := "内置浏览器本轮仍不可用，已跳过重复启动。请根据当前任务选择其他可用工具继续核验，或明确说明页面尚无法核验。"
 		result := tools.Result{
 			Summary: summary,
 			IsError: true,
@@ -860,8 +624,12 @@ func (g *toolLoopGuard) before(call protocol.ToolCall) (tools.Result, protocol.M
 	if name != "web_search" || strings.TrimSpace(input) == "" {
 		return tools.Result{}, protocol.Message{}, false, false
 	}
+	signature := webSearchRequestSignature(call.Function.Arguments)
+	if signature == "" {
+		return tools.Result{}, protocol.Message{}, false, false
+	}
 	for _, search := range g.searches {
-		if !searchQueriesSimilar(input, search.query) {
+		if signature != search.signature {
 			continue
 		}
 		summary := fmt.Sprintf("本轮已完成相近搜索 %q，复用已有 %d 条来源，未重复联网。", search.query, len(search.sources))
@@ -896,30 +664,15 @@ func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, messa
 			return
 		}
 		g.lastPlanSignature = normalizedToolArguments(call.Function.Arguments)
-		g.planUpdates++
 	case "ssh":
 		if result.IsError {
 			return
 		}
-		var args sshToolArguments
-		if json.Unmarshal(normalizeToolArgs(call.Function.Arguments), &args) == nil {
-			switch strings.ToLower(strings.TrimSpace(args.Action)) {
-			case "run", "capture_secret":
-				g.remoteTargetInspected = true
-			}
-		}
 		if g.completedSSHCalls == nil {
 			g.completedSSHCalls = make(map[string]bool)
 		}
-		if signature := sshToolCallSignature(call.Function.Arguments); signature != "" {
+		if signature := sshToolCallSignature(call.Function.Arguments); strings.HasPrefix(signature, "test\x00") {
 			g.completedSSHCalls[signature] = true
-		}
-		for _, part := range result.Parts {
-			if part.Kind == tools.PartSecretResult && part.SecretID != "" {
-				g.objectiveSatisfied = true
-				g.forceFinalResponse = true
-				break
-			}
 		}
 	case "web_search":
 		if result.IsError {
@@ -929,16 +682,21 @@ func (g *toolLoopGuard) after(call protocol.ToolCall, result tools.Result, messa
 		if len(sources) == 0 {
 			return
 		}
+		signature := webSearchRequestSignature(call.Function.Arguments)
+		if signature == "" {
+			return
+		}
 		g.searches = append(g.searches, completedWebSearch{
-			query:   toolInputForDisplay("web_search", call.Function.Arguments),
-			sources: sources,
+			signature: signature,
+			query:     toolInputForDisplay("web_search", call.Function.Arguments),
+			sources:   sources,
 		})
 	case "browser":
 		if !result.IsError || !browserEngineUnavailable(result.Summary) {
 			return
 		}
 		g.browserUnavailable = true
-		message.Content = strings.TrimSpace(message.Content + "\n本轮不要再次调用 browser；如已有搜索来源，请直接基于来源完成回答。")
+		message.Content = strings.TrimSpace(message.Content + "\n本轮不要再次调用 browser；请选择其他可用工具继续核验，若没有可用替代方案则明确说明受阻原因。")
 	}
 }
 
@@ -1146,128 +904,37 @@ func browserEngineUnavailable(summary string) bool {
 	return strings.Contains(summary, "内置浏览器启动失败") || strings.Contains(summary, "启动浏览器引擎失败")
 }
 
-func browserUseExplicitlyRequested(messages []protocol.Message) bool {
-	request := ""
-	for index := len(messages) - 1; index >= 0; index-- {
-		if messages[index].Role == "user" {
-			request = strings.ToLower(strings.TrimSpace(messages[index].Content))
-			break
-		}
-	}
-	if request == "" {
-		return false
-	}
-	for _, phrase := range []string{
-		"不要打开", "不用打开", "无需打开", "别打开", "不要使用浏览器", "不用浏览器",
-		"do not open", "don't open", "dont open", "without opening", "do not use the browser",
-	} {
-		if strings.Contains(request, phrase) {
-			return false
-		}
-	}
-	for _, phrase := range []string{
-		"打开网页", "打开网站", "打开链接", "访问网页", "访问网站", "使用浏览器", "用浏览器", "内置浏览器",
-		"浏览这个网页", "浏览这个网站", "读取网页", "分析网页", "操作网页", "点击网页", "登录网站", "登录网页",
-		"官网下载", "从官网下载", "下载官网", "下载网站", "下载页", "下载页面",
-		"open the webpage", "open the page", "open the website", "open this link", "use the browser", "in-app browser",
-		"visit the website", "browse the website", "read the webpage", "click on the page", "log in to the website",
-		"download from the official website", "download from the vendor website", "download page",
-	} {
-		if strings.Contains(request, phrase) {
-			return true
-		}
-	}
-	hasAddress := strings.Contains(request, "http://") || strings.Contains(request, "https://") || strings.Contains(request, "www.")
-	if !hasAddress {
-		return false
-	}
-	for _, action := range []string{"打开", "访问", "浏览", "读取", "分析", "登录", "open", "visit", "browse", "read", "inspect", "log in"} {
-		if strings.Contains(request, action) {
-			return true
-		}
-	}
-	return false
-}
-
-func searchQueriesSimilar(left, right string) bool {
-	leftSite, leftTerms, leftCompact := searchQuerySignature(left)
-	rightSite, rightTerms, rightCompact := searchQuerySignature(right)
-	if leftSite != rightSite && (leftSite != "" || rightSite != "") {
-		return false
-	}
-	if leftCompact != "" && leftCompact == rightCompact {
-		return true
-	}
-	if len(leftTerms) == 0 || len(rightTerms) == 0 {
-		return false
-	}
-	intersection := 0
-	for term := range leftTerms {
-		if rightTerms[term] {
-			intersection++
-		}
-	}
-	minimum := len(leftTerms)
-	if len(rightTerms) < minimum {
-		minimum = len(rightTerms)
-	}
-	return intersection >= 2 && float64(intersection)/float64(minimum) >= 0.72
-}
-
-func searchQuerySignature(query string) (string, map[string]bool, string) {
+func canonicalSearchQuery(query string) string {
 	query = strings.ToLower(strings.TrimSpace(query))
-	fields := strings.Fields(query)
-	kept := make([]string, 0, len(fields))
-	site := ""
-	for _, field := range fields {
-		if strings.HasPrefix(field, "site:") {
-			site = strings.Trim(strings.TrimPrefix(field, "site:"), "\"'()[]{}，。；;")
-			continue
-		}
-		kept = append(kept, field)
+	if query == "" {
+		return ""
 	}
-	query = strings.Join(kept, " ")
-	for _, phrase := range []string{"今天", "今日", "当前", "最新", "现在", "实时", "today", "latest", "current", "now"} {
-		query = strings.ReplaceAll(query, phrase, " ")
+	return strings.Join(strings.Fields(query), " ")
+}
+
+func webSearchRequestSignature(raw json.RawMessage) string {
+	var args struct {
+		Query      string `json:"query"`
+		MaxResults int    `json:"max_results"`
 	}
-	terms := map[string]bool{}
-	segments := strings.FieldsFunc(query, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	var compact strings.Builder
-	for _, segment := range segments {
-		runes := []rune(segment)
-		containsDigit := false
-		containsHan := false
-		for _, r := range runes {
-			containsDigit = containsDigit || unicode.IsDigit(r)
-			containsHan = containsHan || unicode.Is(unicode.Han, r)
-			if !unicode.IsDigit(r) {
-				compact.WriteRune(r)
-			}
-		}
-		if containsDigit {
-			continue
-		}
-		if containsHan {
-			if len(runes) == 1 {
-				terms[string(runes)] = true
-				continue
-			}
-			for index := 0; index < len(runes)-1; index++ {
-				terms[string(runes[index:index+2])] = true
-			}
-			continue
-		}
-		term := string(runes)
-		if len(term) > 4 && strings.HasSuffix(term, "s") {
-			term = strings.TrimSuffix(term, "s")
-		}
-		if term != "" {
-			terms[term] = true
-		}
+	if err := json.Unmarshal(normalizeToolArgs(raw), &args); err != nil {
+		return ""
 	}
-	return site, terms, compact.String()
+	args.Query = canonicalSearchQuery(args.Query)
+	if args.Query == "" {
+		return ""
+	}
+	if args.MaxResults <= 0 {
+		args.MaxResults = 6
+	}
+	if args.MaxResults > 10 {
+		args.MaxResults = 10
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
 }
 
 func (s *Service) runToolLoopWithCompletion(
@@ -1277,7 +944,7 @@ func (s *Service) runToolLoopWithCompletion(
 	complete completionFunc,
 	sink ChatEventSink,
 ) (toolLoopOutcome, error) {
-	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink, deploymentSSHPreflight{})
+	return s.runToolLoopWithCompletionState(ctx, reg, req, complete, sink)
 }
 
 func (s *Service) runToolLoopWithCompletionState(
@@ -1286,34 +953,27 @@ func (s *Service) runToolLoopWithCompletionState(
 	req protocol.ChatRequest,
 	complete completionFunc,
 	sink ChatEventSink,
-	preflight deploymentSSHPreflight,
 ) (toolLoopOutcome, error) {
-	outcome := toolLoopOutcome{Parts: append([]tools.ResultPart{}, preflight.Result.Parts...)}
+	outcome := toolLoopOutcome{}
 	messages := append([]protocol.Message{}, req.Messages...)
 	toolDefs := toolDefinitions(reg)
 	toolsDisabled := false // 自定义模型不支持 function-calling 时降级为纯对话
 	emptyCompletionStage := 0
 	synthesisOnly := false
+	forceSubstantiveTool := false
+	requiredToolChoiceUnsupported := false
 	visualVerificationRequested := false
+	subagentFinalizationPrompted := false
 	guard := toolLoopGuard{
-		browserExplicitlyRequested: browserUseExplicitlyRequested(req.Messages),
-		remoteLookup:               remoteLookupTask(req.Messages),
-		completedSSHCalls:          make(map[string]bool),
-		failureStrategy:            s.failureStrategySnapshot(),
-		resolvedFailures:           make(map[string]bool),
-		blockedFailures:            make(map[string]int),
-		turnIndex:                  s.sessionState.TurnCount + 1,
+		completedSSHCalls: make(map[string]bool),
+		failureStrategy:   s.failureStrategySnapshot(),
+		resolvedFailures:  make(map[string]bool),
+		blockedFailures:   make(map[string]int),
+		turnIndex:         s.sessionState.TurnCount + 1,
 	}
 	defer func() {
 		s.mergeFailureStrategyState(guard.failureStrategy, guard.resolvedFailures)
 	}()
-	if guard.remoteLookup {
-		guard.maxPlanUpdates = maxLookupPlanUpdates
-	}
-	if preflight.Succeeded && preflight.CredentialID != "" {
-		guard.completedSSHCalls["test\x00"+preflight.CredentialID] = true
-	}
-
 	executed := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1325,6 +985,9 @@ func (s *Service) runToolLoopWithCompletionState(
 		stepReq.Messages = fitToolLoopMessages(messages, req.TargetInputTokens)
 		if !toolsDisabled {
 			stepReq.Tools = toolDefs
+			if forceSubstantiveTool && !requiredToolChoiceUnsupported {
+				stepReq.ToolChoice = "required"
+			}
 		} else {
 			stepReq.Tools = nil
 			stepReq.ToolChoice = "none"
@@ -1348,6 +1011,7 @@ func (s *Service) runToolLoopWithCompletionState(
 				}
 			}
 		}
+		completion.Content = visibleCompletionContent(completion.Content, completion.ToolCalls)
 		outcome.Parts = mergeOutcomeParts(outcome.Parts, providerNoticeParts(completion.Notices))
 		if completion.Usage != nil {
 			usage := *completion.Usage
@@ -1359,6 +1023,24 @@ func (s *Service) runToolLoopWithCompletionState(
 		}
 		if strings.TrimSpace(completion.Content) != "" {
 			outcome.Content = completion.Content
+		}
+		if err != nil && stepReq.ParallelToolCalls && isParallelToolCallsCompatibilityError(err) {
+			req.ParallelToolCalls = false
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "status",
+				Message: "当前模型端点不支持并行工具请求，正在保留完整工具能力并以兼容模式重试。",
+				Status:  "retrying",
+			})
+			continue
+		}
+		if err != nil && stepReq.ToolChoice == "required" && isRequiredToolChoiceCompatibilityError(err) {
+			requiredToolChoiceUnsupported = true
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "status",
+				Message: "当前模型端点不支持强制工具选择，正在保留完整工具能力并以自动模式继续。",
+				Status:  "retrying",
+			})
+			continue
 		}
 		if err != nil {
 			// Only retry without tools when the provider explicitly rejects the
@@ -1382,7 +1064,7 @@ func (s *Service) runToolLoopWithCompletionState(
 		if toolsDisabled && len(completion.ToolCalls) > 0 {
 			if synthesisOnly {
 				if content := strings.TrimSpace(completion.Content); content != "" {
-					outcome.Content = s.appendVisualVerificationDisclosure(ensureWebSearchSourcesListed(content, outcome.Parts))
+					outcome.Content = s.appendVisualVerificationDisclosure(content)
 					outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
 					setOutcomeProgressStatus(&outcome, "completed")
 					emitOutcomeProgress(sink, outcome.Parts)
@@ -1406,23 +1088,33 @@ func (s *Service) runToolLoopWithCompletionState(
 					return outcome, err
 				}
 			}
-			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: summary, Status: "completed"})
+			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: summary, Status: "failed"})
 			outcome.Content = strings.TrimSpace(completion.Content)
-			if outcome.Content == "" {
-				outcome.Content = summary
-			} else {
-				outcome.Content += "\n\n" + summary
+			if outcome.Content != "" {
+				outcome.Content = s.appendVisualVerificationDisclosure(outcome.Content)
+				outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
 			}
-			outcome.Content = s.appendVisualVerificationDisclosure(outcome.Content)
-			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: outcome.Content})
-			setOutcomeProgressStatus(&outcome, "completed")
+			setOutcomeProgressStatus(&outcome, "failed")
 			emitOutcomeProgress(sink, outcome.Parts)
-			return outcome, nil
+			return outcome, errProviderIgnoredDisabledTools
 		}
 
 		if len(completion.ToolCalls) == 0 {
 			_, canCollectSubagents := reg.Get("await_subagents")
 			if canCollectSubagents && s.hasUncollectedSubagents() {
+				if !subagentFinalizationPrompted {
+					subagentFinalizationPrompted = true
+					messages = append(messages,
+						protocol.Message{Role: "assistant", Content: completion.Content, ReasoningContent: completion.Reasoning},
+						pendingSubagentRecoveryMessage(),
+					)
+					emitChatEvent(sink, ChatStreamEvent{
+						Type:    "status",
+						Message: "后台子代理仍在运行，主 Agent 正在继续可独立推进的工作",
+						Status:  "running",
+					})
+					continue
+				}
 				call := newAwaitSubagentsToolCall()
 				messages = append(messages, protocol.Message{
 					Role:             "assistant",
@@ -1474,25 +1166,31 @@ func (s *Service) runToolLoopWithCompletionState(
 			content := strings.TrimSpace(completion.Content)
 			if content == "" {
 				hasToolEvidence := executed > 0 || hasMeaningfulResultParts(outcome.Parts)
-				if hasToolEvidence && emptyCompletionStage == 0 && !toolsDisabled {
-					emptyCompletionStage = 1
-					messages = append(messages, toolResultRecoveryMessage(false))
+				if hasToolEvidence && toolsDisabled && !synthesisOnly {
+					synthesisOnly = true
+					messages = append(messages, toolResultRecoveryMessage(true))
 					emitChatEvent(sink, ChatStreamEvent{
 						Type:    "status",
-						Message: "模型尚未形成结论，正在继续核验工具结果",
+						Message: "正在执行任务",
 						Status:  "retrying",
 					})
 					continue
 				}
-				if hasToolEvidence && emptyCompletionStage < 2 {
-					emptyCompletionStage = 2
-					synthesisOnly = true
-					toolsDisabled = true
-					messages = append(messages, toolResultRecoveryMessage(true))
+				if hasToolEvidence && !toolsDisabled {
+					emptyCompletionStage++
+					if emptyCompletionStage >= maxEmptyCompletionRecoveries {
+						setOutcomeProgressStatus(&outcome, "failed")
+						emitOutcomeProgress(sink, outcome.Parts)
+						return outcome, errEmptyToolResultSynthesis
+					}
+					if emptyCompletionStage >= 2 {
+						forceSubstantiveTool = true
+					}
+					messages = append(messages, toolResultRecoveryMessage(false))
 					emitChatEvent(sink, ChatStreamEvent{
 						Type:    "status",
-						Message: "调查结果已保留，正在要求模型生成最终结论",
-						Status:  "retrying",
+						Message: "正在执行任务",
+						Status:  "running",
 					})
 					continue
 				}
@@ -1500,7 +1198,7 @@ func (s *Service) runToolLoopWithCompletionState(
 				emitOutcomeProgress(sink, outcome.Parts)
 				return outcome, errEmptyToolResultSynthesis
 			}
-			outcome.Content = s.appendVisualVerificationDisclosure(ensureWebSearchSourcesListed(content, outcome.Parts))
+			outcome.Content = s.appendVisualVerificationDisclosure(content)
 			if strings.TrimSpace(outcome.Content) != "" {
 				outcome.Parts = append(outcome.Parts, tools.ResultPart{
 					Kind: tools.PartText,
@@ -1526,17 +1224,19 @@ func (s *Service) runToolLoopWithCompletionState(
 
 		// 逐个执行工具调用。
 		roundRecords := make([]toolLoopRoundRecord, 0, len(completion.ToolCalls))
+		roundHasSubstantiveTool := false
 		for _, call := range completion.ToolCalls {
 			if err := ctx.Err(); err != nil {
 				setOutcomeProgressStatus(&outcome, "cancelled")
 				emitOutcomeProgress(sink, outcome.Parts)
 				return outcome, err
 			}
-			isProgressUpdate := call.Function.Name == "update_plan"
+			isProgressUpdate := isModelProgressTool(call.Function.Name)
 			toolInput := toolInputForDisplay(call.Function.Name, call.Function.Arguments)
 			result, toolMsg, guarded, hidden := guard.before(call)
 			if !isProgressUpdate && !hidden {
 				executed++
+				roundHasSubstantiveTool = true
 			}
 			if !isProgressUpdate && !hidden {
 				emitChatEvent(sink, ChatStreamEvent{
@@ -1564,6 +1264,21 @@ func (s *Service) runToolLoopWithCompletionState(
 							Message: message,
 							Status:  part.Status,
 							Parts:   []tools.ResultPart{part},
+						})
+						return
+					}
+					if part.Kind == tools.PartTimelineNote {
+						message := strings.TrimSpace(part.Message)
+						if message == "" {
+							return
+						}
+						status := strings.TrimSpace(part.Status)
+						if status == "" {
+							status = "running"
+						}
+						emitChatEvent(sink, ChatStreamEvent{
+							Type: "status", Message: message, Status: status,
+							ToolCallID: call.ID, Parts: []tools.ResultPart{part},
 						})
 						return
 					}
@@ -1639,6 +1354,14 @@ func (s *Service) runToolLoopWithCompletionState(
 				break
 			}
 		}
+		if roundHasSubstantiveTool {
+			emptyCompletionStage = 0
+			forceSubstantiveTool = false
+		} else if emptyCompletionStage > 0 && len(completion.ToolCalls) > 0 {
+			// A progress update keeps the user informed but does not advance the
+			// objective. Require a real tool action on the next provider round.
+			forceSubstantiveTool = true
+		}
 		if period, stalled := guard.cycles.observe(roundRecords); stalled {
 			feedback := toolLoopCycleFeedback(period)
 			appendToolLoopFeedback(messages, feedback)
@@ -1649,6 +1372,23 @@ func (s *Service) runToolLoopWithCompletionState(
 				Status:  "running",
 			})
 		}
+	}
+}
+
+func pendingSubagentRecoveryMessage() protocol.Message {
+	return protocol.Message{
+		Role:         "user",
+		InternalKind: "subagent-pending",
+		Content:      "[MHcode runtime update]\n后台子代理仍在运行。请先继续处理当前任务中与它们不重叠的独立工作；仅在需要它们的结果进行最终综合时调用 await_subagents。不要无意义地空等，也不要在未收集所需结果时仓促结束。\n[/MHcode runtime update]",
+	}
+}
+
+func isModelProgressTool(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "update_plan", "report_progress":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1666,48 +1406,12 @@ func toolProgressMessage(name, status, output string) string {
 	}
 }
 
-func remoteLookupTask(messages []protocol.Message) bool {
-	request := latestUserRequest(messages)
-	if request == "" || !strings.Contains(request, scopedCredentialScheme) {
-		return false
-	}
-	// The opaque URI contains the word "credential" by design; remove it before
-	// intent matching so an unrelated request with an available SSH reference
-	// does not become a remote secret lookup.
-	lower := strings.ToLower(scopedCredentialReferencePattern.ReplaceAllString(request, ""))
-	for _, marker := range []string{
-		"部署", "安装", "升级", "迁移", "修复", "排障", "调试", "配置服务", "发布",
-		"deploy", "install", "upgrade", "migrate", "repair", "debug", "troubleshoot", "configure", "release",
-	} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
-	}
-	for _, marker := range []string{
-		"读取", "查找", "找出", "找回", "恢复", "获取", "查看", "确认", "账号", "账户", "密码", "口令", "密钥", "秘钥", "令牌",
-		"read", "find", "locate", "get", "inspect", "account", "credential", "password", "secret", "token",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func latestUserRequest(messages []protocol.Message) string {
-	for index := len(messages) - 1; index >= 0; index-- {
-		if messages[index].Role == "user" {
-			return strings.TrimSpace(messages[index].Content)
-		}
-	}
-	return ""
-}
-
 func toolResultRecoveryMessage(final bool) protocol.Message {
 	instruction := strings.Join([]string{
 		"[MHcode private tool-result recovery]",
 		"The previous completion returned no user-facing answer after tool execution. The task is not complete.",
-		"Continue investigating with the available tools. Treat web_search snippets only as discovery: for named software, open and read the official website, official documentation, or real source repository before drawing conclusions.",
+		"Continue the task autonomously in this same turn. If more work is needed, call a substantive tool now; report_progress or update_plan alone does not advance the objective. Do not ask the user to reply with 'continue'.",
+		"Treat web_search snippets only as discovery: for named software, open and read the official website, official documentation, or real source repository before drawing conclusions.",
 		"For questions about the user's computer or current configuration, inspect the authorized local state or explicitly request the missing permission. Never substitute a raw search-result list for the requested diagnosis.",
 		"[/MHcode private tool-result recovery]",
 	}, "\n")
@@ -1715,7 +1419,7 @@ func toolResultRecoveryMessage(final bool) protocol.Message {
 		instruction = strings.Join([]string{
 			"[MHcode private tool-result recovery]",
 			"Produce the final user-facing answer now from the verified tool evidence already in the conversation.",
-			"If the evidence is insufficient, say exactly what remains unverified and which permission or user action is needed. Include only relevant source links actually used. Never present raw search snippets as a completed answer.",
+			"If the evidence is insufficient because tools are unavailable or a permission/input is genuinely missing, say exactly what is blocked and what is needed. Do not ask the user to reply with 'continue' for work the available tools can perform. Include only relevant source links actually used. Never present raw search snippets as a completed answer.",
 			"[/MHcode private tool-result recovery]",
 		}, "\n")
 	}
@@ -1743,6 +1447,61 @@ func isToolCompatibilityError(err error) bool {
 		return toolCompatibilityMessage(info.Message)
 	}
 	return toolCompatibilityMessage(err.Error())
+}
+
+func isParallelToolCallsCompatibilityError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	message := err.Error()
+	if info, ok := protocol.ProviderErrorDetails(err); ok {
+		if info.HTTPStatus == 401 || info.HTTPStatus == 403 || info.HTTPStatus == 408 ||
+			info.HTTPStatus == 409 || info.HTTPStatus == 429 || info.HTTPStatus >= 500 {
+			return false
+		}
+		message = strings.TrimSpace(info.Code + " " + info.Type + " " + info.Message)
+	}
+	message = strings.ToLower(strings.TrimSpace(message))
+	mentionsField := strings.Contains(message, "parallel_tool_calls") || strings.Contains(message, "parallel tool calls")
+	if !mentionsField {
+		return false
+	}
+	for _, marker := range []string{
+		"unsupported", "not supported", "not_support", "unknown parameter", "unknown field",
+		"unrecognized", "not allowed", "unexpected", "additional properties",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequiredToolChoiceCompatibilityError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	message := err.Error()
+	if info, ok := protocol.ProviderErrorDetails(err); ok {
+		if info.HTTPStatus == 401 || info.HTTPStatus == 403 || info.HTTPStatus == 408 ||
+			info.HTTPStatus == 409 || info.HTTPStatus == 429 || info.HTTPStatus >= 500 {
+			return false
+		}
+		message = strings.TrimSpace(info.Code + " " + info.Type + " " + info.Message)
+	}
+	message = strings.ToLower(strings.TrimSpace(message))
+	if !strings.Contains(message, "tool_choice") && !strings.Contains(message, "tool choice") {
+		return false
+	}
+	for _, marker := range []string{
+		"unsupported", "not supported", "not_support", "unknown parameter", "unknown field",
+		"unrecognized", "not allowed", "unexpected", "invalid value", "invalid_request",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func toolCompatibilityMessage(message string) bool {
@@ -1850,6 +1609,21 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 			}
 			continue
 		}
+		if part.Kind == tools.PartSecretResult && strings.TrimSpace(part.SecretID) != "" {
+			replaced := false
+			for index := range existing {
+				if existing[index].Kind != tools.PartSecretResult || existing[index].SecretID != part.SecretID {
+					continue
+				}
+				existing[index] = mergeSecretResultParts(existing[index], part)
+				replaced = true
+				break
+			}
+			if !replaced {
+				existing = append(existing, part)
+			}
+			continue
+		}
 		if part.Kind == tools.PartSubagent && strings.TrimSpace(part.TaskID) != "" {
 			replaced := false
 			for index := range existing {
@@ -1882,6 +1656,19 @@ func mergeOutcomeParts(existing, incoming []tools.ResultPart) []tools.ResultPart
 		}
 	}
 	return existing
+}
+
+func mergeSecretResultParts(existing, incoming tools.ResultPart) tools.ResultPart {
+	if incoming.Status == "" {
+		incoming.Status = existing.Status
+	}
+	if incoming.SecretLabel == "" {
+		incoming.SecretLabel = existing.SecretLabel
+	}
+	if incoming.SecretSource == "" {
+		incoming.SecretSource = existing.SecretSource
+	}
+	return incoming
 }
 
 func mergeSubagentParts(existing, incoming tools.ResultPart) tools.ResultPart {
@@ -2020,22 +1807,29 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	timeout := time.Duration(s.runtimeSettings.ToolTimeoutSeconds) * time.Second
 	result, err := s.runToolWithWatchdog(ctx, tool, name, normalizedArgs, timeout)
 	if err != nil {
-		summary := fmt.Sprintf("工具 %s 执行出错: %v", name, err)
-		return tools.Result{
-				Summary: summary,
-				IsError: true,
-				Parts:   []tools.ResultPart{{Kind: tools.PartToolCall, Name: name, Status: "error", Output: summary}},
-			}, protocol.Message{
-				Role:       "tool",
-				ToolCallID: call.ID,
-				Name:       name,
-				Content:    summary,
+		detail := redactSensitiveText(err.Error())
+		summary := fmt.Sprintf("工具 %s 执行出错: %s", name, detail)
+		if strings.TrimSpace(result.Summary) == "" {
+			result.Summary = summary
+		} else if !strings.Contains(result.Summary, detail) {
+			result.Summary = strings.TrimSpace(result.Summary + "\n" + summary)
+		}
+		result.IsError = true
+		for index := range result.Parts {
+			part := &result.Parts[index]
+			if part.Kind != tools.PartToolCall {
+				continue
 			}
+			part.Status = "error"
+			if strings.TrimSpace(part.Stderr) == "" {
+				part.Stderr = detail
+			}
+		}
 	}
-	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy)
+	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy, name)
 
 	result = ensureToolErrorPart(result, name, normalizedArgs)
-	if !result.IsError {
+	if len(result.Changes) > 0 {
 		for _, change := range result.Changes {
 			if snapshotErr := s.recordFileSnapshot(change); snapshotErr != nil {
 				rollbackErr := tools.RestoreFile(s.sandboxPolicy(), change.Path, change.Before, change.Existed, change.LineEnding, change.Encoding, change.HadBOM)
@@ -2052,8 +1846,14 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 			s.turnChanges = append(s.turnChanges, change)
 		}
 	}
+	result = ensureToolExecutionMetadata(result, name, call.ID, normalizedArgs, startedAt, time.Now())
 	var artifactRecords []ArtifactRecord
-	if !result.IsError {
+	// A tool can write a usable file and then fail a later validation step.
+	// Keep explicitly declared files in the registry even for that partial
+	// failure, so the model can reuse the exact path instead of rediscovering
+	// it by scanning the workspace. Arbitrary failed changes are not recorded:
+	// without a successful snapshot they are not safe rewind artifacts.
+	if !result.IsError || toolResultDeclaresArtifacts(result) {
 		// Attach the call ID before registration so the durable record can be
 		// associated with the exact tool invocation even if the turn is later
 		// interrupted before an assistant message is produced.
@@ -2074,16 +1874,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	}
 	// Build model feedback only after snapshot recording and any automatic
 	// rollback, so the model never receives a stale success message.
-	feedback := result.Summary
-	if feedback == "" {
-		feedback = "（无输出）"
-	}
-	for _, part := range result.Parts {
-		if part.Kind == tools.PartToolCall && part.Output != "" && strings.TrimSpace(part.Output) != strings.TrimSpace(feedback) {
-			feedback = feedback + "\n" + part.Output
-			break
-		}
-	}
+	feedback := formatToolResultFeedback(result, name)
 	if context := formatLocalArtifactContext(artifactReferencesFromRecords(artifactRecords), 4_000); context != "" {
 		feedback += "\n\n" + context
 	}
@@ -2094,6 +1885,83 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 		Content:     feedback,
 		Attachments: protocolToolAttachments(result.Attachments),
 	}
+}
+
+type toolResultFeedbackMetadata struct {
+	Tool             string `json:"tool"`
+	CallID           string `json:"callId,omitempty"`
+	Status           string `json:"status"`
+	Input            string `json:"input,omitempty"`
+	WorkingDirectory string `json:"workingDirectory,omitempty"`
+	ExitCode         *int   `json:"exitCode,omitempty"`
+	DurationMs       int64  `json:"durationMs,omitempty"`
+	Stdout           string `json:"stdout,omitempty"`
+	Stderr           string `json:"stderr,omitempty"`
+	Output           string `json:"output,omitempty"`
+}
+
+func formatToolResultFeedback(result tools.Result, name string) string {
+	feedback := strings.TrimSpace(result.Summary)
+	if feedback == "" {
+		feedback = "（无输出）"
+	}
+
+	var execution tools.ResultPart
+	found := false
+	for _, part := range result.Parts {
+		if part.Kind != tools.PartToolCall || strings.TrimSpace(part.Name) != strings.TrimSpace(name) {
+			continue
+		}
+		if !found {
+			execution = part
+			found = true
+			continue
+		}
+		execution = mergeTaskRuntimeToolPart(execution, part)
+	}
+	if !found {
+		return feedback
+	}
+
+	status := strings.TrimSpace(execution.Status)
+	if status == "" {
+		if result.IsError {
+			status = "error"
+		} else {
+			status = "ok"
+		}
+	}
+	metadata := toolResultFeedbackMetadata{
+		Tool:             strings.TrimSpace(name),
+		CallID:           strings.TrimSpace(execution.ToolCallID),
+		Status:           status,
+		Input:            redactSensitiveText(strings.TrimSpace(execution.Input)),
+		WorkingDirectory: strings.TrimSpace(execution.WorkingDirectory),
+		ExitCode:         execution.ExitCode,
+		DurationMs:       execution.DurationMs,
+		Stdout:           redactSensitiveText(strings.TrimSpace(execution.Stdout)),
+		Stderr:           redactSensitiveText(strings.TrimSpace(execution.Stderr)),
+	}
+	if metadata.Stdout == "" && metadata.Stderr == "" {
+		output := redactSensitiveText(strings.TrimSpace(execution.Output))
+		if output != feedback {
+			metadata.Output = output
+		}
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return feedback
+	}
+	return feedback + "\n\nMHcode tool execution metadata:\n" + string(encoded)
+}
+
+func toolResultDeclaresArtifacts(result tools.Result) bool {
+	for _, part := range result.Parts {
+		if part.Kind == tools.PartFile && strings.TrimSpace(part.Path) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func toolNeedsExclusiveWorkspaceAccess(name string, tool tools.Tool) bool {
@@ -2152,6 +2020,9 @@ func ensureToolExecutionMetadata(result tools.Result, name, toolCallID string, r
 			part.DurationMs = durationMs
 		}
 	}
+	if name == (ReportProgressTool{}).Name() && !result.IsError {
+		return result
+	}
 	if found {
 		return result
 	}
@@ -2177,13 +2048,16 @@ func protocolToolAttachments(attachments []tools.Attachment) []protocol.Attachme
 	return converted
 }
 
-func applyToolResultPolicy(result tools.Result, policy string) tools.Result {
+func applyToolResultPolicy(result tools.Result, policy string, toolNames ...string) tools.Result {
 	summaryLimit, detailLimit := 4_000, 8_000
 	switch policy {
 	case "balanced":
 		summaryLimit, detailLimit = 12_000, 24_000
 	case "raw-local":
 		summaryLimit, detailLimit = 32_000, 64_000
+	}
+	if len(toolNames) > 0 && toolNames[0] == (LoadSkillTool{}).Name() {
+		summaryLimit = 64_000
 	}
 	result.Summary = clipContextText(result.Summary, summaryLimit)
 	for index := range result.Parts {
@@ -2213,30 +2087,30 @@ func ensureToolErrorPart(result tools.Result, name string, rawArgs json.RawMessa
 			return result
 		}
 	}
-	preserved := make([]tools.ResultPart, 0, len(result.Parts)+1)
-	preserved = append(preserved, tools.ResultPart{
+	errorPart := tools.ResultPart{
 		Kind:   tools.PartToolCall,
 		Name:   name,
 		Status: "error",
 		Input:  toolInputForDisplay(name, rawArgs),
 		Output: result.Summary,
-	})
-	for _, part := range result.Parts {
-		if part.Kind == tools.PartSubagent {
-			preserved = append(preserved, part)
-		}
 	}
-	result.Parts = preserved
+	// A tool error does not invalidate evidence it already produced. Keep file,
+	// diff, text, web, image, and subagent parts so the model can diagnose the
+	// failure or continue from a usable partial result.
+	result.Parts = append([]tools.ResultPart{errorPart}, result.Parts...)
 	return result
 }
 
 func toolInputForDisplay(name string, rawArgs json.RawMessage) string {
+	rawArgs = normalizeToolArgs(rawArgs)
 	var args map[string]any
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return ""
 	}
 	key := "path"
 	switch name {
+	case "load_skill":
+		key = "name"
 	case "search", "web_search":
 		key = "query"
 	case "read_repository", "read_webpage":

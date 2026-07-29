@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -59,6 +60,25 @@ func TestTurnTimelineSettlesProgressOnFailure(t *testing.T) {
 	}
 }
 
+func TestTurnTimelineSettlesPreviousProgressWhenWorkAdvances(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	service.captureTurnTimelineEvent(ChatStreamEvent{
+		Type: "status", ToolCallID: "progress-1", Message: "已连接服务器。", Status: "running",
+	})
+	service.captureTurnTimelineEvent(ChatStreamEvent{
+		Type: "status", ToolCallID: "progress-2", Message: "正在读取配置。", Status: "running",
+	})
+	if len(service.turnTimelineParts) != 2 || service.turnTimelineParts[0].Status != "completed" || service.turnTimelineParts[1].Status != "running" {
+		t.Fatalf("progress statuses = %#v", service.turnTimelineParts)
+	}
+	service.captureTurnTimelineEvent(ChatStreamEvent{
+		Type: "tool", ToolName: "ssh", ToolCallID: "ssh-read", Status: "running",
+	})
+	if service.turnTimelineParts[1].Status != "completed" {
+		t.Fatalf("tool start did not settle current milestone: %#v", service.turnTimelineParts)
+	}
+}
+
 func TestTurnTimelineDoesNotPersistProviderHeartbeats(t *testing.T) {
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
 	service.resetTurnTimeline()
@@ -77,5 +97,21 @@ func TestTurnTimelineDoesNotPersistRoutineTaskStatuses(t *testing.T) {
 	}
 	if len(service.turnTimelineParts) != 0 {
 		t.Fatalf("routine status leaked into durable timeline: %#v", service.turnTimelineParts)
+	}
+}
+
+func TestTurnTimelineMarksOverflowInsteadOfSilentlyDroppingNotes(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	for index := 0; index < maxTurnTimelineNotes+10; index++ {
+		service.captureTurnTimelineEvent(ChatStreamEvent{
+			Type: "status", Message: fmt.Sprintf("正在核验步骤 %d", index), Status: "running",
+		})
+	}
+	if notes := timelineNoteCount(service.turnTimelineParts); notes != maxTurnTimelineNotes {
+		t.Fatalf("timeline note count = %d, want %d", notes, maxTurnTimelineNotes)
+	}
+	last := service.turnTimelineParts[len(service.turnTimelineParts)-1]
+	if last.Kind != tools.PartTimelineNote || last.Message != timelineOverflowMessage {
+		t.Fatalf("timeline overflow marker = %#v", last)
 	}
 }

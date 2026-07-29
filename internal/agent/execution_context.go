@@ -9,9 +9,14 @@ import (
 )
 
 const (
-	executionContextStart = "[MHcode execution checkpoint]"
-	executionContextEnd   = "[/MHcode execution checkpoint]"
-	contextExecutionKind  = "execution-context"
+	executionContextStart  = "[MHcode execution checkpoint]"
+	executionContextEnd    = "[/MHcode execution checkpoint]"
+	contextExecutionKind   = "execution-context"
+	terminalTurnKindPrefix = "terminal-turn:"
+
+	executionCheckpointRuneLimit        = 8_000
+	executionCheckpointDetailRuneBudget = 6_000
+	executionCheckpointEntryRuneLimit   = 2_400
 )
 
 func (s *Service) formatExecutionCheckpoint(parts []tools.ResultPart) string {
@@ -23,43 +28,62 @@ func (s *Service) formatExecutionCheckpoint(parts []tools.ResultPart) string {
 		lines = append(lines, team)
 	}
 
-	toolParts := 0
-	for _, part := range parts {
-		switch part.Kind {
-		case tools.PartToolCall:
-			if toolParts >= 16 {
-				continue
-			}
-			toolParts++
-			lines = append(lines, formatToolCheckpoint(part))
-		case tools.PartProgress:
-			if progress := formatProgressCheckpoint(part); progress != "" {
-				lines = append(lines, progress)
-			}
-		case tools.PartSubagent:
-			lines = append(lines, fmt.Sprintf(
-				"subagent task_id=%s type=%s status=%s label=%q action=%q",
-				checkpointValue(part.TaskID), checkpointValue(part.AgentType), checkpointValue(part.Status),
-				checkpointText(part.Label, 300), checkpointText(part.CurrentAction, 500),
-			))
-		case tools.PartTeamRole:
-			lines = append(lines, fmt.Sprintf(
-				"team_role role=%s attempt=%d status=%s verdict=%s summary=%q",
-				checkpointValue(part.Role), part.Attempt, checkpointValue(part.Status), checkpointValue(part.Verdict),
-				checkpointText(part.Summary, 800),
-			))
+	details := make([]string, 0, len(parts))
+	remaining := executionCheckpointDetailRuneBudget
+	omitted := 0
+	for index := len(parts) - 1; index >= 0; index-- {
+		detail := formatExecutionCheckpointPart(parts[index])
+		if detail == "" {
+			continue
 		}
+		detail = clipContextText(detail, executionCheckpointEntryRuneLimit)
+		cost := len([]rune(detail)) + 1
+		if cost > remaining {
+			omitted++
+			continue
+		}
+		details = append(details, detail)
+		remaining -= cost
+	}
+	if omitted > 0 {
+		lines = append(lines, fmt.Sprintf("older_operational_entries_omitted=%d; latest entries retained within checkpoint budget", omitted))
+	}
+	for index := len(details) - 1; index >= 0; index-- {
+		lines = append(lines, details[index])
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 	content := strings.Join([]string{
 		executionContextStart,
-		"Branch-local operational facts from completed or interrupted work. Continue from these facts, reuse successful results, and do not repeat a failed strategy without a substantive change.",
+		"Branch-local operational facts from prior work. Decide from the current user request whether it continues this work. When it does, reuse successful results and do not repeat a failed strategy without a substantive change. When it does not, treat these facts only as background and do not resume work automatically.",
 		strings.Join(lines, "\n"),
 		executionContextEnd,
 	}, "\n")
-	return clipDelimitedContext(content, executionContextStart, executionContextEnd, 8_000)
+	return clipDelimitedContext(content, executionContextStart, executionContextEnd, executionCheckpointRuneLimit)
+}
+
+func formatExecutionCheckpointPart(part tools.ResultPart) string {
+	switch part.Kind {
+	case tools.PartToolCall:
+		return formatToolCheckpoint(part)
+	case tools.PartProgress:
+		return formatProgressCheckpoint(part)
+	case tools.PartSubagent:
+		return fmt.Sprintf(
+			"subagent task_id=%s type=%s status=%s label=%q action=%q",
+			checkpointValue(part.TaskID), checkpointValue(part.AgentType), checkpointValue(part.Status),
+			checkpointText(part.Label, 300), checkpointText(part.CurrentAction, 500),
+		)
+	case tools.PartTeamRole:
+		return fmt.Sprintf(
+			"team_role role=%s attempt=%d status=%s verdict=%s summary=%q",
+			checkpointValue(part.Role), part.Attempt, checkpointValue(part.Status), checkpointValue(part.Verdict),
+			checkpointText(part.Summary, 800),
+		)
+	default:
+		return ""
+	}
 }
 
 func formatPlanCheckpoint(plan PlanState) string {
@@ -142,11 +166,19 @@ func checkpointValue(value string) string {
 	return value
 }
 
-func latestExecutionCheckpoint(messages []protocol.Message) string {
+func latestResumableExecutionCheckpoint(messages []protocol.Message) string {
 	for index := len(messages) - 1; index >= 0; index-- {
-		if checkpoint := extractExecutionCheckpoint(messages[index].Content); checkpoint != "" {
-			return checkpoint
+		message := messages[index]
+		if message.Role != "assistant" {
+			continue
 		}
+		// A terminal checkpoint is useful only until the next completed assistant
+		// turn. Looking farther back would keep feeding an abandoned task into
+		// unrelated work long after the user moved on.
+		if !isResumableTerminalAssistant(message) {
+			return ""
+		}
+		return extractExecutionCheckpoint(message.Content)
 	}
 	return ""
 }
@@ -179,15 +211,65 @@ func stripExecutionCheckpoint(content string) string {
 	}
 }
 
-func (s *Service) continuationExecutionContext(userInput string) string {
-	continuing := isContinuationRequest(userInput)
-	resumablePlan := len(s.planState.Steps) > 0 && s.planState.Status != "completed"
-	resumableTeam := s.teamResume != nil && (s.teamResume.Status == "paused" || s.teamResume.Status == "running")
-	if !continuing && !resumablePlan && !resumableTeam {
-		return ""
-	}
-	if checkpoint := latestExecutionCheckpoint(s.sessionMessages); checkpoint != "" {
+func (s *Service) continuationExecutionContextLocked(_ string) string {
+	if checkpoint := latestResumableExecutionCheckpoint(s.sessionMessages); checkpoint != "" {
 		return checkpoint
 	}
-	return s.formatExecutionCheckpoint(nil)
+	if s.hasResumableExecutionStateLocked() {
+		return s.formatExecutionCheckpoint(nil)
+	}
+	return ""
+}
+
+// hasResumableExecutionState intentionally checks durable state rather than
+// parsing the user's wording. The model receives prior operational facts and
+// decides whether the current request continues that work.
+func (s *Service) hasResumableExecutionStateLocked() bool {
+	if hasActivePlanState(s.planState) {
+		return true
+	}
+	if s.hasPausedTeamRunLocked() {
+		return true
+	}
+	if latestResumableExecutionCheckpoint(s.sessionMessages) != "" {
+		return true
+	}
+	runtime, ok := s.TaskRuntimeSnapshot()
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(runtime.Status) {
+	case "running", "waiting", "retrying", "failed", "cancelled", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasActivePlanState(plan PlanState) bool {
+	if len(plan.Steps) == 0 {
+		return false
+	}
+	switch strings.TrimSpace(plan.Status) {
+	case "running", "waiting", "retrying":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalTurnInternalKind(status string) string {
+	return terminalTurnKindPrefix + strings.TrimSpace(status)
+}
+
+func isResumableTerminalAssistant(message protocol.Message) bool {
+	if message.Role != "assistant" {
+		return false
+	}
+	switch strings.TrimPrefix(strings.TrimSpace(message.InternalKind), terminalTurnKindPrefix) {
+	case "failed", "cancelled", "interrupted":
+		return true
+	default:
+		return false
+	}
 }

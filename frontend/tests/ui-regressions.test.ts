@@ -3,6 +3,13 @@ import { describe, expect, test } from "bun:test";
 import { hasMeaningfulTurnOutput, hasUsablePartialResult } from "../src/lib/chat-results";
 
 describe("chat UI regressions", () => {
+  test("keeps private subagent reasoning out of the user-facing panel", async () => {
+    const panel = await Bun.file(new URL("../src/components/SubagentPanel.tsx", import.meta.url)).text();
+    expect(panel).not.toContain("subagentReasoning");
+    expect(panel).not.toContain("推理记录");
+    expect(panel).toContain("工具活动");
+  });
+
   test("shows Skill details, safe file actions, and sliding enable controls", async () => {
     const [settings, workbench, types, css] = await Promise.all([
       Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
@@ -337,7 +344,8 @@ describe("chat UI regressions", () => {
     expect(messageContent).not.toContain('<Match when={block.kind === "progress"}>');
     expect(messageContent).toContain('if (part.kind === "task_progress") {');
     expect(app).toContain('class="execution-status-dock"');
-    expect(app).toContain('activeSubagentParts().length > 0].filter(Boolean).length > 1');
+    expect(app).toContain('activeSubagentParts().length > 0 || pausedTeamTask()');
+    expect(app).toContain('pausedTeamTask()].filter(Boolean).length > 1');
     expect(app).toContain('<TeamRun parts={activeTeamParts()} docked />');
 	expect(app).toContain('<SubagentDock');
     expect(messageContent).toContain("hideTeamRun?: boolean;");
@@ -551,7 +559,7 @@ describe("chat UI regressions", () => {
     expect(app).toMatch(/case "cancelled": \{[\s\S]{0,1600}cancelled: true/);
   });
 
-  test("recognizes partial text, reasoning, and terminal activity as retained output", () => {
+  test("retains only user-visible partial output", () => {
     expect(hasMeaningfulTurnOutput({ content: "partial", turnCommitted: true })).toBe(true);
     expect(hasMeaningfulTurnOutput({ content: "", turnCommitted: false }, { content: "", reasoning: "started", parts: [] })).toBe(false);
     expect(hasMeaningfulTurnOutput({ content: "", turnCommitted: false }, {
@@ -562,6 +570,11 @@ describe("chat UI regressions", () => {
       content: "",
       parts: [{ kind: "provider_notice", noticeKind: "policy_error", message: "blocked" }],
     })).toBe(false);
+	expect(hasMeaningfulTurnOutput(undefined, {
+	  content: "",
+	  reasoning: "private reasoning only",
+	  parts: [],
+	})).toBe(false);
 	expect(hasMeaningfulTurnOutput(undefined, {
 	  content: "",
 	  parts: [{ kind: "timeline_note", message: "正在分析任务", status: "running" }],
@@ -604,5 +617,19 @@ describe("chat UI regressions", () => {
     expect(css).toContain(".op-command-list {");
     expect(css).toContain(".op-command-entry > summary {");
     expect(css).toContain(".op-command-entry[open] > summary > svg {");
+  });
+
+  test("loads Markdown as chat context and imports durable Markdown Skills", async () => {
+    const [app, settings, workbench] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+    ]);
+    expect(app).toContain('title="添加 Markdown 参考资料"');
+    expect(app).toContain('accept=".md,.markdown,text/markdown,text/x-markdown"');
+    expect(app).toContain("readChatMarkdown");
+    expect(settings).toContain("导入长期 Markdown 规则");
+    expect(settings).toContain("每轮自动应用");
+    expect(workbench).toContain("ImportSkillMarkdown?:");
   });
 });

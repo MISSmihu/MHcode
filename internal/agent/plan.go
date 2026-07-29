@@ -155,7 +155,7 @@ func progressStepsEqual(left, right []tools.ProgressStep) bool {
 // Plan 两段式：high/ultra 档（Planner=true）时，先只读探索产出计划 → 用户批准 → 再执行。
 // 复用审批中介：计划作为 kind="plan" 的审批请求弹给用户，批准即进入执行阶段。
 
-const planInstruction = "你现在处于「规划阶段」。请先只用只读工具（read_file/list_dir/search）调研，" +
+const planInstruction = "你现在处于「规划阶段」。请先使用当前可用的只读工具调研真实对象，" +
 	"然后用简洁的分步清单给出你打算如何完成任务的计划，不要在本阶段修改任何文件。" +
 	"输出格式为 Markdown 有序列表，每步一句话。"
 

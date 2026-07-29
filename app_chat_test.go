@@ -145,6 +145,34 @@ func TestActiveChatTaskRestoresStructuredRuntimeSnapshot(t *testing.T) {
 	}
 }
 
+func TestChatTaskDropsLateProgressAfterTerminal(t *testing.T) {
+	service := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	if err := service.StartTaskRuntime("task-late-progress", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	task := &chatTask{id: "task-late-progress", projectID: "project", sessionID: "session", service: service}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{task.id: task}
+	app.chat.bySession = map[string]string{chatSessionKey(task.projectID, task.sessionID): task.id}
+	app.chat.active = task
+
+	app.completeChatTask(task, ChatTaskEvent{
+		TaskID:  task.id,
+		Type:    "completed",
+		Message: "任务完成",
+		Result:  &agent.ChatResult{Content: "final answer"},
+	})
+	app.recordChatTaskProgress(task, agent.ChatStreamEvent{Type: "delta", Delta: " late output"})
+	app.recordChatTaskProgress(task, agent.ChatStreamEvent{
+		Type: "tool", ToolName: "run_command", ToolCallID: "late-call", Status: "running",
+	})
+
+	snapshot, ok := service.TaskRuntimeSnapshot()
+	if !ok || snapshot.Status != "completed" || snapshot.Content != "final answer" || len(snapshot.Parts) != 0 {
+		t.Fatalf("late progress changed terminal task: %#v ok=%v", snapshot, ok)
+	}
+}
+
 func TestProjectSessionIdleCheckDistinguishesDuplicateSessionIDs(t *testing.T) {
 	_, cancelA := context.WithCancel(context.Background())
 	_, cancelB := context.WithCancel(context.Background())

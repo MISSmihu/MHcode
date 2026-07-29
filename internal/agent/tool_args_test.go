@@ -79,4 +79,10 @@ func TestToolInputForDisplaySupportsWebTools(t *testing.T) {
 	if got := toolInputForDisplay("browser", json.RawMessage(`{"action":"snapshot"}`)); got != "snapshot" {
 		t.Fatalf("browser snapshot input = %q", got)
 	}
+	if got := toolInputForDisplay("web_search", json.RawMessage(`"{\"query\":\"宁波天气\"}"`)); got != "宁波天气" {
+		t.Fatalf("string-encoded web_search input = %q", got)
+	}
+	if got := toolInputForDisplay("browser", json.RawMessage(`"{\"action\":\"open\",\"url\":\"https://example.com\"}"`)); got != "https://example.com" {
+		t.Fatalf("string-encoded browser input = %q", got)
+	}
 }

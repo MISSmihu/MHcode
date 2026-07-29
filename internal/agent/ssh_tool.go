@@ -53,7 +53,7 @@ type sshToolArguments struct {
 func (t SSHCredentialTool) Name() string { return "ssh" }
 
 func (t SSHCredentialTool) Description() string {
-	return "Connect directly to a user-authorized SSH target with host, username, and password authentication through an opaque mhcode-credential reference. No SSH key, ssh-agent, or external provider authorization entry is required. Use test to verify login, run to execute a remote command, upload_file or upload_directory to deploy workspace content, and capture_secret only when the user explicitly asks to retrieve a target-system credential or other sensitive value. capture_secret stores stdout in the host vault and returns only an opaque result ID; make its command print only the requested value. Never place a password in command text or tool arguments."
+	return "Connect directly to a user-authorized SSH target with host, username, and password authentication through an opaque mhcode-credential reference. No SSH key, ssh-agent, or external provider authorization entry is required. Use test to verify login, run to execute a remote command, upload_file or upload_directory to deploy workspace content, and capture_secret only when the user explicitly asks to retrieve a target-system credential or other sensitive value. capture_secret stores stdout in the host vault and returns only an opaque result ID; make its command print only one requested field. When the user requests multiple fields, such as an account and password, call capture_secret separately for every field and do not claim completion until every requested field has its own result. Never place a password in command text or tool arguments."
 }
 
 func (t SSHCredentialTool) InputSchema() map[string]any {
@@ -141,12 +141,12 @@ func (t SSHCredentialTool) Execute(ctx context.Context, rawArgs json.RawMessage)
 
 	switch args.Action {
 	case "test":
-		output := "SSH connection established to " + credential.displayTarget()
+		output := "SSH 已连接 " + credential.displayTarget()
 		if hostKey.Fingerprint != "" {
-			output += "\nHost key: " + hostKey.Fingerprint
+			output += "\n主机密钥指纹: " + hostKey.Fingerprint
 		}
 		if hostKey.AcceptedNew {
-			output += "\nHost key saved for future verification."
+			output += "\n已保存主机密钥，后续连接将校验该指纹。"
 		}
 		return sshExecutionResult(credential, displayInput, startedAt, output, "", 0, nil), nil
 	case "run":
@@ -193,9 +193,9 @@ func (t SSHCredentialTool) Execute(ctx context.Context, rawArgs json.RawMessage)
 				runErr,
 			), nil
 		}
-		secretValue := strings.TrimSpace(redactSSHText(stdout, credential.Password))
-		if secretValue == "" || strings.Contains(secretValue, "[已隐藏]") {
-			message := "captured output was empty or matched the SSH login password; the connection password cannot be returned"
+		secretValue := strings.TrimSpace(stdout)
+		if secretValue == "" {
+			message := "captured output was empty; make the command print only the requested value"
 			return sshExecutionResult(credential, displayInput, startedAt, "", message, -1, errors.New(message)), nil
 		}
 		secretPart, captureErr := t.CaptureSecret(args.SecretLabel, "ssh://"+credential.displayTarget(), secretValue)
@@ -617,7 +617,10 @@ func sshExecutionResult(
 		CompletedAt:      completedAt.Format(time.RFC3339Nano),
 		DurationMs:       sshElapsedMilliseconds(startedAt, completedAt),
 	}
-	summary := fmt.Sprintf("SSH %s finished with exit code %d", credential.displayTarget(), exitCode)
+	summary := fmt.Sprintf("SSH 操作已完成（%s，退出码 %d）", credential.displayTarget(), exitCode)
+	if status == "error" {
+		summary = fmt.Sprintf("SSH 操作失败（%s，退出码 %d）", credential.displayTarget(), exitCode)
+	}
 	return tools.Result{Summary: summary, Parts: []tools.ResultPart{part}, IsError: status == "error"}
 }
 
@@ -641,7 +644,7 @@ func sshSecretCaptureResult(
 		DurationMs:       sshElapsedMilliseconds(startedAt, completedAt),
 	}
 	return tools.Result{
-		Summary: fmt.Sprintf("Requested sensitive value was captured as host-managed result %s. The user can reveal or copy it in MHcode. The requested objective is satisfied; stop discovery and summarize now.", secretPart.SecretID),
+		Summary: fmt.Sprintf("已将请求字段 %q 保存为本机受保护结果。若用户还要求其他字段，必须逐项捕获后再汇总；不得声称已交付尚未捕获的字段。", secretPart.SecretLabel),
 		Parts:   []tools.ResultPart{toolPart, secretPart},
 	}
 }

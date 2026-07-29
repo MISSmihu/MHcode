@@ -812,10 +812,11 @@ func TestServiceResetDeepSeekSessionClearsSessionAndMetrics(t *testing.T) {
 	}
 }
 
-func TestServiceSanitizesInternalPrefixLeak(t *testing.T) {
+func TestServicePreservesLegitimateInternalIdentifierDiscussion(t *testing.T) {
+	const answer = "The code uses stable_prefix, product_identity, skills_index, and routing_policy as ordinary identifiers."
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		writeOpenAIReply(w, requestIsStream(body), "stable_prefix: product_identity secret", "")
+		writeOpenAIReply(w, requestIsStream(body), answer, "")
 	}))
 	defer server.Close()
 
@@ -831,11 +832,8 @@ func TestServiceSanitizesInternalPrefixLeak(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(result.Content, "stable_prefix") {
-		t.Fatalf("content leaked internal prefix: %q", result.Content)
-	}
-	if !strings.Contains(result.Content, "已拦截") {
-		t.Fatalf("content = %q, want interception notice", result.Content)
+	if result.Content != answer {
+		t.Fatalf("content = %q, want legitimate code discussion to remain intact", result.Content)
 	}
 }
 
@@ -858,6 +856,9 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 	if strings.Contains(prompt, "skills_index") || strings.Contains(prompt, "mcp_schema_snapshot") {
 		t.Fatalf("stable prompt should not expand long internal sections: %q", prompt)
 	}
+	if !strings.Contains(prompt, "use another structured read when more detail is needed") {
+		t.Fatalf("stable prompt should describe the real clipped-result recovery path: %q", prompt)
+	}
 	for _, forbidden := range []string{
 		"concise developer assistant",
 		"after each step changes state",
@@ -865,6 +866,8 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 		"cache_prefix_hash=",
 		"prompt-cache reuse depends",
 		"byte-stable across turns",
+		"Keep raw outputs in local references",
+		"raw_result_id",
 	} {
 		if strings.Contains(prompt, forbidden) {
 			t.Fatalf("stable prompt still contains capability-limiting instruction %q: %q", forbidden, prompt)
@@ -872,8 +875,9 @@ func TestFormatStablePromptMarksInternalsAsHidden(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"enough detail to fully handle",
-		"materially changes state",
-		"meaningful batch of tool calls",
+		"Decide the task strategy yourself",
+		"visible plan will materially help",
+		"call report_progress before the first action",
 		"length proportional to the task",
 		"immediately following any [MHcode private turn context] block",
 		"user explicitly supplies an absolute target",
@@ -905,17 +909,13 @@ func TestContextPreviewDoesNotForceStructuredSummary(t *testing.T) {
 	}
 }
 
-func TestContextPreviewPrioritizesLocalDiagnosticsOverSearch(t *testing.T) {
+func TestContextPreviewLeavesLocalDiagnosticStrategyToModel(t *testing.T) {
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
 	input := "你帮我看看，我的 Claude 桌面版是不是出了问题，CCSwitch 当前模型仍然是另一个中转的"
-	if !localEnvironmentDiagnosticRequest(input) {
-		t.Fatal("local Claude/CCSwitch diagnosis was not detected")
-	}
-	if localEnvironmentDiagnosticRequest("帮我查找 CCSwitch 官方仓库") {
-		t.Fatal("a public repository lookup must not be misclassified as local diagnosis")
-	}
-
 	ctx := service.contextPreviewForInput(input)
+	if !strings.Contains(stableSection(ctx, "system_rules", ""), "模型负责理解任务") {
+		t.Fatalf("system rules do not assign task strategy to the model: %#v", ctx.StablePrefix)
+	}
 	var requirements string
 	for _, section := range ctx.VolatileTail {
 		if section.Name == "output_requirements" {
@@ -923,10 +923,8 @@ func TestContextPreviewPrioritizesLocalDiagnosticsOverSearch(t *testing.T) {
 			break
 		}
 	}
-	for _, expected := range []string{"本机状态诊断任务", "本机结构化工具", "不能用网络搜索结果冒充本机检查", "必须读取权威页面"} {
-		if !strings.Contains(requirements, expected) {
-			t.Fatalf("local diagnostic requirements missing %q: %s", expected, requirements)
-		}
+	if strings.Contains(requirements, "本机状态诊断任务") {
+		t.Fatalf("host should not keyword-route a local diagnostic: %s", requirements)
 	}
 }
 

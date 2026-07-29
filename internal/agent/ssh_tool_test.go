@@ -60,12 +60,20 @@ func TestSSHCredentialToolUsesPasswordReferenceWithoutExposingSecret(t *testing.
 			return credential, nil
 		},
 		CaptureSecret: func(label, source, value string) (tools.ResultPart, error) {
-			if label != "应用管理员密码" || value != "application-secret" {
-				return tools.ResultPart{}, fmt.Errorf("unexpected captured value: label=%q value=%q", label, value)
+			expectedValue := "application-secret"
+			secretID := "secret-test-result"
+			if label == "与连接凭据相同的应用管理员密码" {
+				expectedValue = password
+				secretID = "secret-password-match-result"
+			} else if label != "应用管理员密码" {
+				return tools.ResultPart{}, fmt.Errorf("unexpected secret label: %q", label)
+			}
+			if value != expectedValue {
+				return tools.ResultPart{}, fmt.Errorf("unexpected captured value for %q", label)
 			}
 			return tools.ResultPart{
 				Kind:         tools.PartSecretResult,
-				SecretID:     "secret-test-result",
+				SecretID:     secretID,
 				SecretLabel:  label,
 				SecretSource: source,
 			}, nil
@@ -108,15 +116,18 @@ func TestSSHCredentialToolUsesPasswordReferenceWithoutExposingSecret(t *testing.
 	if strings.Contains(string(encodedSecretResult), password) || !strings.Contains(string(encodedSecretResult), "已隐藏") {
 		t.Fatalf("SSH result leaked the password: %s", encodedSecretResult)
 	}
-	loginPasswordCapture := executeSSHTestTool(t, tool, sshToolArguments{
+	matchingTargetPasswordCapture := executeSSHTestTool(t, tool, sshToolArguments{
 		Action:       "capture_secret",
 		CredentialID: credential.ID,
 		Command:      "echo-secret",
-		SecretLabel:  "SSH 登录密码",
+		SecretLabel:  "与连接凭据相同的应用管理员密码",
 	})
-	encodedLoginPasswordCapture, _ := json.Marshal(loginPasswordCapture)
-	if !loginPasswordCapture.IsError || strings.Contains(string(encodedLoginPasswordCapture), password) {
-		t.Fatalf("SSH login password capture was not rejected safely: %s", encodedLoginPasswordCapture)
+	encodedMatchingTargetPasswordCapture, _ := json.Marshal(matchingTargetPasswordCapture)
+	if matchingTargetPasswordCapture.IsError || !strings.Contains(string(encodedMatchingTargetPasswordCapture), "secret-password-match-result") {
+		t.Fatalf("matching target password was not captured: %s", encodedMatchingTargetPasswordCapture)
+	}
+	if strings.Contains(string(encodedMatchingTargetPasswordCapture), password) {
+		t.Fatalf("matching target password leaked into the tool result: %s", encodedMatchingTargetPasswordCapture)
 	}
 
 	localFile := filepath.Join(workspace, "index.html")
@@ -216,7 +227,11 @@ func TestSSHToolRegistrationAndStablePromptGuidance(t *testing.T) {
 		"No SSH key, ssh-agent, or external provider authorization entry is required.",
 		"not an SSH key or an external authorization entry",
 		"Password-based SSH authentication does not use ssh-add or ssh-agent.",
-		"use ssh test first",
+		"choose ssh test, ssh run",
+		"Call it separately for every requested field",
+		"a stored account does not satisfy a requested password",
+		"happens to equal the SSH connection password",
+		"without asking the user to reply with 'continue'",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Fatalf("stable prompt is missing %q", expected)
@@ -225,6 +240,9 @@ func TestSSHToolRegistrationAndStablePromptGuidance(t *testing.T) {
 	preview := service.contextPreviewForInput("")
 	if !strings.Contains(stableSection(preview, "system_rules", ""), "不需要 SSH Key") {
 		t.Fatal("password SSH policy is not part of the stable context hash")
+	}
+	if !strings.Contains(stableSection(preview, "system_rules", ""), "每个请求字段必须分别生成独立的受保护结果") {
+		t.Fatal("per-field protected result policy is not part of the stable context hash")
 	}
 }
 

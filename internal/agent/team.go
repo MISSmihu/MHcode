@@ -122,6 +122,7 @@ func isTeamRole(role string) bool {
 }
 
 func teamRoleLabel(role string) string {
+	role = strings.TrimSpace(role)
 	switch role {
 	case TeamRolePlanner:
 		return "规划"
@@ -134,7 +135,10 @@ func teamRoleLabel(role string) string {
 	case TeamRoleSynthesizer:
 		return "汇总"
 	default:
-		return role
+		if role == "" {
+			return "协作任务"
+		}
+		return "协作任务（" + role + "）"
 	}
 }
 
@@ -163,10 +167,7 @@ func cloneTeamRunCheckpoint(checkpoint *teamRunCheckpoint) *teamRunCheckpoint {
 }
 
 func newTeamRunCheckpoint(settings TeamSettings) *teamRunCheckpoint {
-	nextRole := TeamRoleImplementer
-	if roleEnabled(settings, TeamRolePlanner) {
-		nextRole = TeamRolePlanner
-	}
+	nextRole := firstTeamWorkStage(settings)
 	return &teamRunCheckpoint{
 		Version:     teamRunCheckpointVersion,
 		Status:      "running",
@@ -175,6 +176,21 @@ func newTeamRunCheckpoint(settings TeamSettings) *teamRunCheckpoint {
 		Artifacts:   []teamCheckpointArtifact{},
 		Parts:       []tools.ResultPart{},
 	}
+}
+
+func teamSettingsForPolicy(settings TeamSettings, policy tools.SandboxPolicy) TeamSettings {
+	settings.Roles = append([]TeamRoleSetting(nil), settings.Roles...)
+	readOnly := strings.EqualFold(strings.TrimSpace(policy.FilesystemAccess), "read-only") ||
+		strings.EqualFold(strings.TrimSpace(policy.SandboxMode), "read-only")
+	if !readOnly {
+		return settings
+	}
+	for index := range settings.Roles {
+		if settings.Roles[index].Role == TeamRoleImplementer {
+			settings.Roles[index].Enabled = false
+		}
+	}
+	return settings
 }
 
 func (s *Service) persistTeamRunCheckpoint(checkpoint *teamRunCheckpoint) error {
@@ -261,17 +277,6 @@ func teamArtifactAt(artifacts []teamArtifact, role string, attempt int) (teamArt
 	return teamArtifact{}, false
 }
 
-func isTeamResumePrompt(prompt string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(prompt))
-	normalized = strings.Trim(normalized, "。！!？?，,.;； ")
-	switch normalized {
-	case "继续", "继续吧", "继续执行", "继续开发", "接着", "接着做", "接着开发", "resume", "continue", "go on":
-		return true
-	default:
-		return false
-	}
-}
-
 type teamResumeTurnKey struct{}
 
 func withTeamResumeTurn(ctx context.Context) context.Context {
@@ -281,6 +286,70 @@ func withTeamResumeTurn(ctx context.Context) context.Context {
 func isTeamResumeTurn(ctx context.Context) bool {
 	resume, _ := ctx.Value(teamResumeTurnKey{}).(bool)
 	return resume
+}
+
+func (s *Service) hasPausedTeamRun() bool {
+	if s == nil {
+		return false
+	}
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.hasPausedTeamRunLocked()
+}
+
+// hasPausedTeamRunLocked is for state-building paths that already hold
+// stateMu. Keeping the lock-taking wrapper separate prevents a workbench
+// snapshot from trying to recursively acquire Go's non-reentrant RWMutex.
+func (s *Service) hasPausedTeamRunLocked() bool {
+	return s != nil && s.teamResume != nil && strings.EqualFold(strings.TrimSpace(s.teamResume.Status), "paused")
+}
+
+// AbandonPausedTeamTask explicitly ends a paused team run. It preserves the
+// append-only checkpoint for audit and rewind, but removes it from the active
+// resume slot so a later user message is never interpreted as an implicit
+// lifecycle decision.
+func (s *Service) AbandonPausedTeamTask() (WorkbenchState, error) {
+	release, err := s.beginActivity("ending a paused AI team task")
+	if err != nil {
+		return s.WorkbenchState(), err
+	}
+	defer release()
+
+	checkpoint := cloneTeamRunCheckpoint(s.teamResume)
+	if checkpoint == nil || !strings.EqualFold(strings.TrimSpace(checkpoint.Status), "paused") {
+		return s.workbenchStateLocked(), errors.New("当前会话没有可结束的 AI 团队任务")
+	}
+	if checkpoint.PlanStarted && len(s.planState.Steps) > 0 && s.planState.Status != "completed" && s.planState.Status != "cancelled" {
+		if err := s.finishPlanState("cancelled"); err != nil {
+			return s.workbenchStateLocked(), fmt.Errorf("结束团队计划失败: %w", err)
+		}
+	}
+
+	state := cloneTeamState(checkpoint.Team)
+	if len(state.Roles) == 0 {
+		state = cloneTeamState(s.teamState)
+	}
+	state.Enabled = s.runtimeSettings.Team.Enabled
+	state.Active = false
+	state.Status = "cancelled"
+	state.CurrentRole = ""
+	state.CompletedAt = time.Now().Format(time.RFC3339Nano)
+	state.Summary = "用户结束了暂停的 AI 团队任务。"
+	for index := range state.Roles {
+		if state.Roles[index].Status == "paused" || state.Roles[index].Status == "running" || state.Roles[index].Status == "pending" {
+			state.Roles[index].Status = "cancelled"
+			state.Roles[index].FinishedAt = state.CompletedAt
+		}
+	}
+	s.teamState = state
+	checkpoint.Status = "abandoned"
+	checkpoint.Team = cloneTeamState(state)
+	checkpoint.NextRole = ""
+	checkpoint.NextAttempt = 0
+	if err := s.persistTeamRunCheckpoint(checkpoint); err != nil {
+		return s.workbenchStateLocked(), fmt.Errorf("保存团队结束状态失败: %w", err)
+	}
+	return s.workbenchStateLocked(), nil
 }
 
 func (s *Service) recordTeamPauseMessage(content, model string, parts []tools.ResultPart, durations ...int64) {
@@ -298,197 +367,6 @@ func (s *Service) recordTeamPauseMessage(content, model string, parts []tools.Re
 
 func (s *Service) teamModeEnabled() bool {
 	return s.runtimeSettings.Team.Enabled
-}
-
-func (s *Service) runTeamTurnLegacy(
-	ctx context.Context,
-	baseRequest protocol.ChatRequest,
-	primary chatRoute,
-	prefixDiagnostic requestPrefixDiagnostic,
-	requestMessages []protocol.Message,
-	baseMessageCount int,
-	sink ChatEventSink,
-) (ChatResult, error) {
-	settings := s.runtimeSettings.Team
-	s.startTeamRun(settings, sink)
-	parts := make([]tools.ResultPart, 0, 24)
-	artifacts := make([]teamArtifact, 0, 8)
-	aggregate := cache.UsageMetrics{}
-	planStarted := false
-	cancelResult := func() (ChatResult, error) {
-		cancelErr := ctx.Err()
-		if cancelErr == nil {
-			cancelErr = context.Canceled
-		}
-		s.finishTeamRun("cancelled", "用户已停止团队任务", sink)
-		return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, cancelErr
-	}
-
-	run := func(role string, attempt int, prior []teamArtifact) (teamArtifact, error) {
-		if err := ctx.Err(); err != nil {
-			return teamArtifact{role: role}, err
-		}
-		roleSettings := teamRoleSettings(settings, role)
-		artifact, err := s.runTeamRole(ctx, roleSettings, attempt, primary, baseRequest, prior, sink)
-		if artifact.route.Provider.ID != "" {
-			aggregate = addUsageMetrics(aggregate, artifact.usage)
-		}
-		parts = append(parts, teamOperationalParts(artifact.parts)...)
-		parts = append(parts, teamArtifactPart(artifact, attempt, err))
-		if err == nil {
-			artifacts = append(artifacts, artifact)
-		}
-		return artifact, err
-	}
-
-	var plan teamArtifact
-	if roleEnabled(settings, TeamRolePlanner) {
-		var err error
-		plan, err = run(TeamRolePlanner, 1, nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return cancelResult()
-			}
-			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: "规划角色暂不可用，团队将直接进入实现", Model: primary.ModelID})
-		}
-	}
-
-	if s.planMode && strings.TrimSpace(plan.content) != "" {
-		steps := planStepsFromText(plan.content)
-		if len(steps) > 0 {
-			if err := s.startPlanState(steps); err != nil {
-				s.finishTeamRun("failed", "计划状态保存失败", sink)
-				return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID}, err
-			}
-			planStarted = true
-		}
-		approved, err := s.requestPlanApproval(ctx, plan.content)
-		if err != nil {
-			if ctx.Err() != nil {
-				return cancelResult()
-			}
-			err = s.failStartedPlan(planStarted, err)
-			s.finishTeamRun("failed", err.Error(), sink)
-			return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID}, err
-		}
-		if !approved {
-			if planStarted {
-				if err := s.finishPlanState("cancelled"); err != nil {
-					s.finishTeamRun("failed", err.Error(), sink)
-					return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID}, err
-				}
-			}
-			answer := "团队已完成规划，但你选择暂不执行。\n\n" + plan.content
-			parts = append(parts, tools.ResultPart{Kind: tools.PartText, Text: answer})
-			s.finishTeamRun("cancelled", "计划未获批准", sink)
-			s.metrics = aggregate
-			s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
-			s.commitRequestPrefix(prefixDiagnostic, requestMessages)
-			s.sessionState.MessageCount = len(s.sessionMessages)
-			s.sessionState.TurnCount++
-			s.recordAssistantAndCheckpoint(answer, plan.route.ModelID, parts, chatTurnDurationMs(ctx))
-			return ChatResult{Content: answer, Model: plan.route.ModelID, Usage: aggregate, State: s.workbenchStateLocked(), Parts: parts}, nil
-		}
-		if len(steps) > 0 {
-			steps[0].Status = "in_progress"
-			if err := s.updatePlanState(steps); err != nil {
-				err = s.failStartedPlan(planStarted, err)
-				s.finishTeamRun("failed", err.Error(), sink)
-				return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID}, err
-			}
-		}
-	}
-
-	implementation, err := run(TeamRoleImplementer, 1, artifacts)
-	if err != nil {
-		if ctx.Err() != nil {
-			return cancelResult()
-		}
-		err = s.failStartedPlan(planStarted, err)
-		s.finishTeamRun("failed", err.Error(), sink)
-		s.sessionMessages = s.sessionMessages[:baseMessageCount]
-		return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, err
-	}
-
-	latestChecks := make(map[string]teamArtifact, 2)
-	for _, role := range []string{TeamRoleTester, TeamRoleReviewer} {
-		if !roleEnabled(settings, role) {
-			continue
-		}
-		artifact, roleErr := run(role, 1, artifacts)
-		if ctx.Err() != nil {
-			return cancelResult()
-		}
-		if roleErr == nil {
-			latestChecks[role] = artifact
-		}
-	}
-
-	for round := 1; round <= settings.MaxReviewRounds && teamNeedsRevision(latestChecks); round++ {
-		if ctx.Err() != nil {
-			return cancelResult()
-		}
-		feedback := reviewArtifacts(latestChecks)
-		revisionContext := append(append([]teamArtifact(nil), artifacts...), teamArtifact{
-			role: TeamRoleReviewer, content: "需要修订：\n" + feedback, verdict: "changes_required",
-		})
-		implementation, err = run(TeamRoleImplementer, round+1, revisionContext)
-		if err != nil {
-			if ctx.Err() != nil {
-				return cancelResult()
-			}
-			err = s.failStartedPlan(planStarted, err)
-			s.finishTeamRun("failed", err.Error(), sink)
-			s.sessionMessages = s.sessionMessages[:baseMessageCount]
-			return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, err
-		}
-		latestChecks = make(map[string]teamArtifact, 2)
-		for _, role := range []string{TeamRoleTester, TeamRoleReviewer} {
-			if !roleEnabled(settings, role) {
-				continue
-			}
-			artifact, roleErr := run(role, round+1, artifacts)
-			if ctx.Err() != nil {
-				return cancelResult()
-			}
-			if roleErr == nil {
-				latestChecks[role] = artifact
-			}
-		}
-	}
-
-	var final teamArtifact
-	if roleEnabled(settings, TeamRoleSynthesizer) {
-		final, err = run(TeamRoleSynthesizer, 1, artifacts)
-	}
-	if ctx.Err() != nil {
-		return cancelResult()
-	}
-	answer := strings.TrimSpace(final.content)
-	if err != nil || answer == "" {
-		answer = fallbackTeamAnswer(implementation, latestChecks)
-	}
-	answer = sanitizeModelContent(answer)
-	parts = append(parts, tools.ResultPart{Kind: tools.PartText, Text: answer})
-	s.metrics = aggregate
-	s.sessionMessages = s.appendProtocolAssistantMessage(s.sessionMessages, answer, parts)
-	s.commitRequestPrefix(prefixDiagnostic, requestMessages)
-	s.sessionState.MessageCount = len(s.sessionMessages)
-	s.sessionState.TurnCount++
-	model := primary.ModelID
-	if final.route.ModelID != "" {
-		model = final.route.ModelID
-	}
-	if planStarted {
-		if err := s.finishPlanState("completed"); err != nil {
-			s.finishTeamRun("failed", err.Error(), sink)
-			return ChatResult{State: s.workbenchStateLocked(), Model: primary.ModelID, Parts: parts}, err
-		}
-	}
-	s.recordAssistantAndCheckpoint(answer, model, parts, chatTurnDurationMs(ctx))
-	s.markChatProviderStatus(primary.Provider.ID, "ok", fmt.Sprintf("AI 团队任务完成，共执行 %d 个角色回合。", len(artifacts)))
-	s.finishTeamRun("completed", answer, sink)
-	return ChatResult{Content: answer, Model: model, Usage: aggregate, State: s.workbenchStateLocked(), Parts: parts}, nil
 }
 
 func (s *Service) runTeamRole(
@@ -536,7 +414,7 @@ func (s *Service) runTeamRole(
 		if role == TeamRoleImplementer {
 			registry = s.buildWorkerToolRegistryForContext(ctx)
 		}
-		outcome, err = s.runStreamingToolLoopWithState(ctx, provider, registry, request, roleSink, deploymentSSHPreflight{}, observeUsage)
+		outcome, err = s.runStreamingToolLoopWithState(ctx, provider, registry, request, roleSink, observeUsage)
 	}
 
 	artifact := teamArtifact{role: role, attempt: attempt, content: strings.TrimSpace(outcome.Content), route: route, parts: outcome.Parts, usage: roleUsage}
@@ -598,6 +476,7 @@ func teamRoleRequest(base protocol.ChatRequest, role string, attempt int, route 
 	request.Messages = append([]protocol.Message(nil), base.Messages...)
 	request.Messages = append(request.Messages, protocol.Message{Role: "user", Content: teamRoleInstruction(role, attempt, artifacts)})
 	request.Tools = nil
+	request.ParallelToolCalls = role != TeamRoleSynthesizer
 	return request
 }
 
@@ -689,12 +568,19 @@ func teamVerdict(role, content string) string {
 	if role != TeamRoleTester && role != TeamRoleReviewer {
 		return ""
 	}
-	upper := strings.ToUpper(compactTeamText(content, 600))
-	if strings.Contains(upper, "CHANGES_REQUIRED") || strings.Contains(content, "需要修改") || strings.Contains(content, "必须修复") {
-		return "changes_required"
-	}
-	if strings.Contains(upper, "APPROVED") || strings.Contains(content, "通过") {
-		return "approved"
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(strings.Trim(line, "`*_# "))
+		if line == "" {
+			continue
+		}
+		switch strings.ToUpper(strings.Join(strings.Fields(line), " ")) {
+		case "VERDICT: APPROVED":
+			return "approved"
+		case "VERDICT: CHANGES_REQUIRED":
+			return "changes_required"
+		default:
+			return "unknown"
+		}
 	}
 	return "unknown"
 }
@@ -720,19 +606,23 @@ func reviewArtifacts(checks map[string]teamArtifact) string {
 	return strings.TrimSpace(out.String())
 }
 
-func fallbackTeamAnswer(implementation teamArtifact, checks map[string]teamArtifact) string {
+func teamFailureEvidenceContent(artifacts []teamArtifact, heading string) string {
 	var out strings.Builder
-	out.WriteString("AI 团队已完成本轮任务。")
-	if summary := compactTeamText(implementation.content, 1800); summary != "" {
-		out.WriteString("\n\n实现结果：\n")
-		out.WriteString(summary)
+	heading = strings.TrimSpace(heading)
+	if heading == "" {
+		heading = "以下是 AI 团队已保留的角色结果。"
 	}
-	for _, role := range []string{TeamRoleTester, TeamRoleReviewer} {
-		artifact, ok := checks[role]
-		if !ok || strings.TrimSpace(artifact.content) == "" {
+	out.WriteString(heading)
+	for _, role := range teamRoleOrder {
+		artifact, ok := latestTeamArtifact(artifacts, role)
+		if !ok {
 			continue
 		}
-		fmt.Fprintf(&out, "\n\n%s结果：\n%s", teamRoleLabel(role), compactTeamText(artifact.content, 1200))
+		summary := compactTeamText(artifact.content, 1_800)
+		if summary == "" {
+			continue
+		}
+		fmt.Fprintf(&out, "\n\n%s结果：\n%s", teamRoleLabel(role), summary)
 	}
 	return out.String()
 }

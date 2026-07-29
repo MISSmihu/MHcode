@@ -11,7 +11,40 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MISSmihu/MHcode/internal/protocol"
+	"github.com/MISSmihu/MHcode/internal/storage"
 )
+
+type closeTrackingUsageStore struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *closeTrackingUsageStore) Path() string { return "test-usage-store" }
+
+func (s *closeTrackingUsageStore) AppendUsage(storage.UsageRecord) error { return nil }
+
+func (s *closeTrackingUsageStore) RecentUsage(string, int) ([]storage.UsageRecord, error) {
+	return nil, nil
+}
+
+func (s *closeTrackingUsageStore) Totals(string) (storage.UsageTotals, error) {
+	return storage.UsageTotals{}, nil
+}
+
+func (s *closeTrackingUsageStore) Close() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *closeTrackingUsageStore) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
 
 func TestSessionRuntimesKeepConversationStateIsolated(t *testing.T) {
 	base := t.TempDir()
@@ -208,6 +241,142 @@ func TestSessionRuntimesUseIndependentApprovalBrokers(t *testing.T) {
 	}
 }
 
+func TestSessionRuntimesShareProtocolCompatibilityState(t *testing.T) {
+	tests := []struct {
+		name   string
+		config func(t *testing.T) ServiceConfig
+	}{
+		{
+			name: "in memory",
+			config: func(t *testing.T) ServiceConfig {
+				return ServiceConfig{SkillsDir: t.TempDir()}
+			},
+		},
+		{
+			name: "persistent project session",
+			config: func(t *testing.T) ServiceConfig {
+				base := t.TempDir()
+				return ServiceConfig{
+					SkillsDir:    t.TempDir(),
+					SessionsDir:  filepath.Join(base, "sessions"),
+					ProjectsPath: filepath.Join(base, "projects.json"),
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := NewService(test.config(t))
+			defer service.Close()
+
+			projectID, sessionID := service.ActiveSessionIDs()
+			first, err := service.NewProjectSessionRuntime(projectID, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.installationID == "" || first.installationID != service.installationID {
+				t.Fatalf("runtime installation ID = %q, service = %q", first.installationID, service.installationID)
+			}
+			if first.anthropicCompatibilityCache != service.anthropicCompatibilityCache {
+				t.Fatal("runtime must share the service Anthropic compatibility cache")
+			}
+
+			first.anthropicCompatibilityCache.Learn("relay", "claude-test", []string{"temperature"})
+			second, err := service.NewProjectSessionRuntime(projectID, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.installationID != service.installationID {
+				t.Fatalf("second runtime installation ID = %q, service = %q", second.installationID, service.installationID)
+			}
+			if got := strings.Join(second.anthropicCompatibilityCache.Parameters("relay", "claude-test"), ","); got != "temperature" {
+				t.Fatalf("compatibility cache was not reused: %q", got)
+			}
+		})
+	}
+}
+
+func TestSessionRuntimeFeedbackMergesIntoOwnerSettings(t *testing.T) {
+	base := t.TempDir()
+	settingsPath := filepath.Join(base, "runtime-settings.json")
+	service := NewService(ServiceConfig{
+		SkillsDir:    t.TempDir(),
+		SettingsPath: settingsPath,
+		SessionsDir:  filepath.Join(base, "sessions"),
+		ProjectsPath: filepath.Join(base, "projects.json"),
+	})
+	defer service.Close()
+
+	settings := service.WorkbenchState().RuntimeSettings
+	settings.Model = ModelSettings{
+		SelectedProviderID: "relay",
+		SelectedModelID:    "claude-test",
+		Providers: []ModelProviderSetting{{
+			ID: "relay", Name: "Relay", Protocol: "anthropic-compatible", Enabled: true,
+			Models: []ProviderModel{{ID: "claude-test", Provider: "relay"}},
+		}},
+	}
+	if _, err := service.SaveRuntimeSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	projectID, sessionID := service.ActiveSessionIDs()
+	runtime, err := service.NewProjectSessionRuntime(projectID, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	latest := service.WorkbenchState().RuntimeSettings
+	latest.TaskIdleTimeoutSeconds = 777
+	if _, err := service.SaveRuntimeSettings(latest); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.markChatProviderStatus("relay", "ok", "runtime connected")
+	runtime.rememberAnthropicCompatibility(protocol.AnthropicCompatibilityFeedback{
+		ProviderID: "relay", ModelID: "claude-test", UnsupportedParameters: []string{"temperature"},
+	})
+
+	assertSettings := func(label string, got RuntimeSettings) {
+		t.Helper()
+		if got.TaskIdleTimeoutSeconds != 777 {
+			t.Fatalf("%s replaced newer settings: idle timeout = %d", label, got.TaskIdleTimeoutSeconds)
+		}
+		provider, _, ok := findModelProvider(got.Model.Providers, "relay")
+		if !ok || provider.LastSyncStatus != "ok" || provider.LastSyncMessage != "runtime connected" {
+			t.Fatalf("%s provider status = %#v", label, provider)
+		}
+		model, _, ok := findProviderModel(provider.Models, "claude-test")
+		if !ok || strings.Join(model.UnsupportedParameters, ",") != "temperature" {
+			t.Fatalf("%s model compatibility = %#v", label, model)
+		}
+	}
+	assertSettings("owner", service.WorkbenchState().RuntimeSettings)
+	persisted, ok := loadRuntimeSettings(settingsPath)
+	if !ok {
+		t.Fatal("runtime settings were not persisted")
+	}
+	assertSettings("persisted", persisted)
+}
+
+func TestSessionRuntimeCloseDoesNotCloseSharedResources(t *testing.T) {
+	usageStore := &closeTrackingUsageStore{}
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), UsageStore: usageStore})
+	runtime, err := service.NewSessionRuntime("background-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.Close()
+	if usageStore.isClosed() {
+		t.Fatal("closing a detached session runtime closed the shared usage store")
+	}
+	service.Close()
+	if !usageStore.isClosed() {
+		t.Fatal("closing the owner service did not close the shared usage store")
+	}
+}
+
 func TestSessionRuntimesSendModelRequestsConcurrently(t *testing.T) {
 	var requestsMu sync.Mutex
 	requestCount := 0
@@ -288,6 +457,24 @@ func TestSessionRuntimesSendModelRequestsConcurrently(t *testing.T) {
 	}
 	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionA), "prompt-a", "prompt-b")
 	assertSessionHistory(t, service.GetSessionMessagesForSession(sessionB), "prompt-b", "prompt-a")
+}
+
+func TestSessionRuntimesShareWorkspaceMutationGate(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	defer service.Close()
+	service.runtimeSettings.WorkspaceRoot = t.TempDir()
+
+	runtimeA, err := service.NewSessionRuntime("session-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeB, err := service.NewSessionRuntime("session-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeA.toolMutationGateForWorkspace() != runtimeB.toolMutationGateForWorkspace() {
+		t.Fatal("detached runtimes for the same workspace received independent mutation gates")
+	}
 }
 
 func assertSessionHistory(t *testing.T, history []SessionMessage, included, excluded string) {

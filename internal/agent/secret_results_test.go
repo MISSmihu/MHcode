@@ -95,3 +95,43 @@ func TestSecretResultRejectsEmptyInvalidAndOversizedValues(t *testing.T) {
 		})
 	}
 }
+
+func TestSecretResultMergesDeduplicateOnlyMatchingIDs(t *testing.T) {
+	account := tools.ResultPart{
+		Kind:         tools.PartSecretResult,
+		Status:       "ok",
+		SecretID:     "secret-account",
+		SecretLabel:  "管理员账号",
+		SecretSource: "ssh://root@example.test",
+	}
+	password := tools.ResultPart{
+		Kind:         tools.PartSecretResult,
+		Status:       "ok",
+		SecretID:     "secret-password",
+		SecretLabel:  "管理员密码",
+		SecretSource: "ssh://root@example.test",
+	}
+	accountDuplicate := tools.ResultPart{
+		Kind:     tools.PartSecretResult,
+		SecretID: account.SecretID,
+	}
+
+	for name, merge := range map[string]func([]tools.ResultPart, []tools.ResultPart) []tools.ResultPart{
+		"outcome": mergeOutcomeParts,
+		"runtime": mergeTaskRuntimeParts,
+	} {
+		t.Run(name, func(t *testing.T) {
+			parts := merge(nil, []tools.ResultPart{account, password})
+			parts = merge(parts, []tools.ResultPart{accountDuplicate})
+			if len(parts) != 2 {
+				t.Fatalf("protected result count = %d, want 2: %#v", len(parts), parts)
+			}
+			if parts[0].SecretID != account.SecretID || parts[0].SecretLabel != account.SecretLabel || parts[0].SecretSource != account.SecretSource {
+				t.Fatalf("account result was duplicated or lost metadata: %#v", parts[0])
+			}
+			if parts[1].SecretID != password.SecretID || parts[1].SecretLabel != password.SecretLabel {
+				t.Fatalf("password result was not preserved independently: %#v", parts[1])
+			}
+		})
+	}
+}

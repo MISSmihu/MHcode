@@ -49,11 +49,13 @@ func TestLoaderParsesExplicitAndManualTriggers(t *testing.T) {
 	loader := NewFSLoader(fstest.MapFS{
 		"skills/auto/SKILL.md":             &fstest.MapFile{Data: []byte("---\nname: office-artifacts\ndescription: Office documents\n---\n# Office\n")},
 		"skills/auto/agents/mhcode.yaml":   &fstest.MapFile{Data: []byte("activation: auto\ntrigger: .xlsx | excel workbook\n")},
+		"skills/always/SKILL.md":           &fstest.MapFile{Data: []byte("---\nname: persistent-rules\ndescription: Persistent rules\n---\n# Rules\n")},
+		"skills/always/agents/mhcode.yaml": &fstest.MapFile{Data: []byte("activation: always\n")},
 		"skills/manual/SKILL.md":           &fstest.MapFile{Data: []byte("---\nname: manual-helper\ndescription: Manual helper\n---\n# Manual\n")},
 		"skills/manual/agents/mhcode.yaml": &fstest.MapFile{Data: []byte("activation: manual\n")},
 	}, "skills")
 	index, err := loader.Index()
-	if err != nil || len(index) != 2 {
+	if err != nil || len(index) != 3 {
 		t.Fatalf("index = %#v, err = %v", index, err)
 	}
 	entries := map[string]IndexEntry{}
@@ -67,6 +69,10 @@ func TestLoaderParsesExplicitAndManualTriggers(t *testing.T) {
 	manual := entries["manual-helper"]
 	if manual.TriggerMode != "manual" {
 		t.Fatalf("manual trigger entry = %#v", manual)
+	}
+	always := entries["persistent-rules"]
+	if always.Trigger != "always" || always.TriggerMode != "always" {
+		t.Fatalf("persistent trigger entry = %#v", always)
 	}
 }
 

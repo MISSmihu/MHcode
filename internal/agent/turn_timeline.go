@@ -7,7 +7,10 @@ import (
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
 
-const maxTurnTimelineNotes = 128
+const (
+	maxTurnTimelineNotes    = 128
+	timelineOverflowMessage = "较早的进展记录已折叠；完整工具结果仍保留在本轮活动记录中。"
+)
 
 func (s *Service) resetTurnTimeline() {
 	s.turnTimelineMu.Lock()
@@ -40,17 +43,32 @@ func (s *Service) captureTurnTimelineEvent(event ChatStreamEvent) {
 			status = "running"
 		}
 		message = redactSensitiveText(message)
-		if last := lastTimelineNote(s.turnTimelineParts); last != nil && last.Message == message && last.Status == status {
-			return
+		for index := len(s.turnTimelineParts) - 1; index >= 0; index-- {
+			part := s.turnTimelineParts[index]
+			if part.Kind != tools.PartTimelineNote {
+				continue
+			}
+			if event.ToolCallID != "" && part.ToolCallID == event.ToolCallID ||
+				event.ToolCallID == "" && part.Message == message {
+				s.turnTimelineParts[index] = mergeTimelineNoteParts(part, tools.ResultPart{
+					Kind: tools.PartTimelineNote, Message: message, Status: status,
+					ToolCallID: strings.TrimSpace(event.ToolCallID),
+				})
+				return
+			}
 		}
-		if timelineNoteCount(s.turnTimelineParts) >= maxTurnTimelineNotes {
+		settleOpenTimelineNotes(s.turnTimelineParts, "completed")
+		if timelineNoteCount(s.turnTimelineParts) >= maxTurnTimelineNotes-1 {
+			appendTimelineOverflowNote(&s.turnTimelineParts)
 			return
 		}
 		s.turnTimelineParts = append(s.turnTimelineParts, tools.ResultPart{
 			Kind: tools.PartTimelineNote, Message: message, Status: status,
-			StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			ToolCallID: strings.TrimSpace(event.ToolCallID),
+			StartedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 		})
 	case "tool":
+		settleOpenTimelineNotes(s.turnTimelineParts, "completed")
 		state := TaskRuntimeState{Parts: s.turnTimelineParts}
 		upsertTaskRuntimeToolPart(&state, event)
 		state.Parts = mergeTaskRuntimeParts(state.Parts, redactTaskRuntimeParts(event.Parts))
@@ -68,9 +86,48 @@ func (s *Service) captureTurnTimelineEvent(event ChatStreamEvent) {
 	}
 }
 
+func appendTimelineOverflowNote(parts *[]tools.ResultPart) {
+	if parts == nil {
+		return
+	}
+	for _, part := range *parts {
+		if part.Kind == tools.PartTimelineNote && part.Message == timelineOverflowMessage {
+			return
+		}
+	}
+	marker := tools.ResultPart{
+		Kind: tools.PartTimelineNote, Message: timelineOverflowMessage, Status: "completed",
+		StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if timelineNoteCount(*parts) >= maxTurnTimelineNotes {
+		for index := len(*parts) - 1; index >= 0; index-- {
+			if (*parts)[index].Kind == tools.PartTimelineNote {
+				(*parts)[index] = marker
+				return
+			}
+		}
+	}
+	*parts = append(*parts, marker)
+}
+
+func settleOpenTimelineNotes(parts []tools.ResultPart, status string) {
+	if status == "" {
+		status = "completed"
+	}
+	completedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	for index := range parts {
+		if parts[index].Kind != tools.PartTimelineNote || taskRuntimePartTerminal(parts[index].Status) {
+			continue
+		}
+		parts[index].Status = status
+		parts[index].CompletedAt = completedAt
+	}
+}
+
 func isRoutineTaskStatus(message string) bool {
 	message = strings.TrimSpace(message)
-	return message == "正在准备上下文" ||
+	return message == "正在执行任务" ||
+		message == "正在准备上下文" ||
 		message == "正在分析任务" ||
 		message == "正在生成执行计划" ||
 		strings.HasPrefix(message, "正在连接 ") ||

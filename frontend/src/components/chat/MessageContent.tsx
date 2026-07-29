@@ -36,6 +36,7 @@ import { openWorkspaceFile, revealWorkspaceFile } from "../../services/workbench
 import { formatElapsedDuration } from "../../lib/duration";
 import { writeClipboardText } from "../../lib/clipboard";
 import { isRoutineTaskStatus } from "../../lib/timeline";
+import { groupSecretResults, secretResultFieldLabel, type SecretResultGroup } from "../../lib/secret-results";
 import { InlineCodePreview } from "./InlineCodePreview";
 import { InlineDiffPreview } from "./InlineDiffPreview";
 
@@ -102,7 +103,7 @@ export function MessageContent(props: {
             </Match>
 			<Match when={block.kind === "secret"}>
 			  <SecretResultCard
-				part={(block as SecretRenderBlock).part}
+				group={(block as SecretRenderBlock).group}
 				onReveal={props.onRevealSecret}
 			  />
 			</Match>
@@ -138,7 +139,7 @@ type ActivityRenderBlock = { kind: "activity"; parts: MessagePart[] };
 type TeamRenderBlock = { kind: "team"; parts: TeamPart[] };
 type SubagentRenderBlock = { kind: "subagents"; parts: SubagentPart[] };
 type ProviderRenderBlock = { kind: "provider"; part: ProviderNoticePart };
-type SecretRenderBlock = { kind: "secret"; part: SecretResultPart };
+type SecretRenderBlock = { kind: "secret"; group: SecretResultGroup };
 type TimelineRenderBlock = { kind: "timeline"; part: TimelineNotePart };
 type RenderBlock = TextRenderBlock | TimelineRenderBlock | ActivityRenderBlock | TeamRenderBlock | SubagentRenderBlock | ProviderRenderBlock | SecretRenderBlock;
 type ActivityCategory = "command" | "edit" | "read" | "directory" | "search" | "web" | "repository" | "image" | "render" | "visual" | "browser" | "computer" | "open" | "file" | "tool";
@@ -591,9 +592,12 @@ function isChangedFilePart(part: FilePart): boolean {
 }
 
 function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
-  const blocks: RenderBlock[] = [];
-  const teamParts = parts.filter((part): part is TeamPart => part.kind === "team_role");
-  const subagentParts = parts.filter((part): part is SubagentPart => part.kind === "subagent");
+	const blocks: RenderBlock[] = [];
+	const teamParts = parts.filter((part): part is TeamPart => part.kind === "team_role");
+	const subagentParts = parts.filter((part): part is SubagentPart => part.kind === "subagent");
+	const secretGroups = groupSecretResults(parts.filter((part): part is SecretResultPart => part.kind === "secret_result"));
+	const secretGroupByID = new Map(secretGroups.flatMap((group) => group.parts.map((part) => [part.secretId, group] as const)));
+	const addedSecretGroups = new Set<string>();
   let teamAdded = false;
   let subagentsAdded = false;
   for (const part of parts) {
@@ -635,7 +639,11 @@ function groupRenderBlocks(parts: MessagePart[]): RenderBlock[] {
       continue;
     }
 	if (part.kind === "secret_result") {
-	  blocks.push({ kind: "secret", part });
+	  const group = secretGroupByID.get(part.secretId);
+	  if (group && !addedSecretGroups.has(group.key)) {
+		blocks.push({ kind: "secret", group });
+		addedSecretGroups.add(group.key);
+	  }
 	  continue;
 	}
     const previous = blocks.at(-1);
@@ -1238,6 +1246,59 @@ function WebSearchResults(props: {
 }
 
 function SecretResultCard(props: {
+  group: SecretResultGroup;
+  onReveal?: (secretID: string) => Promise<string>;
+}) {
+	const [copying, setCopying] = createSignal(false);
+	const [copied, setCopied] = createSignal(false);
+	const [error, setError] = createSignal("");
+	const copyAll = async () => {
+	  if (!props.onReveal) return;
+	  setCopying(true);
+	  setError("");
+	  try {
+		const values = await Promise.all(props.group.parts.map(async (part) => ({
+		  label: secretResultFieldLabel(part),
+		  value: await props.onReveal!(part.secretId),
+		})));
+		await writeClipboardText(values.map((item) => `${item.label}: ${item.value}`).join("\n"));
+		setCopied(true);
+		window.setTimeout(() => setCopied(false), 1_400);
+	  } catch (err) {
+		setError(err instanceof Error ? err.message : String(err));
+	  } finally {
+		setCopying(false);
+	  }
+	};
+
+	return (
+	  <section class="op-secret-result" classList={{ error: props.group.parts.some((part) => part.status === "error") }} aria-label="登录凭据">
+		<div class="op-secret-result-icon" aria-hidden="true"><KeyRound size={16} /></div>
+		<div class="op-secret-result-main">
+		  <header class="op-secret-result-head">
+			<span>
+			  <strong>{props.group.title}</strong>
+			  <Show when={props.group.source}><small>{props.group.source}</small></Show>
+			</span>
+			<Show when={props.group.parts.length > 1}>
+			  <button type="button" disabled={copying() || !props.onReveal} title="复制全部登录凭据" onClick={() => void copyAll()}>
+				<Show when={copying()} fallback={copied() ? <Check size={14} /> : <Copy size={14} />}>
+				  <LoaderCircle class="spinning" size={14} />
+				</Show>
+				{copied() ? "已复制" : "复制全部"}
+			  </button>
+			</Show>
+		  </header>
+		  <div class="op-secret-result-fields">
+			<For each={props.group.parts}>{(part) => <SecretResultField part={part} onReveal={props.onReveal} />}</For>
+		  </div>
+		  <Show when={error()}><span class="op-secret-result-error">{error()}</span></Show>
+		</div>
+	  </section>
+	);
+}
+
+function SecretResultField(props: {
   part: SecretResultPart;
   onReveal?: (secretID: string) => Promise<string>;
 }) {
@@ -1298,44 +1359,42 @@ function SecretResultCard(props: {
   onCleanup(clearHideTimer);
 
   return (
-    <section class="op-secret-result" classList={{ error: props.part.status === "error" }} aria-label="敏感结果">
-      <div class="op-secret-result-icon" aria-hidden="true"><KeyRound size={16} /></div>
-      <div class="op-secret-result-main">
-        <strong>{props.part.secretLabel || "远程敏感结果"}</strong>
-        <Show when={props.part.secretSource}><small>{props.part.secretSource}</small></Show>
+	<div class="op-secret-result-field">
+	  <span class="op-secret-result-field-label">{secretResultFieldLabel(props.part)}</span>
+	  <span class="op-secret-result-field-value">
         <Show
           when={revealed()}
-          fallback={<span class="op-secret-result-mask">内容已安全保存，查看时才从本机凭据库读取</span>}
+		  fallback={<span class="op-secret-result-mask">已安全保存</span>}
         >
           <code class="op-secret-result-value">{value()}</code>
         </Show>
         <Show when={error()}><span class="op-secret-result-error">{error()}</span></Show>
-      </div>
+	  </span>
       <div class="op-secret-result-actions">
         <button
           type="button"
           disabled={Boolean(busy()) || !props.onReveal}
-          title={revealed() ? "隐藏敏感结果" : "查看敏感结果"}
+		  aria-label={revealed() ? `隐藏${secretResultFieldLabel(props.part)}` : `查看${secretResultFieldLabel(props.part)}`}
+		  title={revealed() ? `隐藏${secretResultFieldLabel(props.part)}` : `查看${secretResultFieldLabel(props.part)}`}
           onClick={() => void toggleReveal()}
         >
           <Show when={busy() === "reveal"} fallback={revealed() ? <EyeOff size={14} /> : <Eye size={14} />}>
             <LoaderCircle class="spinning" size={14} />
           </Show>
-          {revealed() ? "隐藏" : "查看"}
         </button>
         <button
           type="button"
           disabled={Boolean(busy()) || !props.onReveal}
-          title="复制敏感结果"
+		  aria-label={`复制${secretResultFieldLabel(props.part)}`}
+		  title={`复制${secretResultFieldLabel(props.part)}`}
           onClick={() => void copyValue()}
         >
           <Show when={busy() === "copy"} fallback={copied() ? <Check size={14} /> : <Copy size={14} />}>
             <LoaderCircle class="spinning" size={14} />
           </Show>
-          {copied() ? "已复制" : "复制"}
         </button>
       </div>
-    </section>
+	</div>
   );
 }
 

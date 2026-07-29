@@ -64,41 +64,64 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 	usageLedger := s.usageLedger
 	planMode := s.planMode
 	providerFactory := s.providerFactory
+	providerStatusSink := s.providerStatusSink
+	if providerStatusSink == nil {
+		providerStatusSink = s.applySessionProviderStatus
+	}
+	installationID := s.installationID
+	anthropicCompatibilityCache := s.anthropicCompatibilityCache
+	anthropicCompatibilitySink := s.anthropicCompatibilitySink
+	if anthropicCompatibilitySink == nil {
+		anthropicCompatibilitySink = s.applySessionAnthropicCompatibility
+	}
 	baseMessages := cloneProtocolMessages(s.sessionMessages)
 	baseSessionState := s.sessionState
 	teamState := cloneTeamState(s.teamState)
 	teamResume := cloneTeamRunCheckpoint(s.teamResume)
 	failureStrategy := s.failureStrategySnapshot()
+	toolMutationGates := s.toolMutationGates
 	snapshot := cloneWorkbenchState(s.stateSnapshot)
 	var notify func(ApprovalRequest)
 	if s.approvals != nil {
 		notify = s.approvals.notification()
 	}
 	s.stateMu.RUnlock()
+	if installationID == "" {
+		installationID = stableInstallationID(config)
+	}
+	if anthropicCompatibilityCache == nil {
+		anthropicCompatibilityCache = protocol.NewAnthropicCompatibilityCache()
+	}
 
 	if projects == nil || strings.TrimSpace(config.SessionsDir) == "" {
 		// In-memory/test services have no persistent session directory. They can
 		// still get an isolated copy, but there is no event log to reopen.
 		runtime := &Service{
-			config:          config,
-			reasoning:       reasoning,
-			deepSeekState:   deepSeekState,
-			runtimeSettings: settings,
-			settingsPath:    config.SettingsPath,
-			secretVault:     secretVault,
-			builder:         builder,
-			mcpManager:      mcpManager,
-			pluginManager:   pluginManager,
-			usageStore:      usageStore,
-			usageLedger:     usageLedger,
-			planMode:        planMode,
-			providerFactory: providerFactory,
-			approvals:       newApprovalBroker(),
-			sessionID:       sessionID,
-			projectID:       projectID,
-			sessionMessages: baseMessages,
-			sessionState:    baseSessionState,
-			failureStrategy: failureStrategy,
+			config:                      config,
+			reasoning:                   reasoning,
+			deepSeekState:               deepSeekState,
+			runtimeSettings:             settings,
+			settingsPath:                config.SettingsPath,
+			secretVault:                 secretVault,
+			builder:                     builder,
+			mcpManager:                  mcpManager,
+			pluginManager:               pluginManager,
+			usageStore:                  usageStore,
+			usageLedger:                 usageLedger,
+			planMode:                    planMode,
+			providerFactory:             providerFactory,
+			providerStatusSink:          providerStatusSink,
+			installationID:              installationID,
+			anthropicCompatibilityCache: anthropicCompatibilityCache,
+			anthropicCompatibilitySink:  anthropicCompatibilitySink,
+			detachedSessionRuntime:      true,
+			approvals:                   newApprovalBroker(),
+			sessionID:                   sessionID,
+			projectID:                   projectID,
+			sessionMessages:             baseMessages,
+			sessionState:                baseSessionState,
+			failureStrategy:             failureStrategy,
+			toolMutationGates:           toolMutationGates,
 		}
 		runtime.approvals.SetNotify(notify)
 		runtime.teamState = teamState
@@ -126,24 +149,30 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 	}
 
 	runtime := &Service{
-		config:          config,
-		reasoning:       reasoning,
-		deepSeekState:   deepSeekState,
-		runtimeSettings: settings,
-		settingsPath:    config.SettingsPath,
-		secretVault:     secretVault,
-		builder:         builder,
-		mcpManager:      mcpManager,
-		pluginManager:   pluginManager,
-		usageStore:      usageStore,
-		usageLedger:     usageLedger,
-		planMode:        planMode,
-		providerFactory: providerFactory,
-		projects:        projects,
-		approvals:       newApprovalBroker(),
-		sessionID:       sessionID,
-		projectID:       projectID,
-		teamState:       TeamState{Enabled: settings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
+		config:                      config,
+		reasoning:                   reasoning,
+		deepSeekState:               deepSeekState,
+		runtimeSettings:             settings,
+		settingsPath:                config.SettingsPath,
+		secretVault:                 secretVault,
+		builder:                     builder,
+		mcpManager:                  mcpManager,
+		pluginManager:               pluginManager,
+		usageStore:                  usageStore,
+		usageLedger:                 usageLedger,
+		planMode:                    planMode,
+		providerFactory:             providerFactory,
+		providerStatusSink:          providerStatusSink,
+		installationID:              installationID,
+		anthropicCompatibilityCache: anthropicCompatibilityCache,
+		anthropicCompatibilitySink:  anthropicCompatibilitySink,
+		detachedSessionRuntime:      true,
+		projects:                    projects,
+		approvals:                   newApprovalBroker(),
+		sessionID:                   sessionID,
+		projectID:                   projectID,
+		teamState:                   TeamState{Enabled: settings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
+		toolMutationGates:           toolMutationGates,
 	}
 	runtime.approvals.SetNotify(notify)
 

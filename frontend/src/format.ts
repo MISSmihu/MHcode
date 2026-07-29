@@ -109,6 +109,7 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
     extraWritableRoots: [],
     toolTimeoutSeconds: 180,
     taskIdleTimeoutSeconds: 300,
+    maxConcurrentSubagents: 4,
     maxCommandSeconds: 120,
     maxCommandMemoryMb: 4096,
     maxCommandCpuPercent: 100,

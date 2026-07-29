@@ -150,7 +150,7 @@ stdin 和 stdout 每行只能包含一个完整 JSON 对象。stdout 不能输�
 宿主首先发送：
 
 ```json
-{"jsonrpc":"2.0","id":"initialize-1","method":"initialize","params":{"protocolVersion":"1.0","host":{"name":"MHcode","version":"0.3.9"},"plugin":{"id":"example-office-helper","version":"1.0.0"}}}
+{"jsonrpc":"2.0","id":"initialize-1","method":"initialize","params":{"protocolVersion":"1.0","host":{"name":"MHcode","version":"0.3.11"},"plugin":{"id":"example-office-helper","version":"1.0.0"}}}
 ```
 
 插件必须返回相同 `id`：

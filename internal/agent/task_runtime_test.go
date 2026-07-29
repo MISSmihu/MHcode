@@ -70,6 +70,94 @@ func TestTaskRuntimeHeartbeatDoesNotChangeVisibleStatus(t *testing.T) {
 	}
 }
 
+func TestTaskRuntimeLiveTerminalStatusKeepsFinalResultWritable(t *testing.T) {
+	service := newTaskRuntimeTestService(t, t.TempDir())
+	if err := service.StartTaskRuntime("task-final-result", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordTaskStreamEvent("task-final-result", ChatStreamEvent{
+		Type: "status", Status: "completed", Message: "provider reported finish",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	record, ok, err := service.eventStore.ReadTaskRuntime()
+	if err != nil || !ok {
+		t.Fatalf("runtime ok=%v err=%v", ok, err)
+	}
+	if record.Status != "running" {
+		t.Fatalf("live phase incorrectly finalized the task: %#v", record)
+	}
+
+	finalPart := tools.ResultPart{Kind: tools.PartToolCall, Name: "write_file", Status: "ok", Output: "saved"}
+	if err := service.FinishTaskRuntime("task-final-result", "completed", "task complete", ChatResult{
+		Content: "final answer", Parts: []tools.ResultPart{finalPart}, DurationMs: 42,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record, ok, err = service.eventStore.ReadTaskRuntime()
+	if err != nil || !ok {
+		t.Fatalf("final runtime ok=%v err=%v", ok, err)
+	}
+	if record.Status != "completed" || record.Content != "final answer" || len(record.Parts) != 1 || record.Parts[0].Output != "saved" {
+		t.Fatalf("final result was not persisted after a live finish: %#v", record)
+	}
+}
+
+func TestTaskRuntimeIgnoresLateEventsAfterFinalMerge(t *testing.T) {
+	service := newTaskRuntimeTestService(t, t.TempDir())
+	if err := service.StartTaskRuntime("task-late-event", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordTaskStreamEvent("task-late-event", ChatStreamEvent{Type: "delta", Delta: "partial answer"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FinishTaskRuntime("task-late-event", "completed", "task complete", ChatResult{
+		Content: "final answer",
+		Parts:   []tools.ResultPart{{Kind: tools.PartToolCall, Name: "write_file", Status: "ok", Output: "saved"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.RecordTaskStreamEvent("task-late-event", ChatStreamEvent{
+		Type: "tool", ToolName: "run_command", ToolCallID: "late-call", Status: "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RecordTaskStreamEvent("task-late-event", ChatStreamEvent{Type: "delta", Delta: " late output"}); err != nil {
+		t.Fatal(err)
+	}
+
+	record, ok, err := service.eventStore.ReadTaskRuntime()
+	if err != nil || !ok {
+		t.Fatalf("runtime ok=%v err=%v", ok, err)
+	}
+	if record.Status != "completed" || record.Content != "final answer" || len(record.Parts) != 1 || record.Parts[0].Name != "write_file" {
+		t.Fatalf("late event mutated final runtime: %#v", record)
+	}
+}
+
+func TestTaskRuntimeFirstTerminalMergeWins(t *testing.T) {
+	service := newTaskRuntimeTestService(t, t.TempDir())
+	if err := service.StartTaskRuntime("task-first-terminal", "2026-07-27T01:02:03Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FinishTaskRuntime("task-first-terminal", "failed", "first failure", ChatResult{Content: "first result"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FinishTaskRuntime("task-first-terminal", "completed", "late completion", ChatResult{Content: "late result"}); err != nil {
+		t.Fatal(err)
+	}
+
+	record, ok, err := service.eventStore.ReadTaskRuntime()
+	if err != nil || !ok {
+		t.Fatalf("runtime ok=%v err=%v", ok, err)
+	}
+	if record.Status != "failed" || record.Message != "first failure" || record.Content != "first result" {
+		t.Fatalf("late terminal merge replaced the first one: %#v", record)
+	}
+}
+
 func TestServiceStartupRecoversInterruptedTaskOnce(t *testing.T) {
 	base := t.TempDir()
 	service := newTaskRuntimeTestService(t, base)
@@ -145,5 +233,27 @@ func TestStartupDoesNotDuplicateAlreadyCommittedTask(t *testing.T) {
 	record, ok, err := restarted.eventStore.ReadTaskRuntime()
 	if err != nil || !ok || record.Status != "completed" {
 		t.Fatalf("committed runtime = %#v ok=%v err=%v", record, ok, err)
+	}
+}
+
+func TestMergeTaskRuntimePartsDoesNotRegressTerminalTimelineNote(t *testing.T) {
+	completed := tools.ResultPart{
+		Kind:        tools.PartTimelineNote,
+		Message:     "SSH 已验证，正在读取部署配置。",
+		Status:      "completed",
+		ToolCallID:  "progress-1",
+		StartedAt:   "2026-07-29T09:00:00Z",
+		CompletedAt: "2026-07-29T09:00:05Z",
+	}
+	staleRunning := tools.ResultPart{
+		Kind:       tools.PartTimelineNote,
+		Message:    completed.Message,
+		Status:     "running",
+		ToolCallID: completed.ToolCallID,
+	}
+
+	parts := mergeTaskRuntimeParts([]tools.ResultPart{completed}, []tools.ResultPart{staleRunning})
+	if len(parts) != 1 || parts[0].Status != "completed" || parts[0].CompletedAt != completed.CompletedAt || parts[0].StartedAt != completed.StartedAt {
+		t.Fatalf("terminal timeline note regressed: %#v", parts)
 	}
 }

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 var (
 	ErrTaskIdleTimeout      = errors.New("agent task idle timeout")
 	ErrToolExecutionTimeout = errors.New("tool execution timeout")
+	nilServiceMutationGate  sync.Mutex
 )
 
 type taskWatchdogControl struct {
@@ -21,6 +25,18 @@ type taskWatchdogControl struct {
 	stop     chan struct{}
 	cancel   context.CancelCauseFunc
 }
+
+type taskActivityReporter struct {
+	touch    func()
+	interval time.Duration
+}
+
+type taskActivityReporterKey struct{}
+
+const (
+	minTaskToolHeartbeatInterval = 10 * time.Millisecond
+	maxTaskToolHeartbeatInterval = 15 * time.Second
+)
 
 func (control *taskWatchdogControl) pause() {
 	if control == nil {
@@ -63,6 +79,10 @@ func withTaskIdleWatchdog(
 		touch()
 		emitChatEvent(serializedSink, event)
 	}
+	ctx = context.WithValue(ctx, taskActivityReporterKey{}, taskActivityReporter{
+		touch:    touch,
+		interval: taskToolHeartbeatInterval(timeout),
+	})
 
 	go func() {
 		timer := time.NewTimer(timeout)
@@ -95,6 +115,53 @@ func withTaskIdleWatchdog(
 	}()
 	touch()
 	return ctx, wrappedSink, control
+}
+
+func taskToolHeartbeatInterval(idleTimeout time.Duration) time.Duration {
+	if idleTimeout <= 0 {
+		return 0
+	}
+	interval := idleTimeout / 3
+	if interval < minTaskToolHeartbeatInterval {
+		return minTaskToolHeartbeatInterval
+	}
+	if interval > maxTaskToolHeartbeatInterval {
+		return maxTaskToolHeartbeatInterval
+	}
+	return interval
+}
+
+// startTaskToolHeartbeat distinguishes an active but quiet tool from a stalled
+// turn. It is intentionally not a UI event: real tool output remains the only
+// user-visible progress, while the tool watchdog still provides a hard bound.
+func startTaskToolHeartbeat(ctx context.Context) func() {
+	if ctx == nil {
+		return func() {}
+	}
+	reporter, ok := ctx.Value(taskActivityReporterKey{}).(taskActivityReporter)
+	if !ok || reporter.touch == nil || reporter.interval <= 0 {
+		return func() {}
+	}
+	reporter.touch()
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		ticker := time.NewTicker(reporter.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				reporter.touch()
+			}
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() { close(stop) })
+	}
 }
 
 func resolvedTaskContextError(ctx context.Context, err error) error {
@@ -146,12 +213,20 @@ func (s *Service) runToolWithWatchdog(
 	if retainsTaskContext {
 		executionCtx = ctx
 	}
+	stopHeartbeat := startTaskToolHeartbeat(executionCtx)
+	defer stopHeartbeat()
 
 	done := make(chan toolExecutionOutcome, 1)
 	go func() {
 		if toolNeedsExclusiveWorkspaceAccess(name, tool) {
-			s.toolMutationMu.Lock()
-			defer s.toolMutationMu.Unlock()
+			unlock, acquired := s.lockToolMutationUntilDone(toolCtx)
+			if !acquired {
+				return
+			}
+			defer unlock()
+		}
+		if err := executionCtx.Err(); err != nil {
+			return
 		}
 		result, err := s.runToolWithApproval(executionCtx, tool, name, rawArgs)
 		select {
@@ -182,4 +257,55 @@ func (s *Service) runToolWithWatchdog(
 			}},
 		}, nil
 	}
+}
+
+// lockToolMutationUntilDone waits for the exclusive workspace gate without
+// trapping a cancelled task behind another mutating tool. sync.Mutex does not
+// support context-aware waiting, so use short TryLock intervals and abandon
+// the wait as soon as the tool deadline or parent task is cancelled.
+func (s *Service) lockToolMutationUntilDone(ctx context.Context) (func(), bool) {
+	if s == nil {
+		return func() {}, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gate := s.toolMutationGateForWorkspace()
+	if gate.TryLock() {
+		return gate.Unlock, true
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return func() {}, false
+		case <-ticker.C:
+			if gate.TryLock() {
+				return gate.Unlock, true
+			}
+		}
+	}
+}
+
+func (s *Service) toolMutationGateForWorkspace() *sync.Mutex {
+	if s == nil {
+		return &nilServiceMutationGate
+	}
+	if s.toolMutationGates == nil {
+		return &s.toolMutationMu
+	}
+	root := strings.TrimSpace(s.runtimeSettings.WorkspaceRoot)
+	if root == "" {
+		return &s.toolMutationMu
+	}
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	root = filepath.Clean(root)
+	if runtime.GOOS == "windows" {
+		root = strings.ToLower(root)
+	}
+	gate, _ := s.toolMutationGates.LoadOrStore(root, &sync.Mutex{})
+	return gate.(*sync.Mutex)
 }

@@ -1,10 +1,11 @@
 import type { ChatTaskEvent, MessagePart } from "../types";
+import { sanitizeAssistantMessageParts, sanitizeAssistantTextForDisplay } from "./assistant-content";
 
 export function appendLiveAssistantText(
   parts: MessagePart[] | undefined,
   content: string | undefined,
 ): MessagePart[] {
-  const text = content?.trim();
+  const text = sanitizeAssistantTextForDisplay(content);
   if (!text) return parts ?? [];
 
   const next = [...(parts ?? [])];
@@ -19,8 +20,12 @@ export function displayMessageParts(
   content: string,
   streaming: boolean | undefined,
 ): MessagePart[] {
-  if (!parts?.length) return [{ kind: "text", text: content }];
-  return streaming ? appendLiveAssistantText(parts, content) : parts;
+  const visibleParts = sanitizeAssistantMessageParts(parts);
+  if (!visibleParts.length) {
+    const visibleContent = sanitizeAssistantTextForDisplay(content);
+    return visibleContent ? [{ kind: "text", text: visibleContent }] : [];
+  }
+  return streaming ? appendLiveAssistantText(visibleParts, content) : visibleParts;
 }
 
 export function updateLiveTimelineParts(
@@ -35,24 +40,43 @@ export function updateLiveTimelineParts(
     ? event.compression?.status || event.status || "running"
     : event.status || "running";
   const next = [...(parts ?? [])];
-  for (let index = next.length - 1; index >= 0; index--) {
-    const part = next[index];
-    if (part.kind !== "timeline_note") continue;
-    if (part.message === message && part.status === status) return next;
-    break;
-  }
-  next.push({
-    kind: "timeline_note",
-    message,
-    status,
-    startedAt: new Date().toISOString(),
-  });
-  return next;
+	for (let index = next.length - 1; index >= 0; index--) {
+	  const part = next[index];
+	  if (part.kind !== "timeline_note") continue;
+	  if (event.toolCallId && part.toolCallId === event.toolCallId || !event.toolCallId && part.message === message) {
+		const currentTerminal = isTerminalTimelineStatus(part.status);
+		const incomingTerminal = isTerminalTimelineStatus(status);
+		next[index] = currentTerminal && !incomingTerminal
+		  ? part
+		  : { ...part, message, status, toolCallId: event.toolCallId || part.toolCallId };
+		return next;
+	  }
+	}
+	const settled = settleLiveTimelineParts(next);
+	settled.push({
+	  kind: "timeline_note",
+	  message,
+	  status,
+	  toolCallId: event.toolCallId,
+	  startedAt: new Date().toISOString(),
+	});
+  return settled;
+}
+
+export function settleLiveTimelineParts(parts: MessagePart[] | undefined): MessagePart[] {
+  return (parts ?? []).map((part) => part.kind === "timeline_note" && !isTerminalTimelineStatus(part.status)
+	? { ...part, status: "completed", completedAt: part.completedAt || new Date().toISOString() }
+	: part);
+}
+
+function isTerminalTimelineStatus(status: string | undefined): boolean {
+  return ["completed", "failed", "cancelled", "interrupted", "error"].includes(status ?? "");
 }
 
 export function isRoutineTaskStatus(message: string | undefined): boolean {
-  const normalized = message?.trim() ?? "";
-  return normalized === "正在准备上下文"
+	const normalized = message?.trim() ?? "";
+	return normalized === "正在执行任务"
+	  || normalized === "正在准备上下文"
     || normalized === "正在分析任务"
     || normalized === "正在生成执行计划"
     || normalized.startsWith("正在连接 ")
@@ -60,5 +84,6 @@ export function isRoutineTaskStatus(message: string | undefined): boolean {
 }
 
 export function liveTaskStatus(message: string | undefined): string {
-  return isRoutineTaskStatus(message) ? "正在执行任务" : message?.trim() || "正在执行任务";
+	void message;
+	return "正在执行任务";
 }

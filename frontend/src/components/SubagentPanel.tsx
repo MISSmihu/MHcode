@@ -67,13 +67,6 @@ export function SubagentPanel(props: SubagentPanelProps) {
       </div>
 
       <div class="subagent-panel-scroll">
-        <Show when={props.part.subagentReasoning}>
-          <details class="subagent-reasoning">
-            <summary><ChevronRight size={12} />推理记录</summary>
-            <pre>{props.part.subagentReasoning}</pre>
-          </details>
-        </Show>
-
         <section class="subagent-output-section">
           <header>
             <strong>输出</strong>

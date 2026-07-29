@@ -170,7 +170,7 @@ func TestForkFromUserMessageRestoresFilesAndClearsPausedTeamCheckpoint(t *testin
 	if err := svc.persistTeamRunCheckpoint(checkpoint); err != nil {
 		t.Fatal(err)
 	}
-	svc.recordTeamPauseMessage("AI 团队已暂停，发送“继续”恢复。", "model-reviewer", nil)
+	svc.recordTeamPauseMessage("AI 团队已暂停，请使用“继续任务”操作恢复。", "model-reviewer", nil)
 
 	history := svc.GetSessionMessages()
 	if len(history) != 2 || history[0].Role != "user" {

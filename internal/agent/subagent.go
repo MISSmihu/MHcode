@@ -15,10 +15,18 @@ import (
 )
 
 const (
-	maxDelegatedTasks        = 3
-	maxSubagentTimelineSteps = 10
-	maxSubagentActivities    = 120
-	maxSubagentOutputRunes   = 96_000
+	defaultMaxConcurrentSubagents = 4
+	maxConcurrentSubagents        = 16
+	maxSubagentTimelineSteps      = 10
+	maxSubagentActivities         = 120
+	maxSubagentOutputRunes        = 96_000
+	subagentCancellationJoinGrace = 750 * time.Millisecond
+)
+
+const (
+	subagentActivityOverflowID = "mhcode-subagent-activity-overflow"
+	subagentActivityOverflow   = "较早的活动已折叠；后续工具活动仍在继续记录。"
+	subagentStepOverflow       = "更多工具活动见详细记录"
 )
 
 const (
@@ -174,20 +182,40 @@ func cloneDelegatedTaskResult(result delegatedTaskResult) delegatedTaskResult {
 // immediately. Worker registries deliberately omit coordinator tools, so
 // delegation cannot recurse.
 type DelegateTaskTool struct {
-	Service *Service
+	Service  *Service
+	ReadOnly bool
 }
 
 func (DelegateTaskTool) Name() string { return "delegate_task" }
+
+func (t DelegateTaskTool) concurrencyLimit() int {
+	if t.Service == nil {
+		return defaultMaxConcurrentSubagents
+	}
+	return t.Service.subagentConcurrencyLimit()
+}
 
 // RetainsTaskContext reports that workers started by this tool intentionally
 // outlive Execute and remain bound to the parent chat task instead.
 func (DelegateTaskTool) RetainsTaskContext() bool { return true }
 
-func (DelegateTaskTool) Description() string {
-	return "将 1-3 个彼此独立的子任务同时放到后台执行并立即返回任务 ID。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。启动后主 Agent 应继续自己的独立工作，临近最终综合时再调用 await_subagents。多个 implement 以及主 Agent 的写入范围必须互不重叠。"
+func (t DelegateTaskTool) Description() string {
+	if t.ReadOnly {
+		return fmt.Sprintf("将 1-%d 个彼此独立的只读子任务同时放到后台执行并立即返回任务 ID。当前权限仅允许 explore/review，不能委派 implement。启动后主 Agent 应继续自己的独立工作，临近最终综合时再调用 await_subagents。此数值只限制并行工作者，不限制本轮工具调用次数。", t.concurrencyLimit())
+	}
+	return fmt.Sprintf("将 1-%d 个彼此独立的子任务同时放到后台执行并立即返回任务 ID。explore/review 仅可读取；implement 可修改工作区并继续遵守当前沙箱与审批规则。启动后主 Agent 应继续自己的独立工作，临近最终综合时再调用 await_subagents。此数值只限制并行工作者，不限制本轮工具调用次数。多个 implement 以及主 Agent 的写入范围必须互不重叠。", t.concurrencyLimit())
 }
 
-func (DelegateTaskTool) InputSchema() map[string]any {
+func (t DelegateTaskTool) InputSchema() map[string]any {
+	limit := t.concurrencyLimit()
+	agentTypes := []string{subagentExplore, subagentReview}
+	agentTypeDescription := "explore=只读探索，review=只读审阅。当前权限不允许 implement。"
+	taskDescription := "会同时启动的彼此独立只读子任务；需要前后依赖的工作应分多次调用。"
+	if !t.ReadOnly {
+		agentTypes = append(agentTypes, subagentImplement)
+		agentTypeDescription = "explore=只读探索，review=只读审阅，implement=允许修改。"
+		taskDescription = "会同时启动的彼此独立子任务；implement 的文件范围不得重叠，需要前后依赖的工作应分多次调用。"
+	}
 	return map[string]any{
 		"type":                 "object",
 		"additionalProperties": false,
@@ -195,8 +223,8 @@ func (DelegateTaskTool) InputSchema() map[string]any {
 			"tasks": map[string]any{
 				"type":        "array",
 				"minItems":    1,
-				"maxItems":    maxDelegatedTasks,
-				"description": "会同时启动的彼此独立子任务；implement 的文件范围不得重叠，需要前后依赖的工作应分多次调用。",
+				"maxItems":    limit,
+				"description": taskDescription,
 				"items": map[string]any{
 					"type":                 "object",
 					"additionalProperties": false,
@@ -211,8 +239,8 @@ func (DelegateTaskTool) InputSchema() map[string]any {
 						},
 						"agentType": map[string]any{
 							"type":        "string",
-							"enum":        []string{subagentExplore, subagentReview, subagentImplement},
-							"description": "explore=只读探索，review=只读审阅，implement=允许修改。",
+							"enum":        agentTypes,
+							"description": agentTypeDescription,
 						},
 						"providerId": map[string]any{
 							"type":        "string",
@@ -244,12 +272,20 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return delegatedTaskError("子代理参数无效: " + err.Error()), nil
 	}
-	specs, err := normalizeDelegatedTaskSpecs(args.Tasks)
+	limit := t.concurrencyLimit()
+	specs, err := normalizeDelegatedTaskSpecs(args.Tasks, limit)
 	if err != nil {
 		return delegatedTaskError(err.Error()), nil
 	}
-	if active := t.Service.activeSubagentCount(); active+len(specs) > maxDelegatedTasks {
-		return delegatedTaskError(fmt.Sprintf("当前已有 %d 个子代理运行中，并发扇出最多为 %d；请先继续主任务或收集已有结果。", active, maxDelegatedTasks)), nil
+	if t.ReadOnly {
+		for index, spec := range specs {
+			if spec.AgentType == subagentImplement {
+				return delegatedTaskError(fmt.Sprintf("第 %d 个子任务请求 implement，但当前工作区是只读权限；请改用 explore/review 或调整权限后重试", index+1)), nil
+			}
+		}
+	}
+	if active := t.Service.activeSubagentCount(); active+len(specs) > limit {
+		return delegatedTaskError(fmt.Sprintf("当前已有 %d 个子代理运行中，并行子代理上限为 %d；请先继续主任务或收集已有结果。", active, limit)), nil
 	}
 
 	parts := make([]tools.ResultPart, len(specs))
@@ -495,24 +531,84 @@ func (s *Service) hasUncollectedSubagents() bool {
 	return len(controls) > 0
 }
 
-// finishSubagentTurn is the final lifecycle barrier. On cancellation every
-// worker is stopped first; in all cases the method joins workers before the
-// caller can commit or roll back the parent turn.
+// finishSubagentTurn is retained for callers that do not have a parent task
+// context. Production chat turns use finishSubagentTurnWithContext so a task
+// cancellation also stops every worker before the parent can commit or roll
+// back its state.
 func (s *Service) finishSubagentTurn(cancelWorkers bool) []tools.ResultPart {
+	return s.finishSubagentTurnWithContext(context.Background(), cancelWorkers)
+}
+
+// finishSubagentTurnWithContext is the final lifecycle barrier. A parent
+// cancellation is forwarded to all workers before joining them, so a stalled
+// child cannot leave the parent waiting while its task watchdog has already
+// decided that the turn must end.
+func (s *Service) finishSubagentTurnWithContext(ctx context.Context, cancelWorkers bool) []tools.ResultPart {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	controls, _ := s.selectSubagents(nil, false)
-	if cancelWorkers {
+	cancelAll := func() {
 		for _, control := range controls {
 			if control.cancel != nil {
 				control.cancel()
 			}
 		}
 	}
+	workersCancelled := cancelWorkers
+	if workersCancelled {
+		cancelAll()
+	}
+	var cancellationDeadline time.Time
+	startCancellationDeadline := func() {
+		if !cancellationDeadline.IsZero() {
+			return
+		}
+		cancellationDeadline = time.Now().Add(subagentCancellationJoinGrace)
+	}
+	waitForCancellation := func(control *subagentControl) bool {
+		remaining := time.Until(cancellationDeadline)
+		if remaining <= 0 {
+			return false
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case <-control.done:
+			return true
+		case <-timer.C:
+			return false
+		}
+	}
+	if workersCancelled {
+		startCancellationDeadline()
+	}
+	detached := make(map[string]tools.ResultPart)
 	for _, control := range controls {
-		<-control.done
+		if workersCancelled {
+			if !waitForCancellation(control) {
+				detached[control.taskID] = detachedSubagentPart(control)
+			}
+			continue
+		}
+		select {
+		case <-control.done:
+		case <-ctx.Done():
+			cancelAll()
+			workersCancelled = true
+			startCancellationDeadline()
+			if !waitForCancellation(control) {
+				detached[control.taskID] = detachedSubagentPart(control)
+			}
+		}
 	}
 
 	parts := make([]tools.ResultPart, 0, len(controls)*2)
 	for _, control := range controls {
+		if part, detached := detached[control.taskID]; detached {
+			parts = append(parts, part)
+			continue
+		}
 		result, finished, newlyCollected := control.collect()
 		if !finished {
 			continue
@@ -534,6 +630,23 @@ func (s *Service) finishSubagentTurn(cancelWorkers bool) []tools.ResultPart {
 	return parts
 }
 
+func detachedSubagentPart(control *subagentControl) tools.ResultPart {
+	part, _, _, _ := control.snapshot()
+	part.Status = "cancelled"
+	part.Summary = "子代理未在取消宽限期内停止，已从当前任务分离并转入后台清理。"
+	part.CurrentAction = "已停止并分离"
+	part.CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if part.DurationMs < 1 {
+		part.DurationMs = 1
+	}
+	for index := range part.Steps {
+		if part.Steps[index].Status == "pending" || part.Steps[index].Status == "in_progress" {
+			part.Steps[index].Status = "cancelled"
+		}
+	}
+	return part
+}
+
 func (s *Service) recordDelegatedTaskUsage(result delegatedTaskResult) {
 	if len(result.usage) == 0 || result.route.Provider.ID == "" {
 		return
@@ -544,12 +657,13 @@ func (s *Service) recordDelegatedTaskUsage(result delegatedTaskResult) {
 	}
 }
 
-func normalizeDelegatedTaskSpecs(input []delegateTaskSpec) ([]delegateTaskSpec, error) {
+func normalizeDelegatedTaskSpecs(input []delegateTaskSpec, limit int) ([]delegateTaskSpec, error) {
+	limit = normalizeSubagentConcurrencyLimit(limit)
 	if len(input) == 0 {
 		return nil, fmt.Errorf("至少需要一个子任务")
 	}
-	if len(input) > maxDelegatedTasks {
-		return nil, fmt.Errorf("一次最多委派 %d 个子任务", maxDelegatedTasks)
+	if len(input) > limit {
+		return nil, fmt.Errorf("一次最多委派 %d 个子任务", limit)
 	}
 	output := make([]delegateTaskSpec, len(input))
 	for index, spec := range input {
@@ -684,13 +798,16 @@ func (s *Service) runDelegatedTask(
 				key = event.ToolName + "\x00" + event.ToolInput
 			}
 			index, exists := stepIndex[key]
-			if !exists && len(part.Steps) < maxSubagentTimelineSteps {
+			if !exists && len(part.Steps) < maxSubagentTimelineSteps-1 {
 				title := subagentToolStepTitle(event.ToolName, event.ToolInput)
 				part.Steps = append(part.Steps, tools.ProgressStep{Title: title, Status: "in_progress"})
 				index = len(part.Steps) - 1
 				stepIndex[key] = index
+				exists = true
+			} else if !exists {
+				markSubagentStepOverflow(&part)
 			}
-			if exists || index > 0 {
+			if exists {
 				switch event.Status {
 				case "error":
 					part.Steps[index].Status = "error"
@@ -797,7 +914,7 @@ func subagentRequest(base protocol.ChatRequest, spec delegateTaskSpec, taskID st
 	})
 	request.Tools = nil
 	request.ToolChoice = "auto"
-	request.ParallelToolCalls = false
+	request.ParallelToolCalls = true
 	return request
 }
 
@@ -934,6 +1051,60 @@ func boundedSubagentText(current, addition string) string {
 	return "[较早的输出已省略]\n" + string(runes[len(runes)-maxSubagentOutputRunes:])
 }
 
+func normalizeSubagentConcurrencyLimit(value int) int {
+	if value <= 0 {
+		return defaultMaxConcurrentSubagents
+	}
+	if value > maxConcurrentSubagents {
+		return maxConcurrentSubagents
+	}
+	return value
+}
+
+func (s *Service) subagentConcurrencyLimit() int {
+	if s == nil {
+		return defaultMaxConcurrentSubagents
+	}
+	return normalizeSubagentConcurrencyLimit(s.runtimeSettings.MaxConcurrentSubagents)
+}
+
+func markSubagentStepOverflow(part *tools.ResultPart) {
+	if part == nil {
+		return
+	}
+	for _, step := range part.Steps {
+		if step.Title == subagentStepOverflow {
+			return
+		}
+	}
+	marker := tools.ProgressStep{Title: subagentStepOverflow, Status: "in_progress"}
+	if len(part.Steps) >= maxSubagentTimelineSteps {
+		part.Steps[len(part.Steps)-1] = marker
+		return
+	}
+	part.Steps = append(part.Steps, marker)
+}
+
+func markSubagentActivityOverflow(part *tools.ResultPart) {
+	if part == nil {
+		return
+	}
+	for _, activity := range part.Activities {
+		if activity.ID == subagentActivityOverflowID {
+			return
+		}
+	}
+	marker := tools.SubagentActivity{
+		ID: subagentActivityOverflowID, Kind: "status", Title: "活动记录已折叠",
+		Status: "running", Output: subagentActivityOverflow, StartedAt: time.Now().Format(time.RFC3339Nano),
+	}
+	if len(part.Activities) >= maxSubagentActivities {
+		part.Activities[len(part.Activities)-1] = marker
+		return
+	}
+	part.Activities = append(part.Activities, marker)
+}
+
 func upsertSubagentActivity(part *tools.ResultPart, indexes map[string]int, event ChatStreamEvent) {
 	if part == nil {
 		return
@@ -944,7 +1115,8 @@ func upsertSubagentActivity(part *tools.ResultPart, indexes map[string]int, even
 	}
 	index, exists := indexes[key]
 	if !exists {
-		if len(part.Activities) >= maxSubagentActivities {
+		if len(part.Activities) >= maxSubagentActivities-1 {
+			markSubagentActivityOverflow(part)
 			return
 		}
 		index = len(part.Activities)
@@ -994,7 +1166,11 @@ func subagentActivityOutput(event ChatStreamEvent) string {
 }
 
 func appendSubagentProviderActivity(part *tools.ResultPart, event ChatStreamEvent) {
-	if part == nil || len(part.Activities) >= maxSubagentActivities {
+	if part == nil {
+		return
+	}
+	if len(part.Activities) >= maxSubagentActivities-1 {
+		markSubagentActivityOverflow(part)
 		return
 	}
 	message := strings.TrimSpace(event.Message)

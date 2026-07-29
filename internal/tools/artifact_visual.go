@@ -172,15 +172,12 @@ func (t InspectVisualTool) Description() string {
 
 func (t InspectVisualTool) InputSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":                 "object",
+		"additionalProperties": false,
 		"properties": map[string]any{
 			"render_id": map[string]any{"type": "string", "description": "renderId returned by render_artifact."},
 			"path":      map[string]any{"type": "string", "description": "Optional file path used to recover its latest render."},
 			"criteria":  map[string]any{"type": "string", "description": "Task-specific visible acceptance criteria."},
-		},
-		"anyOf": []any{
-			map[string]any{"required": []string{"render_id"}},
-			map[string]any{"required": []string{"path"}},
 		},
 	}
 }

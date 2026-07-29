@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,23 +28,25 @@ type subagentProbeProvider struct {
 }
 
 type subagentEndToEndProvider struct {
-	mu                 sync.Mutex
-	mainCalls          int
-	childCalls         int
-	childTools         []protocol.ToolDefinition
-	sawDelegatedResult bool
+	mu                       sync.Mutex
+	mainCalls                int
+	childCalls               int
+	childTools               []protocol.ToolDefinition
+	sawDelegatedResult       bool
+	sawPendingSubagentPrompt bool
 }
 
 type parentChildParallelProvider struct {
-	mu             sync.Mutex
-	mainCalls      int
-	childCalls     int
-	sawChildResult bool
-	childStarted   chan struct{}
-	mainProgressed chan struct{}
-	releaseChild   chan struct{}
-	childOnce      sync.Once
-	mainOnce       sync.Once
+	mu                       sync.Mutex
+	mainCalls                int
+	childCalls               int
+	sawChildResult           bool
+	sawPendingSubagentPrompt bool
+	childStarted             chan struct{}
+	mainProgressed           chan struct{}
+	releaseChild             chan struct{}
+	childOnce                sync.Once
+	mainOnce                 sync.Once
 }
 
 type cancellingImplementProvider struct {
@@ -156,6 +159,12 @@ func (p *subagentEndToEndProvider) Stream(_ context.Context, request protocol.Ch
 	p.mu.Lock()
 	p.mainCalls++
 	mainCall := p.mainCalls
+	for _, message := range request.Messages {
+		if message.InternalKind == "subagent-pending" {
+			p.sawPendingSubagentPrompt = true
+			break
+		}
+	}
 	if len(request.Messages) > 0 && request.Messages[len(request.Messages)-1].Role == "tool" {
 		p.sawDelegatedResult = strings.Contains(request.Messages[len(request.Messages)-1].Content, "子代理确认了真实目录结构")
 	}
@@ -206,6 +215,12 @@ func (p *parentChildParallelProvider) Stream(ctx context.Context, request protoc
 	p.mu.Lock()
 	p.mainCalls++
 	mainCall := p.mainCalls
+	for _, message := range request.Messages {
+		if message.InternalKind == "subagent-pending" {
+			p.sawPendingSubagentPrompt = true
+			break
+		}
+	}
 	if len(request.Messages) > 0 && request.Messages[len(request.Messages)-1].Role == "tool" {
 		p.sawChildResult = p.sawChildResult || strings.Contains(request.Messages[len(request.Messages)-1].Content, "后台审阅完成")
 	}
@@ -392,9 +407,10 @@ func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
 	mainCalls, childCalls := provider.mainCalls, provider.childCalls
 	childTools := append([]protocol.ToolDefinition(nil), provider.childTools...)
 	sawDelegatedResult := provider.sawDelegatedResult
+	sawPendingSubagentPrompt := provider.sawPendingSubagentPrompt
 	provider.mu.Unlock()
-	if mainCalls != 3 || childCalls != 1 || !sawDelegatedResult {
-		t.Fatalf("provider calls main=%d child=%d saw result=%v", mainCalls, childCalls, sawDelegatedResult)
+	if mainCalls != 4 || childCalls != 1 || !sawDelegatedResult || !sawPendingSubagentPrompt {
+		t.Fatalf("provider calls main=%d child=%d saw result=%v saw pending reminder=%v", mainCalls, childCalls, sawDelegatedResult, sawPendingSubagentPrompt)
 	}
 	assertSubagentToolSet(t, childTools, false)
 	assertSubagentParts(t, result.Parts, 1, "completed")
@@ -471,8 +487,8 @@ func TestMainAgentContinuesToolWorkWhileSubagentRuns(t *testing.T) {
 	}
 	provider.mu.Lock()
 	defer provider.mu.Unlock()
-	if provider.mainCalls != 4 || provider.childCalls != 1 || !provider.sawChildResult {
-		t.Fatalf("provider calls main=%d child=%d saw child=%v", provider.mainCalls, provider.childCalls, provider.sawChildResult)
+	if provider.mainCalls != 5 || provider.childCalls != 1 || !provider.sawChildResult || !provider.sawPendingSubagentPrompt {
+		t.Fatalf("provider calls main=%d child=%d saw child=%v saw pending reminder=%v", provider.mainCalls, provider.childCalls, provider.sawChildResult, provider.sawPendingSubagentPrompt)
 	}
 	eventsMu.Lock()
 	defer eventsMu.Unlock()
@@ -583,6 +599,7 @@ func TestDelegateTaskRunsImplementWorkersConcurrentlyAndAllowsWriteTools(t *test
 func TestDelegateTaskRejectsFanoutBeyondActiveWorkerLimit(t *testing.T) {
 	provider := &subagentProbeProvider{block: true}
 	service, ctx := newSubagentToolTest(t, provider)
+	service.runtimeSettings.MaxConcurrentSubagents = 2
 	first, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[
 		{"label":"first","task":"wait","agentType":"explore"},
 		{"label":"second","task":"wait","agentType":"review"}
@@ -599,13 +616,87 @@ func TestDelegateTaskRejectsFanoutBeyondActiveWorkerLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !second.IsError || !strings.Contains(second.Summary, "并发扇出最多为 3") {
+	if !second.IsError || !strings.Contains(second.Summary, "并行子代理上限为 2") {
 		t.Fatalf("fanout result = %#v", second)
 	}
 	if active := service.activeSubagentCount(); active != 2 {
 		t.Fatalf("active subagents = %d, want 2", active)
 	}
 	service.finishSubagentTurn(true)
+}
+
+func TestDelegateTaskSchemaUsesConfiguredConcurrencyLimit(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	service.runtimeSettings.MaxConcurrentSubagents = 6
+	schema := (DelegateTaskTool{Service: service}).InputSchema()
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema properties = %#v", schema)
+	}
+	tasks, ok := properties["tasks"].(map[string]any)
+	if !ok || tasks["maxItems"] != 6 {
+		t.Fatalf("tasks schema = %#v", tasks)
+	}
+	if _, err := normalizeDelegatedTaskSpecs(make([]delegateTaskSpec, 7), 6); err == nil {
+		t.Fatal("delegated task specs exceeded configured limit without an error")
+	}
+}
+
+func TestReadOnlyDelegateTaskOmitsAndRejectsImplementWorkers(t *testing.T) {
+	provider := &subagentProbeProvider{delay: time.Millisecond}
+	service, ctx := newSubagentToolTest(t, provider)
+	tool := DelegateTaskTool{Service: service, ReadOnly: true}
+
+	schema := tool.InputSchema()
+	properties := schema["properties"].(map[string]any)
+	tasks := properties["tasks"].(map[string]any)
+	items := tasks["items"].(map[string]any)
+	itemProperties := items["properties"].(map[string]any)
+	agentType := itemProperties["agentType"].(map[string]any)
+	agentTypes := agentType["enum"].([]string)
+	if containsString(agentTypes, subagentImplement) {
+		t.Fatalf("read-only delegate schema advertised implement: %#v", agentTypes)
+	}
+	if !containsString(agentTypes, subagentExplore) || !containsString(agentTypes, subagentReview) {
+		t.Fatalf("read-only delegate schema omitted read-only workers: %#v", agentTypes)
+	}
+
+	result, err := tool.Execute(ctx, json.RawMessage(`{"tasks":[{"label":"错误实现","task":"修改文件","agentType":"implement"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(result.Summary, "当前工作区是只读权限") {
+		t.Fatalf("read-only implement result = %#v", result)
+	}
+	if active := service.activeSubagentCount(); active != 0 {
+		t.Fatalf("read-only rejection started %d workers", active)
+	}
+}
+
+func TestSubagentOverflowUsesVisibleMarkers(t *testing.T) {
+	part := tools.ResultPart{Kind: tools.PartSubagent}
+	indexes := make(map[string]int)
+	for index := 0; index < maxSubagentActivities+5; index++ {
+		upsertSubagentActivity(&part, indexes, ChatStreamEvent{
+			Type: "tool", ToolName: "read_file", ToolCallID: fmt.Sprintf("call-%d", index), Status: "completed",
+		})
+	}
+	if len(part.Activities) != maxSubagentActivities {
+		t.Fatalf("activity count = %d, want %d", len(part.Activities), maxSubagentActivities)
+	}
+	lastActivity := part.Activities[len(part.Activities)-1]
+	if lastActivity.ID != subagentActivityOverflowID || lastActivity.Output != subagentActivityOverflow {
+		t.Fatalf("activity overflow marker = %#v", lastActivity)
+	}
+
+	part.Steps = make([]tools.ProgressStep, maxSubagentTimelineSteps)
+	for index := range part.Steps {
+		part.Steps[index] = tools.ProgressStep{Title: fmt.Sprintf("step-%d", index), Status: "completed"}
+	}
+	markSubagentStepOverflow(&part)
+	if len(part.Steps) != maxSubagentTimelineSteps || part.Steps[len(part.Steps)-1].Title != subagentStepOverflow {
+		t.Fatalf("step overflow marker = %#v", part.Steps)
+	}
 }
 
 func TestCompletedSubagentsReleaseActiveWorkerSlotsBeforeCollection(t *testing.T) {
@@ -666,6 +757,60 @@ func TestDelegateTaskCancellationPersistsCancelledWorkerState(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("parent cancellation did not join the delegated task promptly")
 	}
+}
+
+func TestFinishSubagentTurnCancelsWorkersWhenParentContextEnds(t *testing.T) {
+	provider := &subagentProbeProvider{block: true, started: make(chan struct{})}
+	service, ctx := newSubagentToolTest(t, provider)
+	result, err := (DelegateTaskTool{Service: service}).Execute(ctx, json.RawMessage(`{"tasks":[{"label":"阻塞检查","task":"等待父任务结束","agentType":"explore"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubagentParts(t, result.Parts, 1, "pending")
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("subagent provider did not start")
+	}
+
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan []tools.ResultPart, 1)
+	go func() { done <- service.finishSubagentTurnWithContext(parentCtx, false) }()
+	select {
+	case parts := <-done:
+		assertSubagentParts(t, parts, 1, "cancelled")
+	case <-time.After(time.Second):
+		t.Fatal("parent cancellation did not cancel and join the delegated task promptly")
+	}
+}
+
+func TestFinishSubagentTurnDetachesWorkerThatNeverAcknowledgesCancellation(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	_, control := service.registerSubagent(context.Background(), tools.ResultPart{
+		Kind:      tools.PartSubagent,
+		TaskID:    "stuck-worker",
+		AgentType: subagentExplore,
+		Label:     "无响应上游",
+		Status:    "running",
+		Steps:     []tools.ProgressStep{{Title: "等待上游", Status: "in_progress"}},
+	})
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	parts := service.finishSubagentTurnWithContext(parent, false)
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("cancellation barrier blocked for %s", elapsed)
+	}
+	if len(parts) != 1 || parts[0].TaskID != "stuck-worker" || parts[0].Status != "cancelled" || !strings.Contains(parts[0].Summary, "后台清理") {
+		t.Fatalf("detached worker result = %#v", parts)
+	}
+	if active := service.activeSubagentCount(); active != 0 {
+		t.Fatalf("detached worker remained registered: %d", active)
+	}
+	// A late completion is intentionally ignored by the completed parent turn.
+	control.finish(delegatedTaskResult{part: tools.ResultPart{Kind: tools.PartSubagent, TaskID: "stuck-worker", Status: "completed"}})
 }
 
 func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {

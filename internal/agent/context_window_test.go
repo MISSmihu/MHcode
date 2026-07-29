@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -152,7 +154,7 @@ func TestCompressProtocolMessagesPreservesLatestExecutionCheckpoint(t *testing.T
 	}
 	messages = append(messages,
 		protocol.Message{Role: "user", Content: "resume source"},
-		protocol.Message{Role: "assistant", Content: checkpointed},
+		protocol.Message{Role: "assistant", Content: checkpointed, InternalKind: terminalTurnInternalKind("cancelled")},
 		protocol.Message{Role: "user", Content: requestContextStart + "\n[execution_state]\nresume\n" + requestContextEnd, InternalKind: contextRequestKind},
 		protocol.Message{Role: "user", Content: "continue"},
 	)
@@ -179,6 +181,92 @@ func TestCompressProtocolMessagesPreservesLatestExecutionCheckpoint(t *testing.T
 	last := compressed[len(compressed)-1]
 	if last.Role != "user" || last.Content != "continue" {
 		t.Fatalf("latest user request was not preserved: %#v", last)
+	}
+}
+
+func TestCompressProtocolMessagesDropsCheckpointClosedByCompletedTurn(t *testing.T) {
+	service := &Service{}
+	interrupted := service.protocolAssistantContent("old task stopped", []tools.ResultPart{{
+		Kind: tools.PartToolCall, Name: "read_file", Status: "ok", Input: "old.txt", Output: "old result",
+	}})
+	completed := service.protocolAssistantContent("new task completed", []tools.ResultPart{{
+		Kind: tools.PartToolCall, Name: "read_file", Status: "ok", Input: "new.txt", Output: "new result",
+	}})
+	messages := []protocol.Message{{Role: "system", Content: "stable-system"}}
+	for index := 0; index < 10; index++ {
+		messages = append(messages,
+			protocol.Message{Role: "user", Content: strings.Repeat("old request ", 160)},
+			protocol.Message{Role: "assistant", Content: strings.Repeat("old answer ", 160)},
+		)
+	}
+	messages = append(messages,
+		protocol.Message{Role: "user", Content: "old interrupted request"},
+		protocol.Message{Role: "assistant", Content: interrupted, InternalKind: terminalTurnInternalKind("cancelled")},
+		protocol.Message{Role: "user", Content: "new request"},
+		protocol.Message{Role: "assistant", Content: completed},
+		protocol.Message{Role: "user", Content: "current request"},
+	)
+
+	compressed, removed := compressProtocolMessages(messages, contextBudget{InputLimitTokens: 5_000, TargetTokens: 2_500})
+	if removed == 0 {
+		t.Fatal("expected compression to remove old history")
+	}
+	for _, message := range compressed {
+		if message.InternalKind == contextExecutionKind || strings.Contains(message.Content, executionContextStart) {
+			t.Fatalf("completed work left a resumable execution checkpoint: %#v", compressed)
+		}
+	}
+}
+
+func TestSendChatFailureAfterCompressionUsesRebuiltTurnAnchor(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	defer service.Close()
+	service.runtimeSettings.Model = ModelSettings{
+		SelectedProviderID: "compression-provider",
+		SelectedModelID:    "small-model",
+		Providers: []ModelProviderSetting{{
+			ID: "compression-provider", Name: "Compression", Protocol: "local", APIType: "chat-completions",
+			BaseURL: "http://127.0.0.1:11434/v1", Enabled: true, DefaultModelID: "small-model",
+			Models: []ProviderModel{{
+				ID: "small-model", Provider: "compression-provider",
+				ContextWindowTokens: 16_000, ContextWindowSource: ContextWindowSourceManual,
+			}},
+		}},
+	}
+	service.sessionMessages = []protocol.Message{{Role: "system", Content: "old-system"}}
+	for index := 0; index < 12; index++ {
+		service.sessionMessages = append(service.sessionMessages,
+			protocol.Message{Role: "user", Content: strings.Repeat("request ", 300)},
+			protocol.Message{Role: "assistant", Content: strings.Repeat("answer ", 300)},
+		)
+	}
+	original := cloneProtocolMessages(service.sessionMessages)
+	service.providerFactory = func(chatRoute) (protocol.Provider, error) {
+		return nil, errors.New("provider unavailable after compression")
+	}
+	compressed := false
+
+	result, err := service.SendChatMessageWithEvents(context.Background(), "current request must roll back", func(event ChatStreamEvent) {
+		if event.Type == "context_compression" && event.Compression != nil && event.Compression.Status == "completed" && event.Compression.RemovedMessages > 0 {
+			compressed = true
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider unavailable after compression") {
+		t.Fatalf("provider error = %v", err)
+	}
+	if !compressed {
+		t.Fatal("test did not trigger context compression")
+	}
+	if result.TurnCommitted {
+		t.Fatalf("failed compressed turn was committed: %#v", result)
+	}
+	if len(service.sessionMessages) != len(original) || !protocolMessagesEqualSlice(service.sessionMessages[1:], original[1:]) {
+		t.Fatalf("failed compressed turn did not restore the original conversation history: count=%d want=%d", len(service.sessionMessages), len(original))
+	}
+	for _, message := range service.sessionMessages {
+		if message.Content == "current request must roll back" {
+			t.Fatalf("failed current request survived rollback: %#v", message)
+		}
 	}
 }
 

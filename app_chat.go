@@ -34,6 +34,7 @@ type chatTask struct {
 	id                string
 	projectID         string
 	sessionID         string
+	kind              chatTaskKind
 	service           *agent.Service
 	startedAt         string
 	status            string
@@ -43,9 +44,18 @@ type chatTask struct {
 	done              chan struct{}
 	doneOnce          sync.Once
 	terminalOnce      sync.Once
+	progressMu        sync.Mutex
+	terminal          bool
 }
 
 const chatTaskStopGracePeriod = 2 * time.Second
+
+type chatTaskKind string
+
+const (
+	chatTaskKindMessage    chatTaskKind = "message"
+	chatTaskKindTeamResume chatTaskKind = "team_resume"
+)
 
 type chatGuidance struct {
 	id          string
@@ -133,8 +143,54 @@ func (a *App) startChatMessageForProjectSessionRoute(projectID, sessionID, promp
 }
 
 func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessionID, prompt string, attachments []agent.ChatAttachment, providerID, modelID string, registered func(string)) (string, error) {
+	return a.startChatMessageForProjectSessionRouteRegisteredWithKind(
+		projectID, sessionID, prompt, attachments, providerID, modelID, chatTaskKindMessage, registered,
+	)
+}
+
+// ResumePausedTeamTask starts an explicit continuation of a persisted team
+// checkpoint. It does not create a synthetic user message, so ordinary chat
+// text can never be mistaken for a task lifecycle command.
+func (a *App) ResumePausedTeamTask(projectID, sessionID string) (string, error) {
+	return a.startChatMessageForProjectSessionRouteRegisteredWithKind(
+		projectID, sessionID, "", nil, "", "", chatTaskKindTeamResume, nil,
+	)
+}
+
+// AbandonPausedTeamTask ends the checkpoint after the user explicitly chooses
+// to do so. The session history and its audit trail remain intact.
+func (a *App) AbandonPausedTeamTask(projectID, sessionID string) (agent.WorkbenchState, error) {
+	if a.service == nil {
+		return agent.WorkbenchState{}, errors.New("Agent 服务尚未初始化")
+	}
+	projectID = strings.TrimSpace(projectID)
+	sessionID = strings.TrimSpace(sessionID)
+	if err := a.requireProjectSessionIdleChat(projectID, sessionID); err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	runtime, err := a.service.NewProjectSessionRuntime(projectID, sessionID)
+	if err != nil {
+		return a.service.WorkbenchState(), err
+	}
+	state, err := runtime.AbandonPausedTeamTask()
+	if err != nil {
+		return state, err
+	}
+	if activeState, reloaded, reloadErr := a.service.ReloadProjectSessionIfActive(projectID, sessionID); reloadErr == nil && reloaded {
+		return activeState, nil
+	}
+	return state, nil
+}
+
+func (a *App) startChatMessageForProjectSessionRouteRegisteredWithKind(
+	projectID, sessionID, prompt string,
+	attachments []agent.ChatAttachment,
+	providerID, modelID string,
+	kind chatTaskKind,
+	registered func(string),
+) (string, error) {
 	prompt = strings.TrimSpace(prompt)
-	if prompt == "" && len(attachments) == 0 {
+	if kind != chatTaskKindTeamResume && prompt == "" && len(attachments) == 0 {
 		return "", errors.New("消息内容不能为空")
 	}
 
@@ -178,6 +234,7 @@ func (a *App) startChatMessageForProjectSessionRouteRegistered(projectID, sessio
 		id:                fmt.Sprintf("chat-%d", time.Now().UnixNano()),
 		projectID:         projectID,
 		sessionID:         sessionID,
+		kind:              kind,
 		service:           runtime,
 		startedAt:         time.Now().Format(time.RFC3339Nano),
 		status:            "running",
@@ -409,62 +466,51 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 	defer task.markDone()
 	_ = task.service.StartTaskRuntime(task.id, task.startedAt)
 	a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "started", Message: "正在准备上下文"})
-	emitProgress := func(progress agent.ChatStreamEvent) {
-		_ = task.service.RecordTaskStreamEvent(task.id, progress)
-		a.emitChatTaskEvent(ChatTaskEvent{
-			TaskID:      task.id,
-			Type:        progress.Type,
-			Delta:       progress.Delta,
-			Message:     progress.Message,
-			Model:       progress.Model,
-			ToolName:    progress.ToolName,
-			ToolCallID:  progress.ToolCallID,
-			ToolInput:   progress.ToolInput,
-			Status:      progress.Status,
-			Usage:       progress.Usage,
-			UsageState:  progress.UsageState,
-			Progress:    progress.Progress,
-			Parts:       progress.Parts,
-			Compression: progress.Compression,
-			Team:        progress.Team,
-		})
-	}
+	emitProgress := func(progress agent.ChatStreamEvent) { a.recordChatTaskProgress(task, progress) }
 
-	currentPrompt := prompt
-	currentAttachments := attachments
-	guidanceTurn := false
 	var result agent.ChatResult
 	var err error
-	for {
-		if guidanceTurn {
-			result, err = task.service.SendChatGuidanceWithAttachmentsAndEvents(ctx, currentPrompt, currentAttachments, emitProgress)
-		} else {
-			result, err = task.service.SendChatMessageWithAttachmentsAndEvents(ctx, currentPrompt, currentAttachments, emitProgress)
-		}
-		if err != nil || ctx.Err() != nil {
-			break
-		}
-
-		guidance, ok := a.takeNextChatGuidance(task)
-		if !ok {
+	if task.kind == chatTaskKindTeamResume {
+		result, err = task.service.ResumePausedTeamTaskWithEvents(ctx, emitProgress)
+		if err == nil && ctx.Err() == nil {
 			a.completeChatTask(task, ChatTaskEvent{TaskID: task.id, Type: "completed", Model: result.Model, Result: &result})
 			return
 		}
+	} else {
+		currentPrompt := prompt
+		currentAttachments := attachments
+		guidanceTurn := false
+		for {
+			if guidanceTurn {
+				result, err = task.service.SendChatGuidanceWithAttachmentsAndEvents(ctx, currentPrompt, currentAttachments, emitProgress)
+			} else {
+				result, err = task.service.SendChatMessageWithAttachmentsAndEvents(ctx, currentPrompt, currentAttachments, emitProgress)
+			}
+			if err != nil || ctx.Err() != nil {
+				break
+			}
 
-		completedResult := result
-		a.emitChatTaskEvent(ChatTaskEvent{
-			TaskID:      task.id,
-			Type:        "guidance",
-			Message:     "已收到引导，正在调整当前任务",
-			GuidanceID:  guidance.id,
-			Guidance:    guidance.prompt,
-			Attachments: append([]agent.ChatAttachment(nil), guidance.attachments...),
-			Result:      &completedResult,
-		})
-		_ = task.service.StartGuidedTaskRuntime(task.id, "已收到引导，正在调整当前任务", result.Model)
-		currentPrompt = guidance.prompt
-		currentAttachments = guidance.attachments
-		guidanceTurn = true
+			guidance, ok := a.takeNextChatGuidance(task)
+			if !ok {
+				a.completeChatTask(task, ChatTaskEvent{TaskID: task.id, Type: "completed", Model: result.Model, Result: &result})
+				return
+			}
+
+			completedResult := result
+			a.emitChatTaskEvent(ChatTaskEvent{
+				TaskID:      task.id,
+				Type:        "guidance",
+				Message:     "已收到引导，正在调整当前任务",
+				GuidanceID:  guidance.id,
+				Guidance:    guidance.prompt,
+				Attachments: append([]agent.ChatAttachment(nil), guidance.attachments...),
+				Result:      &completedResult,
+			})
+			_ = task.service.StartGuidedTaskRuntime(task.id, "已收到引导，正在调整当前任务", result.Model)
+			currentPrompt = guidance.prompt
+			currentAttachments = guidance.attachments
+			guidanceTurn = true
+		}
 	}
 
 	wasCancelled := chatTaskWasCancelled(ctx, err)
@@ -494,6 +540,12 @@ func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 		return
 	}
 	task.terminalOnce.Do(func() {
+		// A provider, tool, or detached worker can emit after cancellation or
+		// completion. Close the application-side gate before durable finalization
+		// so a late event cannot revive the UI or overwrite the final snapshot.
+		task.progressMu.Lock()
+		task.terminal = true
+		task.progressMu.Unlock()
 		result := agent.ChatResult{}
 		if event.Result != nil {
 			result = *event.Result
@@ -501,12 +553,46 @@ func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 		if task.service != nil {
 			_ = task.service.FinishTaskRuntime(task.id, event.Type, event.Message, result)
 		}
-		a.finishChatTask(task)
 		if task.cancel != nil {
 			task.cancel()
 		}
+		// Keep the task registered until its durable state has been reloaded.
+		// Otherwise a successor task in the same session can start while this
+		// task's older snapshot is still being applied and overwrite it.
 		a.reloadCompletedChatTask(task)
+		a.finishChatTask(task)
 		a.emitChatTaskEvent(event)
+	})
+}
+
+func (a *App) recordChatTaskProgress(task *chatTask, progress agent.ChatStreamEvent) {
+	if task == nil {
+		return
+	}
+	task.progressMu.Lock()
+	defer task.progressMu.Unlock()
+	if task.terminal {
+		return
+	}
+	if task.service != nil {
+		_ = task.service.RecordTaskStreamEvent(task.id, progress)
+	}
+	a.emitChatTaskEvent(ChatTaskEvent{
+		TaskID:      task.id,
+		Type:        progress.Type,
+		Delta:       progress.Delta,
+		Message:     progress.Message,
+		Model:       progress.Model,
+		ToolName:    progress.ToolName,
+		ToolCallID:  progress.ToolCallID,
+		ToolInput:   progress.ToolInput,
+		Status:      progress.Status,
+		Usage:       progress.Usage,
+		UsageState:  progress.UsageState,
+		Progress:    progress.Progress,
+		Parts:       progress.Parts,
+		Compression: progress.Compression,
+		Team:        progress.Team,
 	})
 }
 

@@ -90,7 +90,8 @@ func TestCompressProtocolMessagesDropsOldPrivateTurnContexts(t *testing.T) {
 func TestPlanTeamAndSubagentRequestsInheritPrivateTurnContext(t *testing.T) {
 	private := protocol.Message{Role: "user", Content: requestContextStart + "\n[project_context]\nremember this\n" + requestContextEnd, InternalKind: contextRequestKind}
 	base := protocol.ChatRequest{
-		Model: "model-main",
+		Model:             "model-main",
+		ParallelToolCalls: true,
 		Messages: []protocol.Message{
 			{Role: "system", Content: "stable"},
 			private,
@@ -110,12 +111,16 @@ func TestPlanTeamAndSubagentRequestsInheritPrivateTurnContext(t *testing.T) {
 	}
 
 	teamRequest := teamRoleRequest(base, TeamRoleReviewer, 1, chatRoute{ModelID: "model-review"}, nil)
-	if !requestHasPrivateTurnContext(teamRequest) || teamRequest.Messages[len(teamRequest.Messages)-1].Content == "finish the task" {
+	if !requestHasPrivateTurnContext(teamRequest) || teamRequest.Messages[len(teamRequest.Messages)-1].Content == "finish the task" || !teamRequest.ParallelToolCalls {
 		t.Fatalf("team request did not preserve context and append role instruction: %#v", teamRequest.Messages)
+	}
+	synthesisRequest := teamRoleRequest(base, TeamRoleSynthesizer, 1, chatRoute{ModelID: "model-synthesis"}, nil)
+	if synthesisRequest.ParallelToolCalls {
+		t.Fatal("tool-free synthesis request kept parallel tool calls enabled")
 	}
 
 	subagentRequest := subagentRequest(base, delegateTaskSpec{AgentType: subagentReview, Label: "review", Task: "check files"}, "sub-1", chatRoute{ModelID: "model-child"})
-	if !requestHasPrivateTurnContext(subagentRequest) || subagentRequest.Messages[len(subagentRequest.Messages)-1].Content == "finish the task" {
+	if !requestHasPrivateTurnContext(subagentRequest) || subagentRequest.Messages[len(subagentRequest.Messages)-1].Content == "finish the task" || !subagentRequest.ParallelToolCalls {
 		t.Fatalf("subagent request did not preserve context and append child instruction: %#v", subagentRequest.Messages)
 	}
 }
@@ -134,5 +139,34 @@ func TestSanitizeModelContentRemovesPrivateContextBlocks(t *testing.T) {
 		"\n\n" + executionContextStart + "\nprivate execution\n" + executionContextEnd
 	if visible := sanitizeModelContent(content); visible != "visible answer" {
 		t.Fatalf("sanitized model content = %q", visible)
+	}
+}
+
+func TestSanitizeModelContentRemovesTaggedPrivateReasoning(t *testing.T) {
+	content := strings.Join([]string{
+		"<thinking>private English reasoning</thinking>",
+		"用户可见进展。",
+		"<analysis>another private block</analysis>",
+		"最终答复。",
+	}, "\n")
+	if visible := sanitizeModelContent(content); visible != "用户可见进展。\n最终答复。" {
+		t.Fatalf("tagged reasoning leaked into visible content: %q", visible)
+	}
+	if visible := sanitizeModelContent("<thinking>unfinished private reasoning"); visible != "" {
+		t.Fatalf("unterminated tagged reasoning leaked into visible content: %q", visible)
+	}
+	if visible := sanitizeModelContent("进展前缀 <thinking>inline private reasoning</thinking> 用户可见结论"); visible != "进展前缀 用户可见结论" {
+		t.Fatalf("inline tagged reasoning leaked into visible content: %q", visible)
+	}
+}
+
+func TestVisibleCompletionContentSuppressesProgressToolPayload(t *testing.T) {
+	payload := `{"message":"已定位配置，正在读取字段。","status":"running"}`
+	if visible := visibleCompletionContent(payload, nil); visible != "" {
+		t.Fatalf("progress arguments leaked into visible content: %q", visible)
+	}
+	answer := `{"message":"任务已完成","status":"completed"}`
+	if visible := visibleCompletionContent(answer, nil); visible != answer {
+		t.Fatalf("ordinary final JSON was hidden: %q", visible)
 	}
 }
