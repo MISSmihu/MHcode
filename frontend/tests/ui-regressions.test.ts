@@ -186,6 +186,21 @@ describe("chat UI regressions", () => {
     expect(editorRule).toContain("text-decoration: none;");
   });
 
+  test("keeps composer controls inside a narrow chat pane beside the right panel", async () => {
+    const [app, css] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    expect(app).toContain('class="composer-tools"');
+    expect(app).toContain('class="composer-send-controls"');
+    expect(css).toContain("container-name: chat-pane;");
+    expect(css).toContain("@container chat-pane (max-width: 620px)");
+    expect(css).toContain(".composer-tools {");
+    expect(css).toContain("flex-basis: 100%;");
+    expect(css).toContain(".composer-send-controls {");
+    expect(css).toContain("flex-wrap: wrap;");
+  });
+
 	test("keeps URL chips on a separate row below one native editor", async () => {
     const [app, css] = await Promise.all([
       Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),

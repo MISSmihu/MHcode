@@ -612,6 +612,8 @@ body[data-theme="light"],
   height: 100%;
   overflow: hidden;
   background: var(--bg-main);
+  container-name: chat-pane;
+  container-type: inline-size;
 }
 
 .browser-preview,
@@ -4415,11 +4417,23 @@ body[data-theme="light"],
   justify-content: space-between;
   min-width: 0;
   gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-end;
 }
 
 .composer-toolbar > div {
   min-width: 0;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.composer-tools {
+  flex: 1 1 220px;
+}
+
+.composer-send-controls {
+  flex: 0 1 auto;
+  justify-content: flex-end;
 }
 
 .composer-toolbar button {
@@ -4433,6 +4447,34 @@ body[data-theme="light"],
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+@container chat-pane (max-width: 620px) {
+  .composer-toolbar {
+    gap: 6px;
+  }
+
+  .composer-toolbar > div {
+    gap: 5px;
+  }
+
+  .composer-tools {
+    flex-basis: 100%;
+  }
+
+  .composer-send-controls {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+
+  .model-route-menu {
+    flex: 1 1 118px;
+  }
+
+  .model-route-trigger {
+    width: 100%;
+    max-width: none;
+  }
 }
 
 .send-button {

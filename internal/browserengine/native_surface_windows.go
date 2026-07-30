@@ -25,7 +25,13 @@ import (
 )
 
 const (
-	pmRemove = 0x0001
+	pmRemove       = 0x0001
+	wsChild        = 0x40000000
+	wsClipSiblings = 0x04000000
+	wsClipChildren = 0x02000000
+	swpNoActivate  = 0x0010
+	swpShowWindow  = 0x0040
+	swHide         = 0
 
 	embeddedSurfaceCommandTimeout = 15 * time.Second
 )
@@ -41,6 +47,10 @@ var (
 	procPeekMessage        = user32.NewProc("PeekMessageW")
 	procTranslateMessage   = user32.NewProc("TranslateMessage")
 	procDispatchMessage    = user32.NewProc("DispatchMessageW")
+	procCreateWindowEx     = user32.NewProc("CreateWindowExW")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
+	procSetWindowPos       = user32.NewProc("SetWindowPos")
+	procShowWindow         = user32.NewProc("ShowWindow")
 )
 
 type nativeRect struct {
@@ -70,11 +80,16 @@ type embeddedSurfaceCommand struct {
 	result chan error
 }
 
+type embeddedBrowserTab struct {
+	hostWindow uintptr
+	view       *edge.Chromium
+}
+
 type embeddedSurfaceThread struct {
 	mainWindow  uintptr
 	options     embeddedBrowserOptions
 	bootstrap   *edge.Chromium
-	tabs        map[string]*edge.Chromium
+	tabs        map[string]*embeddedBrowserTab
 	activeTabID string
 	visible     bool
 	bounds      NativeSurfaceBounds
@@ -159,19 +174,39 @@ func (s *windowsNativeBrowserSurface) CreateTab(tabID, markerURL string) error {
 		if _, exists := state.tabs[tabID]; exists {
 			return nil
 		}
-		view, err := createEmbeddedChromium(state.mainWindow, state.options)
+		hostWindow, err := createEmbeddedTabHost(state.mainWindow)
 		if err != nil {
 			return err
 		}
+		view, err := createEmbeddedChromium(hostWindow, state.options)
+		if err != nil {
+			destroyEmbeddedTabHost(hostWindow)
+			return err
+		}
 		view.Navigate(markerURL)
-		state.tabs[tabID] = view
+		tab := &embeddedBrowserTab{hostWindow: hostWindow, view: view}
+		state.tabs[tabID] = tab
 		if state.activeTabID == "" {
 			state.activeTabID = tabID
 		}
 		if state.visible && state.activeTabID == tabID {
 			return showEmbeddedTab(state, tabID)
 		}
-		return view.Hide()
+		return hideEmbeddedTab(tab)
+	})
+}
+
+func (s *windowsNativeBrowserSurface) NavigateTab(tabID, targetURL string) error {
+	if strings.TrimSpace(tabID) == "" {
+		return errors.New("WebView2 tab ID is empty")
+	}
+	return s.dispatch(embeddedSurfaceCommandTimeout, func(state *embeddedSurfaceThread) error {
+		tab := state.tabs[tabID]
+		if tab == nil || tab.view == nil {
+			return fmt.Errorf("WebView2 tab %q does not exist", tabID)
+		}
+		tab.view.Navigate(targetURL)
+		return nil
 	})
 }
 
@@ -181,9 +216,9 @@ func (s *windowsNativeBrowserSurface) ActivateTab(tabID string) error {
 			return fmt.Errorf("WebView2 tab %q does not exist", tabID)
 		}
 		state.activeTabID = tabID
-		for id, view := range state.tabs {
+		for id, tab := range state.tabs {
 			if id != tabID {
-				_ = view.Hide()
+				_ = hideEmbeddedTab(tab)
 			}
 		}
 		if !state.visible {
@@ -195,8 +230,8 @@ func (s *windowsNativeBrowserSurface) ActivateTab(tabID string) error {
 
 func (s *windowsNativeBrowserSurface) CloseTab(tabID string) {
 	_ = s.dispatch(5*time.Second, func(state *embeddedSurfaceThread) error {
-		view := state.tabs[tabID]
-		if view == nil {
+		tab := state.tabs[tabID]
+		if tab == nil {
 			return nil
 		}
 		delete(state.tabs, tabID)
@@ -207,7 +242,7 @@ func (s *windowsNativeBrowserSurface) CloseTab(tabID string) {
 				break
 			}
 		}
-		closeEmbeddedChromium(view)
+		closeEmbeddedTab(tab)
 		if state.visible && state.activeTabID != "" {
 			return showEmbeddedTab(state, state.activeTabID)
 		}
@@ -232,8 +267,8 @@ func (s *windowsNativeBrowserSurface) Show(bounds NativeSurfaceBounds, _ nativeW
 func (s *windowsNativeBrowserSurface) Hide() error {
 	return s.dispatch(5*time.Second, func(state *embeddedSurfaceThread) error {
 		state.visible = false
-		for _, view := range state.tabs {
-			_ = view.Hide()
+		for _, tab := range state.tabs {
+			_ = hideEmbeddedTab(tab)
 		}
 		return nil
 	})
@@ -322,7 +357,7 @@ func runEmbeddedSurfaceThread(
 		mainWindow: mainWindow,
 		options:    options,
 		bootstrap:  bootstrap,
-		tabs:       map[string]*edge.Chromium{},
+		tabs:       map[string]*embeddedBrowserTab{},
 	}
 	ready <- embeddedSurfaceStartResult{endpoint: "http://127.0.0.1:" + strconv.Itoa(port)}
 
@@ -336,8 +371,8 @@ func runEmbeddedSurfaceThread(
 		case <-ticker.C:
 			pumpWindowMessages()
 		case <-stop:
-			for _, view := range state.tabs {
-				closeEmbeddedChromium(view)
+			for _, tab := range state.tabs {
+				closeEmbeddedTab(tab)
 			}
 			closeEmbeddedChromium(state.bootstrap)
 			pumpWindowMessages()
@@ -392,15 +427,18 @@ func createEmbeddedChromium(mainWindow uintptr, options embeddedBrowserOptions) 
 }
 
 func showEmbeddedTab(state *embeddedSurfaceThread, tabID string) error {
-	view := state.tabs[tabID]
-	if view == nil {
+	tab := state.tabs[tabID]
+	if tab == nil || tab.view == nil || tab.hostWindow == 0 {
 		return fmt.Errorf("WebView2 tab %q does not exist", tabID)
 	}
 	bounds, rasterizationScale, err := calculateEmbeddedSurfaceMetrics(state.mainWindow, state.bounds)
 	if err != nil {
 		return err
 	}
-	if controller := view.GetController(); controller != nil {
+	if err := placeEmbeddedTabHost(tab.hostWindow, bounds); err != nil {
+		return err
+	}
+	if controller := tab.view.GetController(); controller != nil {
 		if controller3 := controller.GetICoreWebView2Controller3(); controller3 != nil {
 			defer controller3.Release()
 			if err := controller3.PutRasterizationScale(rasterizationScale); err != nil {
@@ -408,9 +446,81 @@ func showEmbeddedTab(state *embeddedSurfaceThread, tabID string) error {
 			}
 		}
 	}
-	view.ResizeWithBounds(&bounds)
-	_ = view.NotifyParentWindowPositionChanged()
-	return view.Show()
+	viewBounds := edge.Rect{Right: bounds.Right - bounds.Left, Bottom: bounds.Bottom - bounds.Top}
+	tab.view.ResizeWithBounds(&viewBounds)
+	_ = tab.view.NotifyParentWindowPositionChanged()
+	return tab.view.Show()
+}
+
+func hideEmbeddedTab(tab *embeddedBrowserTab) error {
+	if tab == nil {
+		return nil
+	}
+	var hideErr error
+	if tab.view != nil {
+		hideErr = tab.view.Hide()
+	}
+	if tab.hostWindow != 0 {
+		procShowWindow.Call(tab.hostWindow, swHide)
+	}
+	return hideErr
+}
+
+func closeEmbeddedTab(tab *embeddedBrowserTab) {
+	if tab == nil {
+		return
+	}
+	closeEmbeddedChromium(tab.view)
+	destroyEmbeddedTabHost(tab.hostWindow)
+}
+
+func createEmbeddedTabHost(parent uintptr) (uintptr, error) {
+	className, err := windows.UTF16PtrFromString("STATIC")
+	if err != nil {
+		return 0, err
+	}
+	hostWindow, _, callErr := procCreateWindowEx.Call(
+		0,
+		uintptr(unsafe.Pointer(className)),
+		0,
+		uintptr(wsChild|wsClipSiblings|wsClipChildren),
+		0,
+		0,
+		1,
+		1,
+		parent,
+		0,
+		0,
+		0,
+	)
+	if hostWindow == 0 {
+		return 0, fmt.Errorf("create embedded browser host window: %w", callErr)
+	}
+	return hostWindow, nil
+}
+
+func placeEmbeddedTabHost(hostWindow uintptr, bounds edge.Rect) error {
+	width := max(int32(1), bounds.Right-bounds.Left)
+	height := max(int32(1), bounds.Bottom-bounds.Top)
+	result, _, callErr := procSetWindowPos.Call(
+		hostWindow,
+		0,
+		uintptr(bounds.Left),
+		uintptr(bounds.Top),
+		uintptr(width),
+		uintptr(height),
+		uintptr(swpNoActivate|swpShowWindow),
+	)
+	if result == 0 {
+		return fmt.Errorf("place embedded browser host window: %w", callErr)
+	}
+	return nil
+}
+
+func destroyEmbeddedTabHost(hostWindow uintptr) {
+	if hostWindow != 0 {
+		procDestroyWindow.Call(hostWindow)
+	}
 }
 
 func calculateEmbeddedSurfaceMetrics(mainWindow uintptr, bounds NativeSurfaceBounds) (edge.Rect, float64, error) {

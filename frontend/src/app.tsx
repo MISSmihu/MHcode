@@ -4626,7 +4626,7 @@ function App() {
 			  </div>
 			</Show>
             <div class="composer-toolbar">
-              <div>
+              <div class="composer-tools">
                 <input
                   ref={composerImageInputRef}
                   class="composer-image-input"
@@ -4707,7 +4707,7 @@ function App() {
                   {teamMode() ? "团队：开" : "AI 团队"}
                 </button>
               </div>
-              <div>
+              <div class="composer-send-controls">
                 <ModelRouteMenu
                   settings={runtimeSettings()}
                   saving={savingRuntime() || currentSessionBusy()}

@@ -37,6 +37,7 @@ type embeddedNativeBrowserSurface interface {
 	nativeBrowserSurface
 	Start(options embeddedBrowserOptions) (embeddedBrowserStart, error)
 	CreateTab(tabID, markerURL string) error
+	NavigateTab(tabID, targetURL string) error
 	ActivateTab(tabID string) error
 	CloseTab(tabID string)
 }

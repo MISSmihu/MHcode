@@ -41,6 +41,25 @@ func (s *Service) Navigate(ctx context.Context, tabID, rawURL string) error {
 	defer tab.runMu.Unlock()
 	runCtx, cancel := operationContext(ctx, tab.ctx, 12*time.Second)
 	defer cancel()
+	s.mu.RLock()
+	embeddedSurface, embedded := s.nativeSurface.(embeddedNativeBrowserSurface)
+	embedded = embedded && s.nativeReady
+	s.mu.RUnlock()
+	if embedded {
+		if err := embeddedSurface.NavigateTab(tabID, targetURL); err != nil {
+			tab.mu.Lock()
+			tab.state.Loading = false
+			tab.state.Error = readableNavigationError(err)
+			tab.mu.Unlock()
+			return s.setError(fmt.Errorf("网页加载失败: %w", err))
+		}
+		tab.mu.Lock()
+		tab.state.URL = targetURL
+		tab.state.Error = ""
+		tab.mu.Unlock()
+		s.clearError()
+		return nil
+	}
 	var navigationError string
 	err = chromedp.Run(runCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 		_, _, errorText, navigateErr := page.Navigate(targetURL).Do(ctx)
