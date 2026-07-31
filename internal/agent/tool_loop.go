@@ -140,6 +140,15 @@ func (s *Service) runToolLoopTurn(
 		route = resolvedRoute
 		s.adoptProviderRoute(route)
 	}
+	if err == nil {
+		if scopeErr := s.validateTurnTaskScopeOutcome(executionCtx, outcome); scopeErr != nil {
+			message := "本轮未完成：用户指定的目标范围内没有检测到真实文件变更，已阻止将未完成任务报告为成功。"
+			outcome.Content = message
+			outcome.Parts = append(outcome.Parts, tools.ResultPart{Kind: tools.PartText, Text: message})
+			emitChatEvent(sink, ChatStreamEvent{Type: "status", Message: message, Status: "failed"})
+			err = scopeErr
+		}
+	}
 	if err != nil {
 		s.sessionMessages = s.sessionMessages[:baseMessageCount]
 		s.markChatProviderStatus(route.Provider.ID, "error", err.Error())
@@ -203,6 +212,38 @@ func (s *Service) runToolLoopTurn(
 		State:     s.workbenchStateLocked(),
 		Parts:     outcome.Parts,
 	}, nil
+}
+
+func (s *Service) validateTurnTaskScopeOutcome(ctx context.Context, outcome toolLoopOutcome) error {
+	scope := turnTaskScopeFrom(ctx)
+	if !scope.Enabled || !scope.RequireWrite {
+		return nil
+	}
+	policy := s.sandboxPolicyForContext(ctx)
+	for _, change := range outcome.Changes {
+		if _, err := policy.ResolveWritePath(change.Path); err == nil {
+			return nil
+		}
+	}
+	for _, part := range outcome.Parts {
+		if strings.TrimSpace(part.Path) == "" {
+			continue
+		}
+		switch part.Kind {
+		case tools.PartDiff:
+			if _, err := policy.ResolveWritePath(part.Path); err == nil {
+				return nil
+			}
+		case tools.PartFile:
+			if strings.EqualFold(strings.TrimSpace(part.FileAction), "available") {
+				continue
+			}
+			if _, err := policy.ResolveWritePath(part.Path); err == nil {
+				return nil
+			}
+		}
+	}
+	return errors.New("task scope requires a verified write, but no in-scope file change was recorded")
 }
 
 func partialToolFailureContent(outcome toolLoopOutcome) string {
@@ -310,6 +351,7 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 	reg.Add(tools.FileInfoTool{Policy: policy})
 	reg.Add(tools.ListDirTool{Policy: policy})
 	reg.Add(tools.SearchTool{Policy: policy})
+	reg.AddStructuredSearch(policy)
 	if s.config.ArtifactRenderer != nil {
 		reg.Add(tools.RenderArtifactTool{Policy: policy, Controller: s})
 		reg.Add(tools.InspectVisualTool{Policy: policy, Controller: s})
@@ -355,13 +397,19 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 			KnownHostsPath: s.scopedSSHKnownHostsPath(),
 		})
 	}
-	if s.config.Git != nil {
+	// Git and persistent terminals operate at workspace/session scope rather
+	// than a single declared target. Hide them for a turn-scoped task instead
+	// of letting them observe or mutate sibling projects.
+	if s.config.Git != nil && !policy.TaskScopeEnabled {
 		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: readOnly})
 	}
-	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess && !readOnly {
+	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess && !readOnly && !policy.TaskScopeEnabled {
 		reg.Add(TerminalTool{Policy: policy, Controller: s.config.Terminal})
 	}
-	if s.mcpManager != nil {
+	// Generic MCP schemas do not provide a host-enforceable local filesystem
+	// boundary. Built-in scoped tools remain available; remote MCP tools return
+	// on the next unscoped turn.
+	if s.mcpManager != nil && !policy.TaskScopeEnabled {
 		for _, remoteTool := range s.mcpManager.Tools() {
 			if readOnly {
 				readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
@@ -399,11 +447,12 @@ func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Re
 		tools.ListDirTool{Policy: policy},
 		tools.SearchTool{Policy: policy},
 	)
+	reg.AddStructuredSearch(policy)
 	if s.config.ArtifactRenderer != nil {
 		reg.Add(tools.RenderArtifactTool{Policy: policy, Controller: s})
 		reg.Add(tools.InspectVisualTool{Policy: policy, Controller: s})
 	}
-	if s.config.Git != nil {
+	if s.config.Git != nil && !policy.TaskScopeEnabled {
 		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: true})
 	}
 	if s.runtimeSettings.NetworkAccess {
@@ -411,7 +460,7 @@ func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Re
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
-	if s.mcpManager != nil {
+	if s.mcpManager != nil && !policy.TaskScopeEnabled {
 		for _, remoteTool := range s.mcpManager.Tools() {
 			readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
 			if ok && readOnlyTool.ReadOnly() {
@@ -579,13 +628,17 @@ type stableToolLoopAttachment struct {
 	DataHash string `json:"dataHash"`
 }
 
-func newAwaitSubagentsToolCall() protocol.ToolCall {
+func newAwaitSubagentsToolCall(wait bool) protocol.ToolCall {
+	arguments := `{"wait":false}`
+	if wait {
+		arguments = `{"wait":true}`
+	}
 	return protocol.ToolCall{
 		ID:   fmt.Sprintf("await-subagents-%d", time.Now().UnixNano()),
 		Type: "function",
 		Function: protocol.ToolCallFunction{
 			Name:      "await_subagents",
-			Arguments: json.RawMessage(`{}`),
+			Arguments: json.RawMessage(arguments),
 		},
 	}
 }
@@ -1076,7 +1129,7 @@ func (s *Service) runToolLoopWithCompletionState(
 			}
 			summary := "上游模型在工具已禁用后仍请求调用工具，MHcode 已停止本轮工具循环并保留全部已完成结果。"
 			if _, canCollectSubagents := reg.Get("await_subagents"); canCollectSubagents && s.hasUncollectedSubagents() {
-				call := newAwaitSubagentsToolCall()
+				call := newAwaitSubagentsToolCall(true)
 				result, _ := s.executeToolCall(ctx, reg, call)
 				outcome.Parts = mergeOutcomeParts(outcome.Parts, result.Parts)
 				if strings.TrimSpace(result.Summary) != "" {
@@ -1115,7 +1168,7 @@ func (s *Service) runToolLoopWithCompletionState(
 					})
 					continue
 				}
-				call := newAwaitSubagentsToolCall()
+				call := newAwaitSubagentsToolCall(true)
 				messages = append(messages, protocol.Message{
 					Role:             "assistant",
 					Content:          completion.Content,
@@ -1787,8 +1840,12 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	name := call.Function.Name
 	normalizedArgs := normalizeToolArgs(call.Function.Arguments)
 	startedAt := time.Now()
+	toolRegistered := false
 	defer func() {
 		result = ensureToolExecutionMetadata(result, name, call.ID, normalizedArgs, startedAt, time.Now())
+		if toolRegistered {
+			s.recordToolTerminalEvent(name, call.ID, result)
+		}
 	}()
 	tool, ok := reg.Get(name)
 	if !ok {
@@ -1804,6 +1861,8 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 				Content:    summary,
 			}
 	}
+	toolRegistered = true
+	s.recordToolStartedEvent(name, call.ID, normalizedArgs, startedAt)
 	timeout := time.Duration(s.runtimeSettings.ToolTimeoutSeconds) * time.Second
 	result, err := s.runToolWithWatchdog(ctx, tool, name, normalizedArgs, timeout)
 	if err != nil {
@@ -1826,9 +1885,11 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 			}
 		}
 	}
-	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy, name)
-
 	result = ensureToolErrorPart(result, name, normalizedArgs)
+	if toolCallInterrupted(ctx, err) {
+		result = markToolResultInterrupted(result, name, normalizedArgs)
+	}
+	result = applyToolResultPolicy(result, s.runtimeSettings.ToolResultPolicy, name)
 	if len(result.Changes) > 0 {
 		for _, change := range result.Changes {
 			if snapshotErr := s.recordFileSnapshot(change); snapshotErr != nil {
@@ -2098,6 +2159,45 @@ func ensureToolErrorPart(result tools.Result, name string, rawArgs json.RawMessa
 	// diff, text, web, image, and subagent parts so the model can diagnose the
 	// failure or continue from a usable partial result.
 	result.Parts = append([]tools.ResultPart{errorPart}, result.Parts...)
+	return result
+}
+
+func toolCallInterrupted(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled))
+}
+
+func markToolResultInterrupted(result tools.Result, name string, rawArgs json.RawMessage) tools.Result {
+	summary := "工具已因任务停止而中断，迟到结果已被忽略。"
+	if strings.TrimSpace(result.Summary) == "" {
+		result.Summary = summary
+	} else if !strings.Contains(result.Summary, summary) {
+		result.Summary = strings.TrimSpace(result.Summary + "\n" + summary)
+	}
+	result.IsError = true
+	found := false
+	for index := range result.Parts {
+		part := &result.Parts[index]
+		if part.Kind != tools.PartToolCall {
+			continue
+		}
+		found = true
+		part.Status = "cancelled"
+		if part.Input == "" {
+			part.Input = toolInputForDisplay(name, rawArgs)
+		}
+		if part.Output == "" {
+			part.Output = summary
+		}
+		if part.Stderr == "" {
+			part.Stderr = summary
+		}
+	}
+	if !found {
+		result.Parts = append(result.Parts, tools.ResultPart{
+			Kind: tools.PartToolCall, Name: name, Status: "cancelled",
+			Input: toolInputForDisplay(name, rawArgs), Output: summary, Stderr: summary,
+		})
+	}
 	return result
 }
 

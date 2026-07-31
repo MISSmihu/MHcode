@@ -14,9 +14,16 @@ import (
 // SandboxPolicy 是工具执行的安全边界。由 agent 层从 RuntimeSettings 填充，
 // tools 包不反向依赖 agent，避免 import 环。
 type SandboxPolicy struct {
-	SandboxMode          string   // read-only | workspace-write | danger-full-access
-	WorkspaceRoot        string   // 主工作区根，所有路径必须落在这里或 ExtraWritableRoots 下
-	ExtraWritableRoots   []string // 额外可写根
+	SandboxMode        string   // read-only | workspace-write | danger-full-access
+	WorkspaceRoot      string   // 主工作区根，所有路径必须落在这里或 ExtraWritableRoots 下
+	ExtraWritableRoots []string // 额外可写根
+	// TaskScope* are ephemeral, turn-scoped boundaries. They are narrower than
+	// the configured workspace and are used when the user names a concrete
+	// target such as a new output directory. An empty scope preserves the
+	// normal workspace behavior.
+	TaskScopeEnabled     bool
+	TaskScopeRoots       []string // writable/readable directory roots for this turn
+	TaskScopeFiles       []string // exact readable/writable files for this turn
 	FilesystemAccess     string   // read-only | workspace-write | unrestricted
 	NetworkAccess        bool     // 是否允许 web_search 等联网工具
 	ShellAccess          bool     // 是否允许 run_command
@@ -60,13 +67,14 @@ var (
 	ErrCommandOutsideRoots    = errors.New("shell command references a path outside the allowed roots")
 	ErrShellFileOperation     = errors.New("shell file operations are disabled; use the structured workspace tools")
 	ErrShellRemoteOperation   = errors.New("remote SSH operations are disabled on the generic shell path; use the structured ssh tool")
+	ErrPathOutsideTaskScope   = errors.New("路径超出本轮任务范围")
 	ErrSymlinkMutation        = errors.New("refusing to replace a symbolic link with a regular file")
 	ErrNoWorkspaceRoot        = errors.New("未配置工作区根目录")
 )
 
 // ResolveReadPath 校验并规范化一个用于「读取」的路径：必须落在允许的根内。
 func (p SandboxPolicy) ResolveReadPath(input string) (string, error) {
-	return p.resolveWithinRoots(input)
+	return p.resolveWithinRoots(input, false)
 }
 
 // ResolveWritePath 校验用于「写入」的路径：既要在允许的根内，还要求文件系统非只读。
@@ -74,9 +82,53 @@ func (p SandboxPolicy) ResolveWritePath(input string) (string, error) {
 	if strings.EqualFold(p.FilesystemAccess, "read-only") {
 		return "", ErrReadOnlyFilesystem
 	}
-	abs, err := p.resolveWithinRoots(input)
+	abs, err := p.resolveWithinRoots(input, true)
 	if err != nil {
 		return "", err
+	}
+	if info, statErr := os.Lstat(abs); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%w: %s", ErrSymlinkMutation, abs)
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return "", statErr
+	}
+	return abs, nil
+}
+
+// ResolveCreateParentPath authorizes an existing ancestor directory needed to
+// create a declared target (for example Git clone's parent mkdir). It does not
+// authorize files or sibling directories: under a task scope the resolved
+// path must be an ancestor of one of the declared roots/files.
+func (p SandboxPolicy) ResolveCreateParentPath(input string) (string, error) {
+	if strings.EqualFold(p.FilesystemAccess, "read-only") {
+		return "", ErrReadOnlyFilesystem
+	}
+	if !p.TaskScopeEnabled {
+		return p.ResolveWritePath(input)
+	}
+	base := p
+	base.TaskScopeEnabled = false
+	abs, err := base.resolveWithinRoots(input, true)
+	if err != nil {
+		return "", err
+	}
+	allowed := false
+	for _, root := range p.taskScopeRoots() {
+		if pathWithinRoot(root, abs) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		for _, file := range p.TaskScopeFiles {
+			file, fileErr := filepath.Abs(filepath.Clean(strings.TrimSpace(file)))
+			if fileErr == nil && pathWithinRoot(file, abs) {
+				allowed = true
+				break
+			}
+		}
+	}
+	if !allowed {
+		return "", fmt.Errorf("%w: %s；只能创建本轮目标的祖先目录", ErrPathOutsideTaskScope, abs)
 	}
 	if info, statErr := os.Lstat(abs); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
 		return "", fmt.Errorf("%w: %s", ErrSymlinkMutation, abs)
@@ -89,7 +141,7 @@ func (p SandboxPolicy) ResolveWritePath(input string) (string, error) {
 // resolveWithinRoots 把输入路径（可为相对，基于 WorkspaceRoot）转成绝对干净路径，
 // 并确保它位于某个允许根之内，防止 ../ 目录穿越。
 // FilesystemAccess=unrestricted 时跳过根约束（仍返回绝对路径）。
-func (p SandboxPolicy) resolveWithinRoots(input string) (string, error) {
+func (p SandboxPolicy) resolveWithinRoots(input string, write bool) (string, error) {
 	root := strings.TrimSpace(p.WorkspaceRoot)
 	if root == "" {
 		return "", ErrNoWorkspaceRoot
@@ -111,6 +163,9 @@ func (p SandboxPolicy) resolveWithinRoots(input string) (string, error) {
 	abs = filepath.Clean(abs)
 
 	if strings.EqualFold(p.FilesystemAccess, "unrestricted") {
+		if err := p.validateTaskScope(abs, write); err != nil {
+			return "", err
+		}
 		return abs, nil
 	}
 
@@ -121,10 +176,141 @@ func (p SandboxPolicy) resolveWithinRoots(input string) (string, error) {
 			continue
 		}
 		if pathWithinRoot(abs, filepath.Clean(candidate)) {
+			if err := p.validateTaskScope(abs, write); err != nil {
+				return "", err
+			}
 			return abs, nil
 		}
 	}
 	return "", fmt.Errorf("%w: %s", ErrPathOutsideWorkspace, abs)
+}
+
+// validateTaskScope applies a narrower, per-turn boundary after the normal
+// workspace/extra-root check. The workspace root itself remains readable so a
+// model can confirm that a requested new target does not exist; it cannot walk
+// into or mutate an unrelated child project unless that path was explicitly
+// included in the turn scope.
+func (p SandboxPolicy) validateTaskScope(abs string, write bool) error {
+	if !p.TaskScopeEnabled {
+		return nil
+	}
+	if p.taskScopeAllows(abs, write) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s；本轮已锁定到用户指定目标，请不要访问其他项目", ErrPathOutsideTaskScope, abs)
+}
+
+// TaskScopeAllowsTraversal reports whether a directory walker may descend into
+// the supplied path. It is intentionally separate from ResolveReadPath:
+// ResolveReadPath permits the workspace root as a shallow observation point,
+// while a recursive search must not use that permission to enter every child.
+func (p SandboxPolicy) TaskScopeAllowsTraversal(path string) bool {
+	if !p.TaskScopeEnabled {
+		return true
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	root, err := filepath.Abs(filepath.Clean(strings.TrimSpace(p.WorkspaceRoot)))
+	if err != nil || sameGuardPath(abs, root) {
+		return err == nil
+	}
+	for _, candidate := range p.taskScopeRoots() {
+		if pathWithinRoot(abs, candidate) {
+			return true
+		}
+	}
+	// An explicitly named file may be reached through its parent directories,
+	// but files outside the scope are still filtered by TaskScopeAllowsPath.
+	for _, candidate := range p.TaskScopeFiles {
+		candidate, candidateErr := filepath.Abs(filepath.Clean(strings.TrimSpace(candidate)))
+		if candidateErr == nil && pathWithinRoot(candidate, abs) {
+			return true
+		}
+	}
+	return false
+}
+
+// TaskScopeAllowsPath is the exact-path counterpart to
+// TaskScopeAllowsTraversal. Directory walkers use both methods: traversal is
+// allowed only along a declared target, while unrelated files are omitted.
+func (p SandboxPolicy) TaskScopeAllowsPath(path string) bool {
+	if !p.TaskScopeEnabled {
+		return true
+	}
+	workspace, err := filepath.Abs(filepath.Clean(strings.TrimSpace(p.WorkspaceRoot)))
+	if err != nil || workspace == "" {
+		return false
+	}
+	abs := path
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(workspace, abs)
+	}
+	abs, err = filepath.Abs(filepath.Clean(abs))
+	if err != nil {
+		return false
+	}
+	return p.taskScopeAllows(abs, false)
+}
+
+func (p SandboxPolicy) taskScopeAllows(abs string, write bool) bool {
+	if !p.TaskScopeEnabled {
+		return true
+	}
+	workspace, err := filepath.Abs(filepath.Clean(strings.TrimSpace(p.WorkspaceRoot)))
+	if err != nil {
+		return false
+	}
+	if !write && sameGuardPath(abs, workspace) {
+		return true
+	}
+	for _, candidate := range p.taskScopeRoots() {
+		if pathWithinRoot(abs, candidate) {
+			return true
+		}
+	}
+	for _, candidate := range p.TaskScopeFiles {
+		candidate, err := filepath.Abs(filepath.Clean(strings.TrimSpace(candidate)))
+		if err == nil && sameGuardPath(abs, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p SandboxPolicy) taskScopeRoots() []string {
+	roots := make([]string, 0, len(p.TaskScopeRoots))
+	for _, candidate := range p.TaskScopeRoots {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		abs, err := filepath.Abs(filepath.Clean(candidate))
+		if err != nil {
+			continue
+		}
+		duplicate := false
+		for _, existing := range roots {
+			if sameGuardPath(existing, abs) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			roots = append(roots, abs)
+		}
+	}
+	return roots
+}
+
+func sameGuardPath(left, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if os.PathSeparator == '\\' {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func looksLikeForeignAbsolutePath(input string) bool {
@@ -166,6 +352,14 @@ func (p SandboxPolicy) CheckShell() error {
 // setting cmd.Dir alone. The broker rejects common escape, network, and
 // destructive forms before a process is started.
 func (p SandboxPolicy) ValidateCommand(command string) error {
+	return p.ValidateCommandAt(command, p.WorkspaceRoot)
+}
+
+// ValidateCommandAt applies the command broker relative to the directory in
+// which the process will actually run. A turn-scoped command may execute only
+// from the declared target and may not use parent traversal or absolute path
+// arguments to escape that target.
+func (p SandboxPolicy) ValidateCommandAt(command, workingDirectory string) error {
 	command = strings.TrimSpace(command)
 	if command == "" {
 		return errors.New("command cannot be empty")
@@ -187,6 +381,9 @@ func (p SandboxPolicy) ValidateCommand(command string) error {
 	if !strings.EqualFold(strings.TrimSpace(p.FilesystemAccess), "unrestricted") && commandReferencesForeignPath(command, p) {
 		return ErrCommandOutsideRoots
 	}
+	if p.TaskScopeEnabled && commandReferencesOutsideTaskScope(command, workingDirectory, p) {
+		return ErrPathOutsideTaskScope
+	}
 	return nil
 }
 
@@ -194,6 +391,14 @@ func (p SandboxPolicy) ValidateCommand(command string) error {
 // executable and its raw argv. Display quoting is deliberately excluded: a
 // quoted label is presentation data and must never become security input.
 func (p SandboxPolicy) ValidateDirectCommand(executable string, args []string) error {
+	return p.ValidateDirectCommandAt(executable, args, p.WorkspaceRoot)
+}
+
+// ValidateDirectCommandAt is the argv-preserving counterpart to
+// ValidateCommandAt. The executable itself may live outside the task target
+// (for example go.exe or python.exe); only user-controlled arguments are
+// checked for filesystem escapes.
+func (p SandboxPolicy) ValidateDirectCommandAt(executable string, args []string, workingDirectory string) error {
 	executable = strings.TrimSpace(executable)
 	if executable == "" {
 		return errors.New("executable cannot be empty")
@@ -222,7 +427,49 @@ func (p SandboxPolicy) ValidateDirectCommand(executable string, args []string) e
 			}
 		}
 	}
+	if p.TaskScopeEnabled {
+		for _, argument := range args {
+			if commandReferencesOutsideTaskScope(argument, workingDirectory, p) {
+				return ErrPathOutsideTaskScope
+			}
+		}
+	}
 	return nil
+}
+
+// ResolveCommandWorkingDirectory is stricter than ResolveReadPath. The latter
+// deliberately permits a shallow read of the workspace root so list/search
+// tools can discover only the declared target. A process started there would
+// regain access to every sibling project, so command execution requires a
+// directory inside a scoped root (or the parent of an explicitly scoped file).
+func (p SandboxPolicy) ResolveCommandWorkingDirectory(input string) (string, error) {
+	abs, err := p.ResolveReadPath(input)
+	if err != nil {
+		return "", err
+	}
+	if !p.TaskScopeEnabled || p.taskScopeAllowsCommandDirectory(abs) {
+		return abs, nil
+	}
+	return "", fmt.Errorf("%w: %s；命令必须从本轮目标目录执行", ErrPathOutsideTaskScope, abs)
+}
+
+func (p SandboxPolicy) taskScopeAllowsCommandDirectory(abs string) bool {
+	abs, err := filepath.Abs(filepath.Clean(abs))
+	if err != nil {
+		return false
+	}
+	for _, root := range p.taskScopeRoots() {
+		if pathWithinRoot(abs, root) {
+			return true
+		}
+	}
+	for _, candidate := range p.TaskScopeFiles {
+		file, fileErr := filepath.Abs(filepath.Clean(strings.TrimSpace(candidate)))
+		if fileErr == nil && sameGuardPath(abs, filepath.Dir(file)) {
+			return true
+		}
+	}
+	return false
 }
 
 func structuredRemoteToolForCommand(command string) string {
@@ -338,6 +585,57 @@ func commandReferencesForeignPath(command string, policy SandboxPolicy) bool {
 		}
 	}
 	return false
+}
+
+func commandReferencesOutsideTaskScope(command, workingDirectory string, policy SandboxPolicy) bool {
+	if !policy.TaskScopeEnabled {
+		return false
+	}
+	workingDirectory = strings.TrimSpace(workingDirectory)
+	if workingDirectory == "" {
+		workingDirectory = policy.WorkspaceRoot
+	}
+	for _, raw := range commandPathTokens(command) {
+		token := strings.Trim(raw, "[]{}<>")
+		if token == "" || strings.HasPrefix(token, "-") || strings.Contains(token, "=") {
+			continue
+		}
+		lower := strings.ToLower(token)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			continue
+		}
+		normalized := filepath.FromSlash(strings.ReplaceAll(token, `\`, "/"))
+		if looksLikeAbsolutePath(token) {
+			if absolute, err := filepath.Abs(filepath.Clean(normalized)); err != nil || !policy.taskScopeAllows(absolute, false) {
+				return true
+			}
+			continue
+		}
+		if !pathContainsParentTraversal(normalized) {
+			continue
+		}
+		candidate, err := filepath.Abs(filepath.Join(workingDirectory, normalized))
+		if err != nil || !policy.taskScopeAllows(candidate, false) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandPathTokens(command string) []string {
+	return strings.FieldsFunc(command, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\r', '\n', '"', '\'', ';', '|', '&', '(', ')', ',':
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+func pathContainsParentTraversal(value string) bool {
+	cleaned := filepath.Clean(value)
+	return cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator))
 }
 
 func looksLikeAbsolutePath(value string) bool {

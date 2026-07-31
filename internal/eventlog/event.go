@@ -10,21 +10,74 @@ import "time"
 type EventType string
 
 const (
-	EventUserMessage      EventType = "user_message"
-	EventAssistantMessage EventType = "assistant_message"
-	EventFileSnapshot     EventType = "file_snapshot"
-	EventCheckpoint       EventType = "checkpoint"
-	EventBranchMarker     EventType = "branch_marker"
-	EventPlanUpdate       EventType = "plan_update"
-	EventTeamCheckpoint   EventType = "team_checkpoint"
-	EventTurnTerminal     EventType = "turn_terminal"
-	EventArtifactUpdate   EventType = "artifact_update"
+	EventUserMessage        EventType = "user_message"
+	EventAssistantMessage   EventType = "assistant_message"
+	EventAssistantDelta     EventType = "assistant_delta"
+	EventAssistantCompleted EventType = "assistant_completed"
+	EventToolStarted        EventType = "tool_started"
+	EventToolOutput         EventType = "tool_output"
+	EventToolCompleted      EventType = "tool_completed"
+	EventToolFailed         EventType = "tool_failed"
+	EventTurnInterrupted    EventType = "turn_interrupted"
+	EventContextCondensed   EventType = "context_condensed"
+	EventTaskTerminal       EventType = "task_terminal"
+	EventFileSnapshot       EventType = "file_snapshot"
+	EventCheckpoint         EventType = "checkpoint"
+	EventBranchMarker       EventType = "branch_marker"
+	EventPlanUpdate         EventType = "plan_update"
+	EventTeamCheckpoint     EventType = "team_checkpoint"
+	EventTurnTerminal       EventType = "turn_terminal"
+	EventArtifactUpdate     EventType = "artifact_update"
 )
+
+// EventSchemaVersion identifies the shape of the event header. A zero value
+// denotes JSONL records written before event headers were introduced.
+type EventSchemaVersion int
+
+const (
+	LegacyEventSchemaVersion  EventSchemaVersion = 0
+	CurrentEventSchemaVersion EventSchemaVersion = 1
+)
+
+// EventHeader contains cross-cutting execution metadata. It is embedded in
+// Event so its fields are serialized at the JSONL record's top level while the
+// existing id/parentId/seq/type/ts/payload layout remains unchanged.
+//
+// Event log readers intentionally do not reject newer schema versions or
+// unknown JSON fields. Existing JSONL records therefore decode as legacy
+// events, and future writers can add fields without blocking a log replay.
+type EventHeader struct {
+	SchemaVersion EventSchemaVersion `json:"schemaVersion,omitempty"`
+	ProjectID     string             `json:"projectId,omitempty"`
+	SessionID     string             `json:"sessionId,omitempty"`
+	BranchID      string             `json:"branchId,omitempty"`
+	RunID         string             `json:"runId,omitempty"`
+	Generation    int64              `json:"generation,omitempty"`
+	CausationID   string             `json:"causationId,omitempty"`
+	ToolCallID    string             `json:"toolCallId,omitempty"`
+}
+
+// WithDefaultSchemaVersion returns a header ready to persist. It only fills
+// the missing legacy value, allowing readers and future writers to preserve
+// schema versions newer than this binary understands.
+func (header EventHeader) WithDefaultSchemaVersion() EventHeader {
+	if header.SchemaVersion == LegacyEventSchemaVersion {
+		header.SchemaVersion = CurrentEventSchemaVersion
+	}
+	return header
+}
+
+// IsLegacy reports whether this header came from a JSONL record that predates
+// the versioned event header.
+func (header EventHeader) IsLegacy() bool {
+	return header.SchemaVersion == LegacyEventSchemaVersion
+}
 
 // Event 是事件日志的一条记录。所有事件 append-only，靠 ParentID 串成树。
 // 「当前对话线」= 从 head 沿 ParentID 回溯到根。Rewind 只移动 head，不删事件，
 // 因此分叉是免费的（回退后再追加即从该点长出新线）。
 type Event struct {
+	EventHeader
 	ID       string       `json:"id"`
 	ParentID string       `json:"parentId"`
 	Seq      int64        `json:"seq"`
@@ -72,6 +125,18 @@ type EventPayload struct {
 	// branch as the conversation. Rewind and branch switching therefore change
 	// the visible artifact registry without a second mutable database.
 	Artifacts []ArtifactRecord `json:"artifacts,omitempty"`
+
+	// context_condensed records a replayable Context View while preserving all
+	// original events. The full view is content-addressed to keep JSONL bounded.
+	ContextSummary              string   `json:"contextSummary,omitempty"`
+	ContextViewHash             string   `json:"contextViewHash,omitempty"`
+	ContextFromEventID          string   `json:"contextFromEventId,omitempty"`
+	ContextThroughEventID       string   `json:"contextThroughEventId,omitempty"`
+	ContextPreservedToolCallIDs []string `json:"contextPreservedToolCallIds,omitempty"`
+	ContextPreservedArtifactIDs []string `json:"contextPreservedArtifactIds,omitempty"`
+	ContextBeforeTokens         int64    `json:"contextBeforeTokens,omitempty"`
+	ContextAfterTokens          int64    `json:"contextAfterTokens,omitempty"`
+	ContextRemovedMessages      int      `json:"contextRemovedMessages,omitempty"`
 }
 
 // ArtifactRecord is a durable observation of a file created, modified, read,

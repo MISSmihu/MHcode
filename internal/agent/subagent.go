@@ -37,6 +37,19 @@ const (
 
 var subagentSequence atomic.Uint64
 
+func nextSubagentGeneration() uint64 {
+	candidate := uint64(time.Now().UnixNano())
+	for {
+		current := subagentSequence.Load()
+		if candidate <= current {
+			candidate = current + 1
+		}
+		if subagentSequence.CompareAndSwap(current, candidate) {
+			return candidate
+		}
+	}
+}
+
 type subagentExecutionScope struct {
 	BaseRequest  protocol.ChatRequest
 	PrimaryRoute chatRoute
@@ -54,12 +67,28 @@ func subagentExecutionScopeFrom(ctx context.Context) (subagentExecutionScope, bo
 }
 
 func (s *Service) registerSubagent(parent context.Context, part tools.ResultPart) (context.Context, *subagentControl) {
+	projectID, sessionID := s.subagentRegistryIdentity()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	record := normalizeSubagentTaskRecord(SubagentTaskRecord{
+		Version: subagentTaskRegistryVersion, TaskID: part.TaskID,
+		ProjectID: projectID, SessionID: sessionID, Generation: nextSubagentGeneration(),
+		AgentType: part.AgentType, Label: part.Label, Status: part.Status,
+		CreatedAt: now, UpdatedAt: now, RecoveryState: "active",
+	})
+	ctx, control := s.registerSubagentWithRecord(parent, part, record)
+	_ = s.persistSubagentControl(control)
+	return ctx, control
+}
+
+func (s *Service) registerSubagentWithRecord(parent context.Context, part tools.ResultPart, record SubagentTaskRecord) (context.Context, *subagentControl) {
 	ctx, cancel := context.WithCancel(parent)
 	control := &subagentControl{
-		taskID: part.TaskID,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		latest: cloneSubagentPart(part),
+		taskID:            part.TaskID,
+		cancel:            cancel,
+		done:              make(chan struct{}),
+		latest:            cloneSubagentPart(part),
+		taskRecord:        normalizeSubagentTaskRecord(record),
+		registryLastWrite: time.Now().UTC(),
 	}
 	s.subagentMu.Lock()
 	if s.subagents == nil {
@@ -82,6 +111,9 @@ func (s *Service) CancelSubagent(taskID string) bool {
 	s.subagentMu.Unlock()
 	if control == nil || control.cancel == nil {
 		return false
+	}
+	if control.markCancelRequested() {
+		_ = s.persistSubagentControl(control)
 	}
 	control.cancel()
 	return true
@@ -107,36 +139,50 @@ type delegatedTaskResult struct {
 }
 
 type subagentControl struct {
-	mu        sync.RWMutex
-	taskID    string
-	cancel    context.CancelFunc
-	done      chan struct{}
-	doneOnce  sync.Once
-	latest    tools.ResultPart
-	result    delegatedTaskResult
-	finished  bool
-	collected bool
+	mu                sync.RWMutex
+	taskID            string
+	cancel            context.CancelFunc
+	done              chan struct{}
+	doneOnce          sync.Once
+	latest            tools.ResultPart
+	result            delegatedTaskResult
+	finished          bool
+	collected         bool
+	taskRecord        SubagentTaskRecord
+	registryLastWrite time.Time
 }
 
-func (c *subagentControl) update(part tools.ResultPart) {
+func (c *subagentControl) update(part tools.ResultPart) bool {
 	if c == nil {
-		return
+		return false
 	}
 	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		return false
+	}
 	c.latest = cloneSubagentPart(part)
+	due := c.updateTaskRecordFromPartLocked(part, false)
 	c.mu.Unlock()
+	return due
 }
 
-func (c *subagentControl) finish(result delegatedTaskResult) {
+func (c *subagentControl) finish(result delegatedTaskResult) bool {
 	if c == nil {
-		return
+		return false
 	}
 	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		return false
+	}
 	c.result = cloneDelegatedTaskResult(result)
 	c.latest = cloneSubagentPart(result.part)
 	c.finished = true
+	c.finishTaskRecordLocked(result)
 	c.mu.Unlock()
 	c.doneOnce.Do(func() { close(c.done) })
+	return true
 }
 
 func (c *subagentControl) snapshot() (tools.ResultPart, delegatedTaskResult, bool, bool) {
@@ -159,6 +205,8 @@ func (c *subagentControl) collect() (delegatedTaskResult, bool, bool) {
 	}
 	newlyCollected := !c.collected
 	c.collected = true
+	c.taskRecord.Collected = true
+	c.taskRecord.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return cloneDelegatedTaskResult(c.result), true, newlyCollected
 }
 
@@ -291,7 +339,8 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 	parts := make([]tools.ResultPart, len(specs))
 	workerContexts := make([]context.Context, len(specs))
 	controls := make([]*subagentControl, len(specs))
-	callID := fmt.Sprintf("subagent-%d-%d", time.Now().UnixNano(), subagentSequence.Add(1))
+	generation := nextSubagentGeneration()
+	callID := fmt.Sprintf("subagent-%d-%d", time.Now().UnixNano(), generation)
 	var emitMu sync.Mutex
 	emitProgress := func(part tools.ResultPart) {
 		emitMu.Lock()
@@ -310,20 +359,31 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 		}
 	}
 	if ctx.Err() != nil {
+		records := make([]SubagentTaskRecord, len(parts))
 		for index := range parts {
 			parts[index].Status = "cancelled"
 			parts[index].Summary = "任务在开始前已停止"
 			parts[index].CurrentAction = "已停止"
+			parts[index].CompletedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			records[index] = t.Service.newSubagentTaskRecord(scope, specs[index], parts[index], generation)
 			emitProgress(parts[index])
 		}
+		_ = t.Service.persistSubagentTaskRecords(records)
 		return tools.Result{
 			Summary: "父任务已停止，子代理未启动。",
 			Parts:   parts,
 			IsError: true,
 		}, nil
 	}
+	records := make([]SubagentTaskRecord, len(parts))
 	for index := range parts {
-		workerContexts[index], controls[index] = t.Service.registerSubagent(ctx, parts[index])
+		records[index] = t.Service.newSubagentTaskRecord(scope, specs[index], parts[index], generation)
+	}
+	if err := t.Service.persistSubagentTaskRecords(records); err != nil {
+		return delegatedTaskError("保存子代理任务登记失败: " + err.Error()), nil
+	}
+	for index := range parts {
+		workerContexts[index], controls[index] = t.Service.registerSubagentWithRecord(ctx, parts[index], records[index])
 		emitProgress(parts[index])
 	}
 
@@ -332,11 +392,15 @@ func (t DelegateTaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) 
 			control := controls[index]
 			emit := func(part tools.ResultPart) {
 				part = cloneSubagentPart(part)
-				control.update(part)
+				if control.update(part) {
+					_ = t.Service.persistSubagentControl(control)
+				}
 				emitProgress(part)
 			}
 			result := t.Service.runDelegatedTask(workerContexts[index], scope, spec, parts[index], emit)
-			control.finish(result)
+			if control.finish(result) {
+				_ = t.Service.persistSubagentControl(control)
+			}
 		}(index, spec)
 	}
 	return tools.Result{
@@ -360,7 +424,7 @@ type AwaitSubagentsTool struct {
 func (AwaitSubagentsTool) Name() string { return "await_subagents" }
 
 func (AwaitSubagentsTool) Description() string {
-	return "查询或等待后台子代理并收集最终结果。默认等待当前轮次尚未收集的全部子代理；wait=false 只查询当前状态。应先完成主 Agent 可独立推进的工作，再在最终综合前调用。"
+	return "查询或等待后台子代理并收集最终结果。默认只查询当前状态而不阻塞主 Agent；仅在最终综合确实依赖子代理结果时显式传 wait=true。"
 }
 
 func (AwaitSubagentsTool) InputSchema() map[string]any {
@@ -375,8 +439,8 @@ func (AwaitSubagentsTool) InputSchema() map[string]any {
 			},
 			"wait": map[string]any{
 				"type":        "boolean",
-				"description": "true=等待任务结束（默认）；false=仅返回当前状态。",
-				"default":     true,
+				"description": "true=等待任务结束；false=仅返回当前状态（默认）。",
+				"default":     false,
 			},
 		},
 	}
@@ -393,7 +457,9 @@ func (t AwaitSubagentsTool) Execute(ctx context.Context, rawArgs json.RawMessage
 		}
 	}
 	taskIDs := normalizeSubagentTaskIDs(args.TaskIDs)
-	wait := true
+	// Polling is the safe default. Waiting is an explicit synchronization
+	// point chosen by the model when it is ready to synthesize child results.
+	wait := false
 	if args.Wait != nil {
 		wait = *args.Wait
 	}
@@ -430,6 +496,7 @@ func (t AwaitSubagentsTool) Execute(ctx context.Context, rawArgs json.RawMessage
 			results = append(results, result)
 			parts = append(parts, result.part)
 			if newlyCollected {
+				_ = t.Service.persistSubagentControl(control)
 				parts = append(parts, result.artifacts...)
 				t.Service.recordDelegatedTaskUsage(result)
 			}
@@ -606,6 +673,9 @@ func (s *Service) finishSubagentTurnWithContext(ctx context.Context, cancelWorke
 	parts := make([]tools.ResultPart, 0, len(controls)*2)
 	for _, control := range controls {
 		if part, detached := detached[control.taskID]; detached {
+			if control.finish(delegatedTaskResult{part: part}) {
+				_ = s.persistSubagentControl(control)
+			}
 			parts = append(parts, part)
 			continue
 		}
@@ -615,6 +685,7 @@ func (s *Service) finishSubagentTurnWithContext(ctx context.Context, cancelWorke
 		}
 		parts = append(parts, result.part)
 		if newlyCollected {
+			_ = s.persistSubagentControl(control)
 			parts = append(parts, result.artifacts...)
 			s.recordDelegatedTaskUsage(result)
 		}
@@ -907,11 +978,7 @@ func subagentRequest(base protocol.ChatRequest, spec delegateTaskSpec, taskID st
 	if request.ResponsesContext.WindowID != "" {
 		request.ResponsesContext.WindowID += ":subagent:" + taskID
 	}
-	request.Messages = cloneProtocolMessages(base.Messages)
-	request.Messages = append(request.Messages, protocol.Message{
-		Role:    "user",
-		Content: subagentInstruction(spec),
-	})
+	request.Messages = buildSubagentContextMessages(base.Messages, spec)
 	request.Tools = nil
 	request.ToolChoice = "auto"
 	request.ParallelToolCalls = true
@@ -929,6 +996,7 @@ func subagentInstruction(spec delegateTaskSpec) string {
 	return strings.Join([]string{
 		"你是由 MHcode 主 Agent 动态创建的独立子代理。",
 		"不要尝试创建或委派新的子代理；你的工具集中也不会提供 delegate_task。",
+		"主 Agent 传入的 task_scope 是本轮授权边界；目标不存在表示待创建。不得读取、搜索或修改范围外的兄弟项目，也不得用其他项目替代目标。",
 		modeRule,
 		"只处理下面的独立目标，不要重新执行整个用户任务。完成后给主 Agent 一份简洁、可核验的结果摘要。",
 		"",

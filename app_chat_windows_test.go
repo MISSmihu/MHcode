@@ -146,7 +146,8 @@ func TestChatTaskStopTerminatesRealCommandTreeAndPersistsOneTerminalState(t *tes
 	for _, part := range runtimeState.Parts {
 		if part.Kind == tools.PartToolCall && part.Name == "run_command" {
 			commandParts++
-			if part.Status != "error" || part.CompletedAt == "" || part.DurationMs <= 0 {
+			if part.Status != "cancelled" || part.CompletedAt == "" || part.DurationMs <= 0 ||
+				!strings.Contains(part.Stderr, "工具已因任务停止而中断") {
 				t.Fatalf("terminal command part = %#v", part)
 			}
 		}

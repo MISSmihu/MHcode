@@ -6,10 +6,69 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MISSmihu/MHcode/internal/eventlog"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 )
 
 const contextSummaryKind = "context-summary"
+
+const persistedContextViewVersion = 1
+
+type persistedContextView struct {
+	Version  int                       `json:"version"`
+	Messages []persistedContextMessage `json:"messages"`
+}
+
+// protocol.Message deliberately hides transport-only fields from JSON. The
+// Context View snapshot needs those fields because they distinguish summaries,
+// request context, tool results, attachments and continuation state on replay.
+type persistedContextMessage struct {
+	Role             string                         `json:"role"`
+	Content          string                         `json:"content"`
+	ReasoningContent string                         `json:"reasoningContent,omitempty"`
+	Attachments      []protocol.Attachment          `json:"attachments,omitempty"`
+	Continuation     *protocol.ProviderContinuation `json:"continuation,omitempty"`
+	ToolCalls        []protocol.ToolCall            `json:"toolCalls,omitempty"`
+	ToolCallID       string                         `json:"toolCallId,omitempty"`
+	Name             string                         `json:"name,omitempty"`
+	InternalKind     string                         `json:"internalKind,omitempty"`
+}
+
+func encodePersistedContextView(messages []protocol.Message) persistedContextView {
+	stored := persistedContextView{Version: persistedContextViewVersion, Messages: make([]persistedContextMessage, 0, len(messages))}
+	for _, message := range messages {
+		stored.Messages = append(stored.Messages, persistedContextMessage{
+			Role: message.Role, Content: message.Content, ReasoningContent: message.ReasoningContent,
+			Attachments:  append([]protocol.Attachment(nil), message.Attachments...),
+			Continuation: message.Continuation, ToolCalls: append([]protocol.ToolCall(nil), message.ToolCalls...),
+			ToolCallID: message.ToolCallID, Name: message.Name, InternalKind: message.InternalKind,
+		})
+	}
+	return stored
+}
+
+func decodePersistedContextView(encoded []byte) ([]protocol.Message, error) {
+	var stored persistedContextView
+	if err := json.Unmarshal(encoded, &stored); err == nil && stored.Version > 0 {
+		messages := make([]protocol.Message, 0, len(stored.Messages))
+		for _, message := range stored.Messages {
+			messages = append(messages, protocol.Message{
+				Role: message.Role, Content: message.Content, ReasoningContent: message.ReasoningContent,
+				Attachments:  append([]protocol.Attachment(nil), message.Attachments...),
+				Continuation: message.Continuation, ToolCalls: append([]protocol.ToolCall(nil), message.ToolCalls...),
+				ToolCallID: message.ToolCallID, Name: message.Name, InternalKind: message.InternalKind,
+			})
+		}
+		return messages, nil
+	}
+	// Accept the short-lived pre-DTO format so an interrupted upgrade cannot
+	// make an existing context snapshot unreadable.
+	var legacy []protocol.Message
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		return nil, fmt.Errorf("decode context view: %w", err)
+	}
+	return legacy, nil
+}
 
 type contextBudget struct {
 	WindowTokens     int
@@ -37,7 +96,7 @@ func (s *Service) contextCompressionPreview(route chatRoute) (contextBudget, int
 	return budget, estimated, estimated > budget.TriggerTokens
 }
 
-func (s *Service) prepareSessionContextWithEvents(route chatRoute, sink ChatEventSink) (contextCompressionResult, error) {
+func (s *Service) prepareSessionContextWithEvents(route chatRoute, sink ChatEventSink, excludeCurrentTurn ...bool) (contextCompressionResult, error) {
 	budget, before, needed := s.contextCompressionPreview(route)
 	if needed {
 		emitChatEvent(sink, ChatStreamEvent{
@@ -67,6 +126,28 @@ func (s *Service) prepareSessionContextWithEvents(route chatRoute, sink ChatEven
 		}
 		return result, err
 	}
+	if result.Compressed {
+		view := s.sessionMessages
+		if len(excludeCurrentTurn) > 0 && excludeCurrentTurn[0] {
+			if start := currentTurnMessageStart(view); start >= 0 && start <= len(view) {
+				view = view[:start]
+			}
+		}
+		if err := s.persistContextCondensation(result, view); err != nil {
+			emitChatEvent(sink, ChatStreamEvent{
+				Type:    "context_compression",
+				Message: "保存上下文压缩记录失败",
+				Model:   route.ModelID,
+				Compression: &ContextCompressionEvent{
+					Status:       "error",
+					BeforeTokens: result.BeforeTokens,
+					AfterTokens:  result.AfterTokens,
+					TargetTokens: result.Budget.TargetTokens,
+				},
+			})
+			return result, err
+		}
+	}
 	if needed {
 		message := "上下文已整理，无需移除历史消息"
 		if result.Compressed {
@@ -86,6 +167,81 @@ func (s *Service) prepareSessionContextWithEvents(route chatRoute, sink ChatEven
 		})
 	}
 	return result, nil
+}
+
+func (s *Service) persistContextCondensation(result contextCompressionResult, view []protocol.Message) error {
+	if s == nil || s.eventStore == nil || !result.Compressed {
+		return nil
+	}
+	events := s.eventStore.Events()
+	if len(events) == 0 {
+		return nil
+	}
+	view = cloneProtocolMessages(view)
+	if len(view) > 0 && view[0].Role == "system" && view[0].InternalKind == "" {
+		view = view[1:]
+	}
+	filteredView := make([]protocol.Message, 0, len(view))
+	for _, message := range view {
+		if message.InternalKind != contextArtifactKind {
+			filteredView = append(filteredView, message)
+		}
+	}
+	view = filteredView
+	encoded, err := json.Marshal(encodePersistedContextView(view))
+	if err != nil {
+		return fmt.Errorf("encode context view: %w", err)
+	}
+	viewHash, err := s.eventStore.WriteSnapshot(string(encoded))
+	if err != nil {
+		return fmt.Errorf("store context view: %w", err)
+	}
+
+	summary := "上下文已压缩并保留可恢复视图"
+	toolCallIDs := make([]string, 0)
+	seenToolCalls := make(map[string]bool)
+	for _, message := range view {
+		if message.InternalKind == contextSummaryKind && strings.TrimSpace(message.Content) != "" {
+			summary = message.Content
+		}
+		for _, call := range message.ToolCalls {
+			if id := strings.TrimSpace(call.ID); id != "" && !seenToolCalls[id] {
+				seenToolCalls[id] = true
+				toolCallIDs = append(toolCallIDs, id)
+			}
+		}
+		if id := strings.TrimSpace(message.ToolCallID); id != "" && !seenToolCalls[id] {
+			seenToolCalls[id] = true
+			toolCallIDs = append(toolCallIDs, id)
+		}
+	}
+	artifactIDs := make([]string, 0)
+	for _, artifact := range artifactRecordsFromEvents(events, s.projectID, s.sessionID) {
+		if id := strings.TrimSpace(artifact.ID); id != "" {
+			artifactIDs = append(artifactIDs, id)
+		}
+	}
+	payload := eventlog.ContextCondensedPayload{
+		Summary: summary, ContextViewHash: viewHash,
+		FromEventID: events[0].ID, ThroughEventID: events[len(events)-1].ID,
+		PreservedToolCallIDs: toolCallIDs, PreservedArtifactIDs: artifactIDs,
+		InputTokenCount: int64(result.BeforeTokens), OutputTokenCount: int64(result.AfterTokens),
+		RemovedMessageCount: int64(result.RemovedMessages),
+	}
+	if err := payload.Validate(); err != nil {
+		return fmt.Errorf("validate context condensation: %w", err)
+	}
+	_, err = s.appendEvent(eventlog.EventPayload{
+		ContextSummary: summary, ContextViewHash: viewHash,
+		ContextFromEventID: events[0].ID, ContextThroughEventID: events[len(events)-1].ID,
+		ContextPreservedToolCallIDs: toolCallIDs, ContextPreservedArtifactIDs: artifactIDs,
+		ContextBeforeTokens: int64(result.BeforeTokens), ContextAfterTokens: int64(result.AfterTokens),
+		ContextRemovedMessages: result.RemovedMessages,
+	}, eventlog.EventContextCondensed)
+	if err != nil {
+		return fmt.Errorf("append context condensation: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) prepareSessionContext(route chatRoute) (contextCompressionResult, error) {

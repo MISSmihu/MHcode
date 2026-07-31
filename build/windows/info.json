@@ -1,18 +1,18 @@
 {
   "fixed": {
-    "file_version": "0.3.13.0",
-    "product_version": "0.3.13.0"
+    "file_version": "0.3.15.0",
+    "product_version": "0.3.15.0"
   },
   "info": {
     "0409": {
       "CompanyName": "MISSmihu",
       "FileDescription": "MHcode AI coding agent",
-      "FileVersion": "0.3.13.0",
+      "FileVersion": "0.3.15.0",
       "InternalName": "MHcode",
       "LegalCopyright": "Copyright 2026 MISSmihu",
       "OriginalFilename": "MHcode.exe",
       "ProductName": "MHcode",
-      "ProductVersion": "0.3.13"
+      "ProductVersion": "0.3.15"
     }
   }
 }

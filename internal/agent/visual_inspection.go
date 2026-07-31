@@ -503,7 +503,7 @@ func (s *Service) persistVisualArtifactState(path, expectedSHA, status, renderRe
 			}
 		}
 	}
-	_, err := s.eventStore.Append(eventlog.EventPayload{Artifacts: []ArtifactRecord{current}}, eventlog.EventArtifactUpdate)
+	_, err := s.appendEvent(eventlog.EventPayload{Artifacts: []ArtifactRecord{current}}, eventlog.EventArtifactUpdate, current.ToolCallID)
 	return err
 }
 

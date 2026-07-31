@@ -19,7 +19,15 @@ func (s *Service) resetTurnTimeline() {
 }
 
 func (s *Service) captureTurnTimeline(sink ChatEventSink) ChatEventSink {
+	generation := s.CurrentTaskRuntimeGeneration()
+	return s.captureTurnTimelineForGeneration(generation, sink)
+}
+
+func (s *Service) captureTurnTimelineForGeneration(generation uint64, sink ChatEventSink) ChatEventSink {
 	return func(event ChatStreamEvent) {
+		if !s.taskRuntimeGenerationAcceptsTimeline(generation) {
+			return
+		}
 		s.captureTurnTimelineEvent(event)
 		emitChatEvent(sink, event)
 	}

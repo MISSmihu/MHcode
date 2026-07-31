@@ -22,6 +22,7 @@ const taskRuntimeStreamPersistInterval = 750 * time.Millisecond
 // preserves work that had not reached a terminal event when MHcode exited.
 type TaskRuntimeState struct {
 	TaskID       string             `json:"taskId"`
+	Generation   uint64             `json:"generation,omitempty"`
 	AnchorID     string             `json:"anchorId,omitempty"`
 	StartedAt    string             `json:"startedAt"`
 	UpdatedAt    string             `json:"updatedAt"`
@@ -47,7 +48,9 @@ func (s *Service) TaskRuntimeSnapshot() (TaskRuntimeState, bool) {
 	}
 	// The event representation provides both a deep copy and the same secret
 	// redaction used by the on-disk snapshot.
-	return taskRuntimeStateFromEvent(taskRuntimeEventRecord(s.taskRuntime)), true
+	snapshot := taskRuntimeStateFromEvent(taskRuntimeEventRecord(s.taskRuntime))
+	snapshot.Generation = s.taskRuntime.Generation
+	return snapshot, true
 }
 
 func (state TaskRuntimeState) Terminal() bool {
@@ -60,28 +63,8 @@ func (state TaskRuntimeState) Terminal() bool {
 }
 
 func (s *Service) StartTaskRuntime(taskID, startedAt string) error {
-	if s == nil || s.eventStore == nil {
-		return nil
-	}
-	s.taskRuntimeMu.Lock()
-	defer s.taskRuntimeMu.Unlock()
-	startedAt = strings.TrimSpace(startedAt)
-	if startedAt == "" {
-		startedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	}
-	s.taskRuntime = TaskRuntimeState{
-		TaskID:       strings.TrimSpace(taskID),
-		AnchorID:     s.eventStore.Head(),
-		StartedAt:    startedAt,
-		UpdatedAt:    startedAt,
-		Status:       "running",
-		Message:      "正在执行任务",
-		LastEvent:    "started",
-		TurnSequence: 1,
-	}
-	s.taskRuntimeLastWrite = time.Time{}
-	s.taskRuntimeLastHash = ""
-	return s.persistTaskRuntimeLocked(true)
+	_, err := s.StartTaskRuntimeWithGeneration(taskID, startedAt)
+	return err
 }
 
 // RecordTaskStreamEvent folds provider-independent events into one durable
@@ -99,8 +82,26 @@ func (s *Service) RecordTaskStreamEvent(taskID string, event ChatStreamEvent) er
 			StartedAt: time.Now().UTC().Format(time.RFC3339Nano), Status: "running", TurnSequence: 1,
 		}
 	}
-	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) || s.taskRuntime.Terminal() {
-		return nil
+	generation := s.ensureTaskRuntimeGenerationLocked(taskID)
+	_, err := s.recordTaskStreamEventLocked(taskID, generation, event)
+	return err
+}
+
+// RecordTaskStreamEventForGeneration applies an event only when its captured
+// generation is still active. A stale event is a normal rejection, not an
+// operational error.
+func (s *Service) RecordTaskStreamEventForGeneration(taskID string, generation uint64, event ChatStreamEvent) (bool, error) {
+	if s == nil || s.eventStore == nil {
+		return false, nil
+	}
+	s.taskRuntimeMu.Lock()
+	defer s.taskRuntimeMu.Unlock()
+	return s.recordTaskStreamEventLocked(taskID, generation, event)
+}
+
+func (s *Service) recordTaskStreamEventLocked(taskID string, generation uint64, event ChatStreamEvent) (bool, error) {
+	if !taskRuntimeAcceptsStreamLocked(s.taskRuntime, taskID, generation) {
+		return false, nil
 	}
 	// Live stream states are deliberately non-terminal. FinishTaskRuntime owns
 	// the final merge and remains allowed to replace a prior live snapshot; once
@@ -108,22 +109,31 @@ func (s *Service) RecordTaskStreamEvent(taskID string, event ChatStreamEvent) er
 	// revive or mutate the completed task.
 	applyTaskStreamEvent(&s.taskRuntime, event)
 	force := taskRuntimeEventRequiresFlush(event)
-	return s.persistTaskRuntimeLocked(force)
+	return true, s.persistTaskRuntimeLocked(force)
 }
 
 func (s *Service) StartGuidedTaskRuntime(taskID, message, model string) error {
+	_, err := s.StartGuidedTaskRuntimeWithGeneration(taskID, message, model)
+	return err
+}
+
+// StartGuidedTaskRuntimeWithGeneration starts a new guided turn and invalidates
+// any detached writers that still hold the preceding turn's generation.
+func (s *Service) StartGuidedTaskRuntimeWithGeneration(taskID, message, model string) (uint64, error) {
 	if s == nil || s.eventStore == nil {
-		return nil
+		return 0, nil
 	}
 	s.taskRuntimeMu.Lock()
 	defer s.taskRuntimeMu.Unlock()
 	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) {
-		return nil
+		return 0, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	sequence := s.taskRuntime.TurnSequence + 1
+	generation := nextTaskRuntimeGeneration()
 	s.taskRuntime = TaskRuntimeState{
 		TaskID:       strings.TrimSpace(taskID),
+		Generation:   generation,
 		AnchorID:     s.eventStore.Head(),
 		StartedAt:    now,
 		UpdatedAt:    now,
@@ -135,7 +145,7 @@ func (s *Service) StartGuidedTaskRuntime(taskID, message, model string) error {
 	}
 	s.taskRuntimeLastWrite = time.Time{}
 	s.taskRuntimeLastHash = ""
-	return s.persistTaskRuntimeLocked(true)
+	return generation, s.persistTaskRuntimeLocked(true)
 }
 
 func (s *Service) FinishTaskRuntime(taskID, status, message string, result ChatResult) error {
@@ -150,15 +160,32 @@ func (s *Service) FinishTaskRuntime(taskID, status, message string, result ChatR
 			StartedAt: time.Now().UTC().Format(time.RFC3339Nano), TurnSequence: 1,
 		}
 	}
-	if s.taskRuntime.TaskID != strings.TrimSpace(taskID) {
-		return nil
+	generation := s.ensureTaskRuntimeGenerationLocked(taskID)
+	_, err := s.finishTaskRuntimeLocked(taskID, generation, status, message, result)
+	return err
+}
+
+// FinishTaskRuntimeForGeneration commits a terminal snapshot only for the
+// active generation. Duplicate or stale finalizers are rejected explicitly.
+func (s *Service) FinishTaskRuntimeForGeneration(taskID string, generation uint64, status, message string, result ChatResult) (bool, error) {
+	if s == nil || s.eventStore == nil {
+		return false, nil
+	}
+	s.taskRuntimeMu.Lock()
+	defer s.taskRuntimeMu.Unlock()
+	return s.finishTaskRuntimeLocked(taskID, generation, status, message, result)
+}
+
+func (s *Service) finishTaskRuntimeLocked(taskID string, generation uint64, status, message string, result ChatResult) (bool, error) {
+	if !taskRuntimeGenerationMatchesLocked(s.taskRuntime, taskID, generation) {
+		return false, nil
 	}
 	// The application normally guards this with chatTask.terminalOnce, but the
 	// runtime is also used during recovery and must defend its own one-shot
 	// boundary. Live stream phases never mark a task terminal, so the first
 	// final merge remains writable while duplicate or late finalizers are ignored.
 	if s.taskRuntime.Terminal() {
-		return nil
+		return false, nil
 	}
 	s.taskRuntime.Status = normalizeTaskRuntimeStatus(status)
 	s.taskRuntime.LastEvent = s.taskRuntime.Status
@@ -179,7 +206,7 @@ func (s *Service) FinishTaskRuntime(taskID, status, message string, result ChatR
 		s.taskRuntime.DurationMs = result.DurationMs
 	}
 	settleTaskRuntimeParts(&s.taskRuntime, s.taskRuntime.Status)
-	return s.persistTaskRuntimeLocked(true)
+	return true, s.persistTaskRuntimeLocked(true)
 }
 
 func applyTaskStreamEvent(state *TaskRuntimeState, event ChatStreamEvent) {
@@ -337,7 +364,7 @@ func (s *Service) persistTaskRuntimeLocked(force bool) error {
 
 func taskRuntimeEventRecord(state TaskRuntimeState) eventlog.TaskRuntimeRecord {
 	return eventlog.TaskRuntimeRecord{
-		Version: 1, TaskID: state.TaskID, AnchorID: state.AnchorID,
+		Version: 1, TaskID: state.TaskID, Generation: state.Generation, AnchorID: state.AnchorID,
 		StartedAt: state.StartedAt, UpdatedAt: state.UpdatedAt, Status: state.Status,
 		Message: redactSensitiveText(state.Message), Model: state.Model, Content: redactSensitiveText(state.Content),
 		Reasoning: redactSensitiveText(state.Reasoning), DurationMs: state.DurationMs,
@@ -347,7 +374,7 @@ func taskRuntimeEventRecord(state TaskRuntimeState) eventlog.TaskRuntimeRecord {
 
 func taskRuntimeStateFromEvent(record eventlog.TaskRuntimeRecord) TaskRuntimeState {
 	return TaskRuntimeState{
-		TaskID: record.TaskID, AnchorID: record.AnchorID, StartedAt: record.StartedAt,
+		TaskID: record.TaskID, Generation: record.Generation, AnchorID: record.AnchorID, StartedAt: record.StartedAt,
 		UpdatedAt: record.UpdatedAt, Status: record.Status, Message: record.Message,
 		Model: record.Model, Content: record.Content, Reasoning: record.Reasoning,
 		DurationMs: record.DurationMs, Parts: fromEventParts(record.Parts),
@@ -739,9 +766,10 @@ func recoverInterruptedTaskRuntime(store *eventlog.Store) (bool, error) {
 	state.LastEvent = "interrupted"
 	state.Message = "上次任务因应用退出而中断"
 	settleTaskRuntimeParts(&state, "interrupted")
+	header := eventlog.EventHeader{RunID: strings.TrimSpace(record.TaskID), Generation: int64(record.Generation)}
 	if latestPlan, ok := runningPlanAfterAnchor(events, record.AnchorID); ok {
 		latestPlan.PlanStatus = "interrupted"
-		if _, err := store.Append(latestPlan, eventlog.EventPlanUpdate); err != nil {
+		if _, err := store.AppendWithHeader(header, latestPlan, eventlog.EventPlanUpdate); err != nil {
 			return false, err
 		}
 	}
@@ -751,7 +779,7 @@ func recoverInterruptedTaskRuntime(store *eventlog.Store) (bool, error) {
 			content = "任务因应用意外退出而中断，已保留执行记录。发送“继续”可从当前进度恢复。"
 		}
 		terminalParts := appendTextPartIfMissing(state.Parts, content)
-		if _, err := store.Append(eventlog.EventPayload{
+		if _, err := store.AppendWithHeader(header, eventlog.EventPayload{
 			Role: "assistant", Content: content, Model: state.Model,
 			DurationMs: state.DurationMs, Parts: toEventParts(terminalParts), Status: "interrupted",
 		}, eventlog.EventTurnTerminal); err != nil {

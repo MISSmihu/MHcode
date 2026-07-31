@@ -337,7 +337,7 @@ func (t GitRepositoryTool) prepareClone(args gitRepositoryArguments) (gitReposit
 		return gitRepositoryInvocation{}, fmt.Errorf("cannot inspect clone destination: %w", statErr)
 	}
 	parent := filepath.Dir(destination)
-	if _, err := t.Policy.ResolveWritePath(parent); err != nil {
+	if _, err := t.Policy.ResolveCreateParentPath(parent); err != nil {
 		return gitRepositoryInvocation{}, err
 	}
 	if err := os.MkdirAll(parent, 0o755); err != nil {

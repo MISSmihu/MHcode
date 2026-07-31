@@ -228,6 +228,9 @@ func (m *Manager) Tools(settings Settings, policy tools.SandboxPolicy, readOnlyO
 			if !grantContains(setting.Permissions, descriptor.Permissions) {
 				continue
 			}
+			if policy.TaskScopeEnabled && !pluginToolDeclaresScopedPaths(descriptor) {
+				continue
+			}
 			result = append(result, &pluginTool{
 				manager:    m,
 				record:     record,
@@ -242,6 +245,28 @@ func (m *Manager) Tools(settings Settings, policy tools.SandboxPolicy, readOnlyO
 		}
 	}
 	return result
+}
+
+// pluginToolDeclaresScopedPaths allows network/compute-only plugins through,
+// but requires every requested filesystem capability to be represented by a
+// manifest path argument. pluginTool.resolvePaths then applies the same
+// SandboxPolicy used by built-in tools before the plugin process starts.
+func pluginToolDeclaresScopedPaths(descriptor ToolManifest) bool {
+	if !descriptor.Permissions.FileRead && !descriptor.Permissions.FileWrite {
+		return true
+	}
+	declaresRead := false
+	declaresWrite := false
+	for _, requirement := range descriptor.Paths {
+		switch requirement.Access {
+		case "read":
+			declaresRead = true
+		case "write":
+			declaresWrite = true
+		}
+	}
+	return (!descriptor.Permissions.FileRead || declaresRead) &&
+		(!descriptor.Permissions.FileWrite || declaresWrite)
 }
 
 func (m *Manager) Install(source string) (Manifest, error) {

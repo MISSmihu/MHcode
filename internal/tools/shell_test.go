@@ -212,6 +212,39 @@ func TestRunCommandStructuredModeRejectsOutsideWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestRunCommandTaskScopeRequiresTargetWorkingDirectory(t *testing.T) {
+	workspace := t.TempDir()
+	target := filepath.Join(workspace, "mhcode-agent-web-test")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	policy := SandboxPolicy{
+		WorkspaceRoot: workspace, FilesystemAccess: "workspace-write", ShellAccess: true,
+		TaskScopeEnabled: true, TaskScopeRoots: []string{target},
+	}
+	tool := RunCommandTool{Policy: policy}
+
+	workspaceArgs, _ := json.Marshal(map[string]any{
+		"executable": "go", "args": []string{"version"}, "working_directory": ".",
+	})
+	workspaceResult, err := tool.Execute(context.Background(), workspaceArgs)
+	if err != nil || !workspaceResult.IsError || !strings.Contains(workspaceResult.Summary, "本轮任务范围") {
+		t.Fatalf("workspace command escaped task scope: result=%#v err=%v", workspaceResult, err)
+	}
+
+	escapeArgs, _ := json.Marshal(map[string]any{
+		"executable": "go", "args": []string{"test", "../existing-project"}, "working_directory": target,
+	})
+	escapeResult, err := tool.Execute(context.Background(), escapeArgs)
+	if err != nil || !escapeResult.IsError || !strings.Contains(escapeResult.Summary, "本轮任务范围") {
+		t.Fatalf("parent traversal escaped task scope: result=%#v err=%v", escapeResult, err)
+	}
+
+	if resolved, resolveErr := policy.ResolveCommandWorkingDirectory(target); resolveErr != nil || resolved != target {
+		t.Fatalf("target working directory resolved=%q err=%v", resolved, resolveErr)
+	}
+}
+
 func TestRunCommandStructuredModeStillUsesCommandBroker(t *testing.T) {
 	tool := RunCommandTool{Policy: SandboxPolicy{
 		WorkspaceRoot: t.TempDir(), FilesystemAccess: "workspace-write", NetworkAccess: true, ShellAccess: true,

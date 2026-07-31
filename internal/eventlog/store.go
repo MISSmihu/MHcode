@@ -117,17 +117,32 @@ func (s *Store) persistHead() error {
 
 // Append 追加事件，以当前 head 为 parent，写盘并前移 head。
 func (s *Store) Append(payload EventPayload, eventType EventType) (Event, error) {
+	return s.AppendWithHeader(EventHeader{}, payload, eventType)
+}
+
+// AppendWithHeader appends an event with execution metadata. The existing
+// Append API remains available for callers that do not yet have a run or tool
+// context. Header fields are append-only metadata and do not affect branch
+// ordering, parent selection, or sequence allocation.
+func (s *Store) AppendWithHeader(header EventHeader, payload EventPayload, eventType EventType) (Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if header.BranchID == "" {
+		header.BranchID = s.branchIDLocked()
+	}
 	s.seq++
 	ev := Event{
-		ID:       fmt.Sprintf("ev-%d-%d", s.seq, time.Now().UnixNano()),
-		ParentID: s.head,
-		Seq:      s.seq,
-		Type:     eventType,
-		TS:       time.Now().UTC(),
-		Payload:  payload,
+		EventHeader: header.WithDefaultSchemaVersion(),
+		ID:          fmt.Sprintf("ev-%d-%d", s.seq, time.Now().UnixNano()),
+		ParentID:    s.head,
+		Seq:         s.seq,
+		Type:        eventType,
+		TS:          time.Now().UTC(),
+		Payload:     payload,
+	}
+	if eventType == EventBranchMarker || ev.BranchID == "" {
+		ev.BranchID = ev.ID
 	}
 	if err := s.appendRaw(ev); err != nil {
 		s.seq--
@@ -138,6 +153,32 @@ func (s *Store) Append(payload EventPayload, eventType EventType) (Event, error)
 	s.head = ev.ID
 	_ = s.persistHead()
 	return ev, nil
+}
+
+// BranchID returns the stable identity of the selected event branch. The
+// first event identifies the original branch; every branch_marker starts a new
+// branch. Rewind only moves HEAD and therefore restores the corresponding ID.
+func (s *Store) BranchID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.branchIDLocked()
+}
+
+func (s *Store) branchIDLocked() string {
+	current := s.head
+	root := ""
+	for current != "" {
+		event, ok := s.byID[current]
+		if !ok {
+			break
+		}
+		root = event.ID
+		if event.Type == EventBranchMarker {
+			return event.ID
+		}
+		current = event.ParentID
+	}
+	return root
 }
 
 func (s *Store) appendRaw(ev Event) error {

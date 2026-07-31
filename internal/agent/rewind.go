@@ -110,7 +110,7 @@ func (s *Service) recordUserEventWithAttachments(content string, attachments []C
 	if s.eventStore == nil {
 		return
 	}
-	_, _ = s.eventStore.Append(eventlog.EventPayload{
+	_, _ = s.appendEvent(eventlog.EventPayload{
 		Role: "user", Content: redactSensitiveText(content), Attachments: toEventAttachments(attachments),
 	}, eventlog.EventUserMessage)
 }
@@ -123,7 +123,7 @@ func (s *Service) recordTurnTerminal(status, content, model string, parts []tool
 		return fmt.Errorf("记录任务终态产物失败: %w", err)
 	}
 	parts = s.mergeTurnTimelineParts(parts, content, status)
-	_, err := s.eventStore.Append(eventlog.EventPayload{
+	_, err := s.appendEvent(eventlog.EventPayload{
 		Role:         "assistant",
 		Content:      redactSensitiveText(content),
 		Model:        model,
@@ -165,7 +165,7 @@ func (s *Service) recordFileSnapshot(change tools.FileChange) error {
 			return fmt.Errorf("保存改动后快照失败: %w", err)
 		}
 	}
-	_, err := s.eventStore.Append(eventlog.EventPayload{
+	_, err := s.appendEvent(eventlog.EventPayload{
 		Path:            change.Path,
 		BeforeHash:      beforeHash,
 		AfterHash:       afterHash,
@@ -198,7 +198,7 @@ func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []to
 	if len(durations) > 0 && durations[0] > 0 {
 		durationMs = durations[0]
 	}
-	_, _ = s.eventStore.Append(eventlog.EventPayload{
+	_, _ = s.appendEvent(eventlog.EventPayload{
 		Role:         "assistant",
 		Content:      content,
 		Model:        model,
@@ -206,7 +206,7 @@ func (s *Service) recordAssistantAndCheckpoint(content, model string, parts []to
 		Parts:        toEventParts(parts),
 		FailureState: toEventFailureStrategyState(s.failureStrategySnapshot()),
 	}, eventlog.EventAssistantMessage)
-	_, _ = s.eventStore.Append(eventlog.EventPayload{
+	_, _ = s.appendEvent(eventlog.EventPayload{
 		Label:     truncateLabel(content),
 		TurnIndex: s.sessionState.TurnCount,
 	}, eventlog.EventCheckpoint)
@@ -475,7 +475,7 @@ func (s *Service) forkFromMessageLocked(messageEventID string) (WorkbenchState, 
 	if err := s.restoreCurrentBranchTo(branchHead); err != nil {
 		return s.workbenchStateLocked(), err
 	}
-	if _, err := s.eventStore.Append(eventlog.EventPayload{Label: label}, eventlog.EventBranchMarker); err != nil {
+	if _, err := s.appendEvent(eventlog.EventPayload{Label: label}, eventlog.EventBranchMarker); err != nil {
 		// 尽力恢复原分支，避免写入失败后文件与对话停在半完成状态。
 		_, _ = s.switchBranch(originalHead)
 		return s.workbenchStateLocked(), fmt.Errorf("创建对话分支失败: %w", err)
@@ -529,6 +529,9 @@ func (s *Service) rebuildSessionFromEvents() {
 	s.teamResume = nil
 	s.teamState = TeamState{Enabled: s.runtimeSettings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}}
 	teamFailureAwaitingTerminal := false
+	compressionCount := 0
+	compressedMessageCount := 0
+	lastCompressedAt := ""
 	for _, ev := range events {
 		switch ev.Type {
 		case eventlog.EventUserMessage:
@@ -600,6 +603,27 @@ func (s *Service) rebuildSessionFromEvents() {
 			} else {
 				s.teamResume = nil
 			}
+		case eventlog.EventContextCondensed:
+			if strings.TrimSpace(ev.Payload.ContextViewHash) == "" {
+				continue
+			}
+			encoded, err := s.eventStore.ReadSnapshot(ev.Payload.ContextViewHash)
+			if err != nil {
+				continue
+			}
+			snapshot, err := decodePersistedContextView([]byte(encoded))
+			if err != nil {
+				continue
+			}
+			prefix := make([]protocol.Message, 0, len(snapshot)+1)
+			if systemMsg != nil {
+				prefix = append(prefix, *systemMsg)
+			}
+			rebuilt = append(prefix, cloneProtocolMessages(snapshot)...)
+			pendingUser = false
+			compressionCount++
+			compressedMessageCount += ev.Payload.ContextRemovedMessages
+			lastCompressedAt = ev.TS.Format(time.RFC3339)
 		}
 	}
 	if hasArtifactRegistry {
@@ -622,9 +646,9 @@ func (s *Service) rebuildSessionFromEvents() {
 	s.sessionState.EstimatedInputTokens = 0
 	s.sessionState.InputBudgetTokens = 0
 	s.sessionState.ContextUsagePercent = 0
-	s.sessionState.CompressionCount = 0
-	s.sessionState.CompressedMessageCount = 0
-	s.sessionState.LastCompressedAt = ""
+	s.sessionState.CompressionCount = compressionCount
+	s.sessionState.CompressedMessageCount = compressedMessageCount
+	s.sessionState.LastCompressedAt = lastCompressedAt
 	s.lastRequest = nil
 }
 

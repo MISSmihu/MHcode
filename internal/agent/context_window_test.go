@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MISSmihu/MHcode/internal/eventlog"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
 )
@@ -334,5 +335,61 @@ func TestPrepareSessionContextEmitsAutomaticCompressionEvents(t *testing.T) {
 	}
 	if events[1].Compression == nil || events[1].Compression.Status != "completed" || events[1].Compression.AfterTokens >= events[1].Compression.BeforeTokens {
 		t.Fatalf("completed event = %#v", events[1])
+	}
+}
+
+func TestContextCompressionPersistsAndRebuildsContextView(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	defer service.Close()
+	service.reasoning = ReasoningUltra
+	service.sessionMessages = []protocol.Message{{Role: "system", Content: "stable"}}
+	for index := 0; index < 10; index++ {
+		user := strings.Repeat("old request ", 320) + string(rune('a'+index))
+		answer := strings.Repeat("old answer ", 320) + string(rune('a'+index))
+		service.recordUserEvent(user)
+		service.recordAssistantAndCheckpoint(answer, "test-model", nil)
+		service.sessionMessages = append(service.sessionMessages,
+			protocol.Message{Role: "user", Content: user},
+			protocol.Message{Role: "assistant", Content: answer},
+		)
+	}
+	route := chatRoute{
+		Provider: ModelProviderSetting{ID: "test", Models: []ProviderModel{{
+			ID: "small", ContextWindowTokens: 8_000, ContextWindowSource: ContextWindowSourceManual,
+		}}},
+		ModelID: "small",
+	}
+	result, err := service.prepareSessionContextWithEvents(route, nil)
+	if err != nil || !result.Compressed {
+		t.Fatalf("compression result=%#v err=%v", result, err)
+	}
+
+	events := service.eventStore.Events()
+	var condensed eventlog.Event
+	for _, event := range events {
+		if event.Type == eventlog.EventContextCondensed {
+			condensed = event
+		}
+	}
+	if condensed.ID == "" || condensed.Payload.ContextViewHash == "" || condensed.Payload.ContextFromEventID == "" || condensed.Payload.ContextThroughEventID == "" {
+		t.Fatalf("condensed event = %#v", condensed)
+	}
+	if _, err := service.eventStore.ReadSnapshot(condensed.Payload.ContextViewHash); err != nil {
+		t.Fatalf("context view snapshot is unreadable: %v", err)
+	}
+	if len(events) < 31 { // Original events remain append-only beside the new view event.
+		t.Fatalf("raw event history was unexpectedly removed: %d events", len(events))
+	}
+
+	service.sessionMessages = []protocol.Message{{Role: "system", Content: "stable"}}
+	service.rebuildSessionFromEvents()
+	if len(service.sessionMessages) < 2 || service.sessionMessages[1].InternalKind != contextSummaryKind {
+		t.Fatalf("rebuilt context view = %#v", service.sessionMessages)
+	}
+	if !strings.Contains(service.sessionMessages[1].Content, "compressed conversation memory") {
+		t.Fatalf("rebuilt summary = %q", service.sessionMessages[1].Content)
+	}
+	if service.sessionState.CompressionCount != 1 || service.sessionState.CompressedMessageCount != result.RemovedMessages {
+		t.Fatalf("rebuilt compression telemetry = %#v", service.sessionState)
 	}
 }

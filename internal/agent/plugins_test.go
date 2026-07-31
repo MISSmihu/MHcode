@@ -40,6 +40,11 @@ func TestPluginToolsRegisterAcrossAgentPlanWorkerAndSessionRuntime(t *testing.T)
 	const readName = "plugin__agent-integration__inspect"
 	const writeName = "plugin__agent-integration__write"
 	assertRegistryContains(t, service.buildToolRegistry(), readName, writeName)
+	scopedCtx := withTurnTaskScope(context.Background(), turnTaskScope{
+		Enabled: true,
+		Roots:   []string{filepath.Join(workspace, "target")},
+	})
+	assertRegistryContains(t, service.buildToolRegistryForContext(scopedCtx), readName, writeName)
 	assertRegistryContains(t, service.buildWorkerToolRegistry(), readName, writeName)
 	planRegistry := service.buildReadOnlyRegistry()
 	assertRegistryContains(t, planRegistry, readName)

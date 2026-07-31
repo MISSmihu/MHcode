@@ -132,7 +132,7 @@ func (s *Service) persistPlanState(steps []tools.ProgressStep, status string) er
 		for _, step := range steps {
 			eventSteps = append(eventSteps, eventlog.MessageProgressStep{Title: step.Title, Status: step.Status})
 		}
-		if _, err := s.eventStore.Append(eventlog.EventPayload{PlanSteps: eventSteps, PlanStatus: status}, eventlog.EventPlanUpdate); err != nil {
+		if _, err := s.appendEvent(eventlog.EventPayload{PlanSteps: eventSteps, PlanStatus: status}, eventlog.EventPlanUpdate); err != nil {
 			return err
 		}
 	}

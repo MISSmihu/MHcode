@@ -346,7 +346,7 @@ func TestDelegateTaskRunsReadOnlyWorkersConcurrentlyWithoutCoordinatorTools(t *t
 		t.Fatalf("delegate_task blocked for %s instead of returning immediately", elapsed)
 	}
 	assertSubagentParts(t, result.Parts, 2, "pending")
-	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{"wait":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,6 +365,29 @@ func TestDelegateTaskRunsReadOnlyWorkersConcurrentlyWithoutCoordinatorTools(t *t
 	}
 	assertSubagentParts(t, collected.Parts, 2, "completed")
 	service.finishSubagentTurn(false)
+}
+
+func TestAwaitSubagentsDefaultsToNonBlocking(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	defer service.Close()
+	_, control := service.registerSubagent(context.Background(), tools.ResultPart{
+		Kind: tools.PartSubagent, TaskID: "nonblocking-child", AgentType: subagentExplore,
+		Label: "background", Status: "running",
+	})
+
+	started := time.Now()
+	result, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	if err != nil || result.IsError {
+		t.Fatalf("poll result=%#v err=%v", result, err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("default await blocked for %s", elapsed)
+	}
+	assertSubagentParts(t, result.Parts, 1, "running")
+	control.finish(delegatedTaskResult{part: tools.ResultPart{
+		Kind: tools.PartSubagent, TaskID: "nonblocking-child", AgentType: subagentExplore,
+		Label: "background", Status: "cancelled",
+	}})
 }
 
 func TestMainAgentDelegatesAndSynthesizesSubagentResult(t *testing.T) {
@@ -578,7 +601,7 @@ func TestDelegateTaskRunsImplementWorkersConcurrentlyAndAllowsWriteTools(t *test
 		t.Fatal(err)
 	}
 	assertSubagentParts(t, result.Parts, 2, "pending")
-	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+	collected, err := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{"wait":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +891,7 @@ func TestCancelSubagentStopsOnlySelectedWorker(t *testing.T) {
 
 	done := make(chan tools.Result, 1)
 	go func() {
-		collected, _ := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{}`))
+		collected, _ := (AwaitSubagentsTool{Service: service}).Execute(context.Background(), json.RawMessage(`{"wait":true}`))
 		done <- collected
 	}()
 	select {

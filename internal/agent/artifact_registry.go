@@ -171,7 +171,11 @@ func (s *Service) recordToolArtifacts(toolName, toolCallID string, result tools.
 	if len(pending) == 0 {
 		return records, nil
 	}
-	event, err := s.eventStore.Append(eventlog.EventPayload{Artifacts: pending}, eventlog.EventArtifactUpdate)
+	eventToolCallID := ""
+	if len(pending) == 1 {
+		eventToolCallID = pending[0].ToolCallID
+	}
+	event, err := s.appendEvent(eventlog.EventPayload{Artifacts: pending}, eventlog.EventArtifactUpdate, eventToolCallID)
 	if err != nil {
 		return records, fmt.Errorf("持久化产物登记失败: %w", err)
 	}

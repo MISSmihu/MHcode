@@ -15,7 +15,7 @@ func TestTaskRuntimeRoundTripAndMissingFile(t *testing.T) {
 		t.Fatalf("missing runtime ok=%v err=%v", ok, err)
 	}
 	record := TaskRuntimeRecord{
-		TaskID: "task-1", StartedAt: "2026-07-27T01:02:03Z", Status: "waiting",
+		TaskID: "task-1", Generation: 17, StartedAt: "2026-07-27T01:02:03Z", Status: "waiting",
 		Content: "partial", Parts: []MessagePart{{Kind: string(tools.PartToolCall), Name: "run_command", Status: "running"}},
 	}
 	if err := store.WriteTaskRuntime(record); err != nil {
@@ -25,7 +25,7 @@ func TestTaskRuntimeRoundTripAndMissingFile(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("restored runtime ok=%v err=%v", ok, err)
 	}
-	if restored.Version != 1 || restored.TaskID != "task-1" || restored.Status != "waiting" || len(restored.Parts) != 1 {
+	if restored.Version != 1 || restored.TaskID != "task-1" || restored.Generation != 17 || restored.Status != "waiting" || len(restored.Parts) != 1 {
 		t.Fatalf("restored runtime = %#v", restored)
 	}
 	if restored.Terminal() {

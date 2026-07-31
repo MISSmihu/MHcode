@@ -47,11 +47,52 @@ func TestManagerInstallDefaultsToUnconfiguredAndUninstall(t *testing.T) {
 	if len(pluginTools) < 1 || pluginTools[len(pluginTools)-1].Name() != "plugin__test-plugin__read" {
 		t.Fatalf("tools = %#v", pluginTools)
 	}
+	policy.TaskScopeEnabled = true
+	policy.TaskScopeRoots = []string{filepath.Join(policy.WorkspaceRoot, "target")}
+	for _, scopedTool := range manager.Tools(settings, policy, false) {
+		if scopedTool.Name() == "plugin__test-plugin__read" {
+			t.Fatalf("plugin without declared path arguments leaked into scoped registry: %#v", scopedTool)
+		}
+	}
 	if err := manager.Uninstall(manifest.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, manifest.ID)); !os.IsNotExist(err) {
 		t.Fatalf("plugin directory still exists: %v", err)
+	}
+}
+
+func TestPluginToolScopeRequiresDeclaredFilesystemPaths(t *testing.T) {
+	for name, test := range map[string]struct {
+		descriptor ToolManifest
+		want       bool
+	}{
+		"network-only": {
+			descriptor: ToolManifest{Permissions: PermissionSpec{Network: true}},
+			want:       true,
+		},
+		"undeclared-read": {
+			descriptor: ToolManifest{Permissions: PermissionSpec{FileRead: true}},
+		},
+		"declared-read": {
+			descriptor: ToolManifest{
+				Permissions: PermissionSpec{FileRead: true},
+				Paths:       []PathRequirement{{Argument: "path", Access: "read"}},
+			},
+			want: true,
+		},
+		"missing-write-path": {
+			descriptor: ToolManifest{
+				Permissions: PermissionSpec{FileRead: true, FileWrite: true},
+				Paths:       []PathRequirement{{Argument: "source", Access: "read"}},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := pluginToolDeclaresScopedPaths(test.descriptor); got != test.want {
+				t.Fatalf("compatible=%v want=%v", got, test.want)
+			}
+		})
 	}
 }
 

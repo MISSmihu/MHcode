@@ -207,6 +207,14 @@ func (r *Registry) Add(t Tool) {
 	r.tools[t.Name()] = t
 }
 
+// AddStructuredSearch registers the first-class, read-only grep and glob
+// tools in a stable order. Callers can keep the legacy search tool while they
+// migrate prompts and stored tool calls to the structured contracts.
+func (r *Registry) AddStructuredSearch(policy SandboxPolicy) {
+	r.Add(GrepTool{Policy: policy})
+	r.Add(GlobTool{Policy: policy})
+}
+
 func (r *Registry) Get(name string) (Tool, bool) {
 	t, ok := r.tools[name]
 	return t, ok

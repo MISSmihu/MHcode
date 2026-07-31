@@ -204,8 +204,14 @@ func (s *Service) runToolWithWatchdog(
 	if backgroundTool, ok := tool.(interface{ RetainsTaskContext() bool }); ok {
 		retainsTaskContext = backgroundTool.RetainsTaskContext()
 	}
-	if retainsTaskContext && ctx.Err() != nil {
-		return s.runToolWithApproval(ctx, tool, name, rawArgs)
+	if err := ctx.Err(); err != nil {
+		if retainsTaskContext {
+			// Retained-context tools still need one synchronous cleanup pass after
+			// cancellation. DelegateTaskTool uses this path to persist a cancelled
+			// child entry instead of losing the subagent card entirely.
+			return s.runToolWithApproval(ctx, tool, name, rawArgs)
+		}
+		return tools.Result{}, err
 	}
 	toolCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -215,10 +221,22 @@ func (s *Service) runToolWithWatchdog(
 	}
 	stopHeartbeat := startTaskToolHeartbeat(executionCtx)
 	defer stopHeartbeat()
+	resourcePlan := s.resourcesForTool(name, tool, rawArgs)
 
 	done := make(chan toolExecutionOutcome, 1)
 	go func() {
-		if toolNeedsExclusiveWorkspaceAccess(name, tool) {
+		if len(resourcePlan.Requests) > 0 {
+			lease, err := s.resourceCoordinatorForWorkspace().AcquireAll(toolCtx, resourcePlan.Requests)
+			if err != nil {
+				select {
+				case done <- toolExecutionOutcome{err: err}:
+				case <-toolCtx.Done():
+				}
+				return
+			}
+			defer lease.Release()
+		}
+		if toolNeedsExclusiveWorkspaceAccess(name, tool) && !resourcePlan.Precise {
 			unlock, acquired := s.lockToolMutationUntilDone(toolCtx)
 			if !acquired {
 				return

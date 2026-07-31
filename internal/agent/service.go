@@ -154,6 +154,8 @@ type Service struct {
 	subagentMu                  sync.Mutex
 	toolMutationMu              sync.Mutex // fallback for zero-value/test services
 	toolMutationGates           *sync.Map  // shared by detached runtimes, keyed by workspace
+	resourceCoordinator         ResourceCoordinator
+	resourceCoordinators        *sync.Map // shared by detached runtimes, keyed by workspace
 	failureMu                   sync.Mutex
 	artifactMu                  sync.Mutex
 	visualMu                    sync.Mutex
@@ -336,6 +338,7 @@ func NewService(config ServiceConfig) *Service {
 		anthropicCompatibilityCache: protocol.NewAnthropicCompatibilityCache(),
 		installationID:              stableInstallationID(config),
 		toolMutationGates:           &sync.Map{},
+		resourceCoordinators:        &sync.Map{},
 	}
 	if config.UsageStore != nil {
 		svc.usageLedger.Path = config.UsageStore.Path()
@@ -965,6 +968,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errors.New("当前 DeepSeek 原生协议不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
 	}
 	preview := withMarkdownReferenceDocuments(s.contextPreviewForInputLocked(prompt), attachments)
+	preview = withTurnTaskScopeContext(preview, turnTaskScopeFrom(ctx), s.runtimeSettings.WorkspaceRoot)
 	thinkingMode, reasoningEffort := s.thinkingConfigForRoute(route)
 	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
 	turn := s.captureTurnSnapshot()
@@ -1049,7 +1053,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 		)
 		baseMessageCount = currentTurnMessageStart(s.sessionMessages)
 	}
-	compression, compressionErr := s.prepareSessionContextWithEvents(route, sink)
+	compression, compressionErr := s.prepareSessionContextWithEvents(route, sink, !resumeTeamRun)
 	if compressionErr != nil {
 		if baseMessageCount >= 0 && baseMessageCount <= len(s.sessionMessages) {
 			s.sessionMessages = s.sessionMessages[:baseMessageCount]
@@ -2150,6 +2154,9 @@ func formatStablePrompt(ctx RequestContext) string {
 		stableSection(ctx, "system_rules", "Maintain a stable provider-visible prefix. Keep volatile user and tool data at the end of the request."),
 		"- Append new user turns after the existing transcript. Do not reinterpret older private context as a fresh user request.",
 		"- When a request requires code work, inspect the relevant files first, keep edits scoped, and preserve user changes.",
+		"- When the host supplies a task scope, it is the authoritative boundary for this turn: a missing named directory is a creation target, not permission to inspect or substitute an existing sibling project.",
+		"- Do not recursively list, search, or glob unrelated workspace directories. If a tool rejects a path as outside the task scope, adjust to the named target instead of probing another project.",
+		"- Never report a scoped create or modify task as complete without a successful tool result and a recorded in-scope file change.",
 		"",
 		"Runtime permission profile:",
 		stableSection(ctx, "runtime_policy", "Use the configured workspace sandbox and approval policy. Do not assume access that the runtime does not grant."),

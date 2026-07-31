@@ -77,6 +77,13 @@ func TestAgentMCPToolLoopPreservesPrivateContext(t *testing.T) {
 	if _, ok := service.buildReadOnlyRegistry().Get(mutateToolName); ok {
 		t.Fatal("mutating MCP tool leaked into the read-only registry")
 	}
+	scopedCtx := withTurnTaskScope(context.Background(), turnTaskScope{
+		Enabled: true,
+		Roots:   []string{t.TempDir()},
+	})
+	if _, ok := service.buildToolRegistryForContext(scopedCtx).Get(addToolName); ok {
+		t.Fatal("MCP tool without a host-enforceable path boundary leaked into a scoped turn")
+	}
 
 	userPrompt := "Use the remote MCP tool to add 2 and 3."
 	preview := service.contextPreviewForInput(userPrompt)

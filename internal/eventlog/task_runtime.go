@@ -20,6 +20,7 @@ const taskRuntimeFilename = "task-runtime.json"
 type TaskRuntimeRecord struct {
 	Version      int           `json:"version"`
 	TaskID       string        `json:"taskId"`
+	Generation   uint64        `json:"generation,omitempty"`
 	AnchorID     string        `json:"anchorId,omitempty"`
 	StartedAt    string        `json:"startedAt"`
 	UpdatedAt    string        `json:"updatedAt"`

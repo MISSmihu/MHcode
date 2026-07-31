@@ -49,6 +49,26 @@ func TestStructuredTransferToolsReachMainAndWorkerRegistries(t *testing.T) {
 	}
 }
 
+func TestStructuredSearchToolsReachMainWorkerAndPlanRegistries(t *testing.T) {
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	defer service.Close()
+	service.runtimeSettings.WorkspaceRoot = t.TempDir()
+	service.runtimeSettings.FilesystemAccess = "workspace-write"
+
+	registries := map[string]*tools.Registry{
+		"main":   service.buildToolRegistryForContext(context.Background()),
+		"worker": service.buildWorkerToolRegistryForContext(context.Background()),
+		"plan":   service.buildReadOnlyRegistryForContext(context.Background()),
+	}
+	for label, registry := range registries {
+		for _, name := range []string{"grep", "glob"} {
+			if _, ok := registry.Get(name); !ok {
+				t.Fatalf("%s registry is missing %s", label, name)
+			}
+		}
+	}
+}
+
 func TestStablePromptRequiresVerifiedStructuredTransfers(t *testing.T) {
 	prompt := formatStablePrompt(RequestContext{})
 	for _, expected := range []string{

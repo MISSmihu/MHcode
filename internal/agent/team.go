@@ -217,7 +217,7 @@ func (s *Service) persistTeamRunCheckpoint(checkpoint *teamRunCheckpoint) error 
 	if err != nil {
 		return fmt.Errorf("store AI team checkpoint: %w", err)
 	}
-	if _, err := s.eventStore.Append(eventlog.EventPayload{TeamCheckpointHash: hash}, eventlog.EventTeamCheckpoint); err != nil {
+	if _, err := s.appendEvent(eventlog.EventPayload{TeamCheckpointHash: hash}, eventlog.EventTeamCheckpoint); err != nil {
 		return fmt.Errorf("append AI team checkpoint: %w", err)
 	}
 	return nil
@@ -360,7 +360,7 @@ func (s *Service) recordTeamPauseMessage(content, model string, parts []tools.Re
 	if len(durations) > 0 && durations[0] > 0 {
 		durationMs = durations[0]
 	}
-	_, _ = s.eventStore.Append(eventlog.EventPayload{
+	_, _ = s.appendEvent(eventlog.EventPayload{
 		Role: "assistant", Content: content, Model: model, DurationMs: durationMs, Parts: toEventParts(parts),
 	}, eventlog.EventAssistantMessage)
 }

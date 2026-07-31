@@ -45,6 +45,7 @@ type chatTask struct {
 	doneOnce          sync.Once
 	terminalOnce      sync.Once
 	progressMu        sync.Mutex
+	generation        uint64
 	terminal          bool
 }
 
@@ -464,9 +465,15 @@ func chatSessionKey(projectID, sessionID string) string {
 
 func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, attachments []agent.ChatAttachment) {
 	defer task.markDone()
-	_ = task.service.StartTaskRuntime(task.id, task.startedAt)
+	generation, _ := task.service.StartTaskRuntimeWithGeneration(task.id, task.startedAt)
+	task.setGeneration(generation)
 	a.emitChatTaskEvent(ChatTaskEvent{TaskID: task.id, Type: "started", Message: "正在准备上下文"})
-	emitProgress := func(progress agent.ChatStreamEvent) { a.recordChatTaskProgress(task, progress) }
+	newProgressSink := func(turnGeneration uint64) agent.ChatEventSink {
+		return func(progress agent.ChatStreamEvent) {
+			a.recordChatTaskProgressForGeneration(task, turnGeneration, progress)
+		}
+	}
+	emitProgress := newProgressSink(generation)
 
 	var result agent.ChatResult
 	var err error
@@ -506,7 +513,9 @@ func (a *App) runChatTask(ctx context.Context, task *chatTask, prompt string, at
 				Attachments: append([]agent.ChatAttachment(nil), guidance.attachments...),
 				Result:      &completedResult,
 			})
-			_ = task.service.StartGuidedTaskRuntime(task.id, "已收到引导，正在调整当前任务", result.Model)
+			generation, _ = task.service.StartGuidedTaskRuntimeWithGeneration(task.id, "已收到引导，正在调整当前任务", result.Model)
+			task.setGeneration(generation)
+			emitProgress = newProgressSink(generation)
 			currentPrompt = guidance.prompt
 			currentAttachments = guidance.attachments
 			guidanceTurn = true
@@ -535,6 +544,24 @@ func (task *chatTask) markDone() {
 	task.doneOnce.Do(func() { close(task.done) })
 }
 
+func (task *chatTask) setGeneration(generation uint64) {
+	if task == nil {
+		return
+	}
+	task.progressMu.Lock()
+	task.generation = generation
+	task.progressMu.Unlock()
+}
+
+func (task *chatTask) currentGeneration() uint64 {
+	if task == nil {
+		return 0
+	}
+	task.progressMu.Lock()
+	defer task.progressMu.Unlock()
+	return task.generation
+}
+
 func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 	if task == nil {
 		return
@@ -545,13 +572,18 @@ func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 		// so a late event cannot revive the UI or overwrite the final snapshot.
 		task.progressMu.Lock()
 		task.terminal = true
+		generation := task.generation
 		task.progressMu.Unlock()
 		result := agent.ChatResult{}
 		if event.Result != nil {
 			result = *event.Result
 		}
 		if task.service != nil {
-			_ = task.service.FinishTaskRuntime(task.id, event.Type, event.Message, result)
+			if generation != 0 {
+				_, _ = task.service.FinishTaskRuntimeForGeneration(task.id, generation, event.Type, event.Message, result)
+			} else {
+				_ = task.service.FinishTaskRuntime(task.id, event.Type, event.Message, result)
+			}
 		}
 		if task.cancel != nil {
 			task.cancel()
@@ -566,6 +598,10 @@ func (a *App) completeChatTask(task *chatTask, event ChatTaskEvent) {
 }
 
 func (a *App) recordChatTaskProgress(task *chatTask, progress agent.ChatStreamEvent) {
+	a.recordChatTaskProgressForGeneration(task, task.currentGeneration(), progress)
+}
+
+func (a *App) recordChatTaskProgressForGeneration(task *chatTask, generation uint64, progress agent.ChatStreamEvent) {
 	if task == nil {
 		return
 	}
@@ -575,7 +611,14 @@ func (a *App) recordChatTaskProgress(task *chatTask, progress agent.ChatStreamEv
 		return
 	}
 	if task.service != nil {
-		_ = task.service.RecordTaskStreamEvent(task.id, progress)
+		if generation != 0 {
+			accepted, _ := task.service.RecordTaskStreamEventForGeneration(task.id, generation, progress)
+			if !accepted {
+				return
+			}
+		} else {
+			_ = task.service.RecordTaskStreamEvent(task.id, progress)
+		}
 	}
 	a.emitChatTaskEvent(ChatTaskEvent{
 		TaskID:      task.id,
@@ -670,6 +713,12 @@ func (a *App) cancelActiveChatTask(taskID string) *chatTask {
 	task.acceptingGuidance = false
 	task.status = "cancelled"
 	a.chat.mu.Unlock()
+	if task.service != nil {
+		generation := task.currentGeneration()
+		if generation != 0 {
+			_, _ = task.service.MarkTaskRuntimeCancelling(task.id, generation, "正在停止任务")
+		}
+	}
 	if task.cancel != nil {
 		task.cancel()
 	}
@@ -678,19 +727,34 @@ func (a *App) cancelActiveChatTask(taskID string) *chatTask {
 
 func (a *App) cancelAllChatTasks() {
 	a.chat.mu.Lock()
-	defer a.chat.mu.Unlock()
 	seen := make(map[string]bool)
+	tasks := make([]*chatTask, 0, len(a.chat.tasks)+1)
 	for _, task := range a.chat.tasks {
 		if task == nil || seen[task.id] {
 			continue
 		}
 		seen[task.id] = true
 		task.acceptingGuidance = false
-		task.cancel()
+		task.status = "cancelled"
+		tasks = append(tasks, task)
 	}
 	if a.chat.active != nil && !seen[a.chat.active.id] {
 		a.chat.active.acceptingGuidance = false
-		a.chat.active.cancel()
+		a.chat.active.status = "cancelled"
+		tasks = append(tasks, a.chat.active)
+	}
+	a.chat.mu.Unlock()
+
+	for _, task := range tasks {
+		if task.service != nil {
+			generation := task.currentGeneration()
+			if generation != 0 {
+				_, _ = task.service.MarkTaskRuntimeCancelling(task.id, generation, "正在停止任务")
+			}
+		}
+		if task.cancel != nil {
+			task.cancel()
+		}
 	}
 }
 

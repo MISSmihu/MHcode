@@ -115,3 +115,33 @@ func TestTurnTimelineMarksOverflowInsteadOfSilentlyDroppingNotes(t *testing.T) {
 		t.Fatalf("timeline overflow marker = %#v", last)
 	}
 }
+
+func TestTurnTimelineDropsEventsFromSupersededGeneration(t *testing.T) {
+	service := newTaskRuntimeTestService(t, t.TempDir())
+	oldGeneration, err := service.StartTaskRuntimeWithGeneration("task-timeline", "2026-07-30T01:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarded := 0
+	oldSink := service.captureTurnTimelineForGeneration(oldGeneration, func(ChatStreamEvent) {
+		forwarded++
+	})
+
+	currentGeneration, err := service.StartTaskRuntimeWithGeneration("task-timeline", "2026-07-30T01:00:01Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.resetTurnTimeline()
+	currentSink := service.captureTurnTimelineForGeneration(currentGeneration, func(ChatStreamEvent) {
+		forwarded++
+	})
+
+	oldSink(ChatStreamEvent{Type: "status", Message: "旧任务仍在输出", Status: "running"})
+	if forwarded != 0 || len(service.turnTimelineParts) != 0 {
+		t.Fatalf("superseded timeline event leaked: forwarded=%d parts=%#v", forwarded, service.turnTimelineParts)
+	}
+	currentSink(ChatStreamEvent{Type: "status", Message: "新任务正在工作", Status: "running"})
+	if forwarded != 1 || len(service.turnTimelineParts) != 1 || service.turnTimelineParts[0].Message != "新任务正在工作" {
+		t.Fatalf("current timeline event missing: forwarded=%d parts=%#v", forwarded, service.turnTimelineParts)
+	}
+}

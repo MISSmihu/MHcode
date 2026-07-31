@@ -80,6 +80,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 	teamResume := cloneTeamRunCheckpoint(s.teamResume)
 	failureStrategy := s.failureStrategySnapshot()
 	toolMutationGates := s.toolMutationGates
+	resourceCoordinators := s.resourceCoordinators
 	snapshot := cloneWorkbenchState(s.stateSnapshot)
 	var notify func(ApprovalRequest)
 	if s.approvals != nil {
@@ -122,6 +123,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 			sessionState:                baseSessionState,
 			failureStrategy:             failureStrategy,
 			toolMutationGates:           toolMutationGates,
+			resourceCoordinators:        resourceCoordinators,
 		}
 		runtime.approvals.SetNotify(notify)
 		runtime.teamState = teamState
@@ -173,6 +175,7 @@ func (s *Service) NewProjectSessionRuntime(projectID, sessionID string) (*Servic
 		projectID:                   projectID,
 		teamState:                   TeamState{Enabled: settings.Team.Enabled, Status: "idle", Roles: []TeamRoleState{}},
 		toolMutationGates:           toolMutationGates,
+		resourceCoordinators:        resourceCoordinators,
 	}
 	runtime.approvals.SetNotify(notify)
 

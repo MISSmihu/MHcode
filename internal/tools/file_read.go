@@ -197,6 +197,12 @@ func (t ListDirTool) Execute(_ context.Context, rawArgs json.RawMessage) (Result
 		if path == abs {
 			return nil
 		}
+		if entry.IsDir() && !t.Policy.TaskScopeAllowsTraversal(path) {
+			return filepath.SkipDir
+		}
+		if !entry.IsDir() && !t.Policy.TaskScopeAllowsPath(path) {
+			return nil
+		}
 		depth := strings.Count(filepath.Clean(path), string(os.PathSeparator)) - rootDepth
 		name := entry.Name()
 		if entry.IsDir() && (depth > args.MaxDepth || (!args.IncludeHidden && strings.HasPrefix(name, ".")) || skipDir(name)) {
@@ -310,9 +316,15 @@ func (t SearchTool) Execute(ctx context.Context, rawArgs json.RawMessage) (Resul
 			return ctx.Err()
 		}
 		if d.IsDir() {
+			if !t.Policy.TaskScopeAllowsTraversal(p) {
+				return filepath.SkipDir
+			}
 			if skipDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if !t.Policy.TaskScopeAllowsPath(p) {
 			return nil
 		}
 		relWorkspace, relErr := filepath.Rel(t.Policy.WorkspaceRoot, p)

@@ -68,23 +68,22 @@ func (t RunCommandTool) Execute(ctx context.Context, rawArgs json.RawMessage) (R
 	if err := t.Policy.CheckShell(); err != nil {
 		return errorResult(err.Error()), nil
 	}
+	workDir, err := resolveCommandWorkingDirectory(t.Policy, args.WorkingDirectory)
+	if err != nil {
+		return errorResult(err.Error()), nil
+	}
 	displayCommand := runCommandDisplay(args)
 	if directMode {
 		if err := validateDirectProcessArguments(args.Executable, args.Args); err != nil {
 			return errorResult(err.Error()), nil
 		}
-		if err := t.Policy.ValidateDirectCommand(args.Executable, args.Args); err != nil {
+		if err := t.Policy.ValidateDirectCommandAt(args.Executable, args.Args, workDir); err != nil {
 			return errorResult(err.Error()), nil
 		}
 	} else {
-		if err := t.Policy.ValidateCommand(args.Command); err != nil {
+		if err := t.Policy.ValidateCommandAt(args.Command, workDir); err != nil {
 			return errorResult(err.Error()), nil
 		}
-	}
-
-	workDir, err := resolveCommandWorkingDirectory(t.Policy, args.WorkingDirectory)
-	if err != nil {
-		return errorResult(err.Error()), nil
 	}
 
 	timeout := time.Duration(t.Policy.MaxCommandSeconds) * time.Second
@@ -225,7 +224,7 @@ func resolveCommandWorkingDirectory(policy SandboxPolicy, requested string) (str
 	if requested == "" {
 		requested = "."
 	}
-	workDir, err := policy.ResolveReadPath(requested)
+	workDir, err := policy.ResolveCommandWorkingDirectory(requested)
 	if err != nil {
 		return "", fmt.Errorf("invalid working_directory: %w", err)
 	}

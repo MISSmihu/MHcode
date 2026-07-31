@@ -173,6 +173,92 @@ func TestChatTaskDropsLateProgressAfterTerminal(t *testing.T) {
 	}
 }
 
+func TestChatTaskDropsProgressFromSupersededGeneration(t *testing.T) {
+	service := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	first, err := service.StartTaskRuntimeWithGeneration("task-generation", "2026-07-30T01:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &chatTask{id: "task-generation", projectID: "project", sessionID: "session", service: service, generation: first}
+	app := &App{}
+
+	current, err := service.StartTaskRuntimeWithGeneration(task.id, "2026-07-30T01:00:01Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.setGeneration(current)
+	app.recordChatTaskProgressForGeneration(task, first, agent.ChatStreamEvent{Type: "delta", Delta: "stale"})
+	app.recordChatTaskProgressForGeneration(task, current, agent.ChatStreamEvent{Type: "delta", Delta: "current"})
+
+	snapshot, ok := service.TaskRuntimeSnapshot()
+	if !ok || snapshot.Generation != current || snapshot.Content != "current" {
+		t.Fatalf("runtime snapshot = %#v ok=%v", snapshot, ok)
+	}
+}
+
+func TestCancelActiveChatTaskMarksRuntimeCancelling(t *testing.T) {
+	service := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+	generation, err := service.StartTaskRuntimeWithGeneration("task-cancelling", "2026-07-30T01:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	task := &chatTask{
+		id: "task-cancelling", projectID: "project", sessionID: "session", service: service,
+		generation: generation, cancel: cancel,
+	}
+	app := &App{}
+	app.chat.tasks = map[string]*chatTask{task.id: task}
+	app.chat.active = task
+
+	if cancelled := app.cancelActiveChatTask(task.id); cancelled != task {
+		t.Fatalf("cancelled task = %#v", cancelled)
+	}
+	snapshot, ok := service.TaskRuntimeSnapshot()
+	if !ok || snapshot.Status != "cancelling" || snapshot.Terminal() {
+		t.Fatalf("runtime snapshot = %#v ok=%v", snapshot, ok)
+	}
+}
+
+func TestCancelAllChatTasksMarksEveryRuntimeCancelling(t *testing.T) {
+	app := &App{}
+	app.chat.tasks = make(map[string]*chatTask)
+	app.chat.bySession = make(map[string]string)
+
+	for _, taskID := range []string{"task-cancel-all-a", "task-cancel-all-b"} {
+		service := agent.NewService(agent.ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: t.TempDir()})
+		generation, err := service.StartTaskRuntimeWithGeneration(taskID, "2026-07-30T01:00:00Z")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		task := &chatTask{
+			id: taskID, projectID: "project", sessionID: taskID, service: service,
+			generation: generation, cancel: cancel, acceptingGuidance: true,
+		}
+		app.chat.tasks[taskID] = task
+		app.chat.bySession[chatSessionKey(task.projectID, task.sessionID)] = taskID
+		app.chat.active = task
+		t.Cleanup(service.Close)
+
+		defer func(ctx context.Context, service *agent.Service, taskID string) {
+			select {
+			case <-ctx.Done():
+			default:
+				t.Errorf("%s context was not cancelled", taskID)
+			}
+			snapshot, ok := service.TaskRuntimeSnapshot()
+			if !ok || snapshot.Status != "cancelling" || snapshot.Terminal() {
+				t.Errorf("%s runtime snapshot = %#v ok=%v", taskID, snapshot, ok)
+			}
+		}(ctx, service, taskID)
+	}
+
+	app.cancelAllChatTasks()
+}
+
 func TestProjectSessionIdleCheckDistinguishesDuplicateSessionIDs(t *testing.T) {
 	_, cancelA := context.WithCancel(context.Background())
 	_, cancelB := context.WithCancel(context.Background())
