@@ -1,15 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <rect x="10" y="10" width="236" height="236" rx="54" fill="#171717"/>
-  <rect x="12" y="12" width="232" height="232" rx="52" fill="none" stroke="#383838" stroke-width="4"/>
-  <path
-    d="M34 190V66h29l37 54 37-54h29v124h-31v-73l-35 51-35-51v73Z"
-    fill="#F4F4F2"
-  />
-  <path
-    d="m185 94 35 34-35 34"
+  <rect x="16" y="16" width="224" height="224" rx="44" fill="#202124"/>
+  <polyline
+    points="72,184 72,72 128,154 184,72 184,184"
     fill="none"
-    stroke="#D89A31"
-    stroke-width="15"
+    stroke="#ffffff"
+    stroke-width="32"
     stroke-linecap="round"
     stroke-linejoin="round"
   />
