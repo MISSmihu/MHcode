@@ -24,19 +24,25 @@ type DB struct {
 }
 
 type UsageRecord struct {
-	ID                    int64     `json:"id"`
-	CreatedAt             time.Time `json:"createdAt"`
-	SessionID             string    `json:"sessionId"`
-	ProviderID            string    `json:"providerId"`
-	ProviderName          string    `json:"providerName"`
-	Protocol              string    `json:"protocol"`
-	ModelID               string    `json:"modelId"`
-	Reasoning             string    `json:"reasoning"`
-	PromptCacheHitTokens  int64     `json:"promptCacheHitTokens"`
-	PromptCacheMissTokens int64     `json:"promptCacheMissTokens"`
-	InputTokens           int64     `json:"inputTokens"`
-	OutputTokens          int64     `json:"outputTokens"`
-	EffectiveCost         float64   `json:"effectiveCost"`
+	ID                       int64     `json:"id"`
+	CreatedAt                time.Time `json:"createdAt"`
+	SessionID                string    `json:"sessionId"`
+	ProviderID               string    `json:"providerId"`
+	ProviderName             string    `json:"providerName"`
+	Protocol                 string    `json:"protocol"`
+	ModelID                  string    `json:"modelId"`
+	Reasoning                string    `json:"reasoning"`
+	PromptCacheHitTokens     int64     `json:"promptCacheHitTokens"`
+	PromptCacheMissTokens    int64     `json:"promptCacheMissTokens"`
+	InputTokens              int64     `json:"inputTokens"`
+	OutputTokens             int64     `json:"outputTokens"`
+	EffectiveCost            float64   `json:"effectiveCost"`
+	PricingSource            string    `json:"pricingSource,omitempty"`
+	PricingVersion           string    `json:"pricingVersion,omitempty"`
+	InputPricePerMillion     float64   `json:"inputPricePerMillion,omitempty"`
+	OutputPricePerMillion    float64   `json:"outputPricePerMillion,omitempty"`
+	CacheHitPricePerMillion  float64   `json:"cacheHitPricePerMillion,omitempty"`
+	CacheMissPricePerMillion float64   `json:"cacheMissPricePerMillion,omitempty"`
 }
 
 type UsageTotals struct {
@@ -47,6 +53,25 @@ type UsageTotals struct {
 	OutputTokens          int64   `json:"outputTokens"`
 	EffectiveCost         float64 `json:"effectiveCost"`
 	LastRecordedAt        string  `json:"lastRecordedAt,omitempty"`
+}
+
+// BillingReconciliation stores a user- or API-supplied official billing
+// snapshot for one provider and one closed reporting period. The local
+// estimate is saved beside it so later price edits cannot rewrite history.
+type BillingReconciliation struct {
+	ID               int64     `json:"id"`
+	ProviderID       string    `json:"providerId"`
+	ProviderName     string    `json:"providerName"`
+	PeriodStart      time.Time `json:"periodStart"`
+	PeriodEnd        time.Time `json:"periodEnd"`
+	OfficialCost     float64   `json:"officialCost"`
+	EstimatedCost    float64   `json:"estimatedCost"`
+	Difference       float64   `json:"difference"`
+	Source           string    `json:"source"`
+	Note             string    `json:"note,omitempty"`
+	UsageDetailsJSON string    `json:"usageDetailsJson,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 func Open(path string) (*DB, error) {
@@ -174,8 +199,10 @@ func (db *DB) AppendUsage(record UsageRecord) error {
 	_, err := db.db.ExecContext(ctx, `
 		INSERT INTO usage_metrics (
 			created_at, session_id, provider_id, provider_name, protocol, model_id, reasoning,
-			prompt_cache_hit_tokens, prompt_cache_miss_tokens, input_tokens, output_tokens, effective_cost
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			prompt_cache_hit_tokens, prompt_cache_miss_tokens, input_tokens, output_tokens, effective_cost,
+			pricing_source, pricing_version, input_price_per_million, output_price_per_million,
+			cache_hit_price_per_million, cache_miss_price_per_million
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.CreatedAt.UTC().Format(time.RFC3339Nano),
 		strings.TrimSpace(record.SessionID),
 		strings.TrimSpace(record.ProviderID),
@@ -188,6 +215,12 @@ func (db *DB) AppendUsage(record UsageRecord) error {
 		nonNegative(record.InputTokens),
 		nonNegative(record.OutputTokens),
 		nonNegativeFloat(record.EffectiveCost),
+		strings.TrimSpace(record.PricingSource),
+		strings.TrimSpace(record.PricingVersion),
+		nonNegativeFloat(record.InputPricePerMillion),
+		nonNegativeFloat(record.OutputPricePerMillion),
+		nonNegativeFloat(record.CacheHitPricePerMillion),
+		nonNegativeFloat(record.CacheMissPricePerMillion),
 	)
 	if err != nil {
 		return fmt.Errorf("append usage: %w", err)
@@ -210,7 +243,9 @@ func (db *DB) RecentUsage(sessionID string, limit int) ([]UsageRecord, error) {
 
 	query := `
 		SELECT id, created_at, session_id, provider_id, provider_name, protocol, model_id, reasoning,
-			prompt_cache_hit_tokens, prompt_cache_miss_tokens, input_tokens, output_tokens, effective_cost
+			prompt_cache_hit_tokens, prompt_cache_miss_tokens, input_tokens, output_tokens, effective_cost,
+			pricing_source, pricing_version, input_price_per_million, output_price_per_million,
+			cache_hit_price_per_million, cache_miss_price_per_million
 		FROM usage_metrics`
 	args := []any{}
 	if strings.TrimSpace(sessionID) != "" {
@@ -277,6 +312,157 @@ func (db *DB) Totals(sessionID string) (UsageTotals, error) {
 	return totals, nil
 }
 
+// UsageCostForProviderPeriod returns the locally recorded request cost for a
+// half-open reporting period [start, end). Keeping the range explicit avoids
+// comparing a partial local day against a complete official billing day.
+func (db *DB) UsageCostForProviderPeriod(providerID string, start, end time.Time) (float64, error) {
+	if db == nil || db.db == nil {
+		return 0, errors.New("storage is closed")
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return 0, errors.New("provider id cannot be empty")
+	}
+	if start.IsZero() || end.IsZero() || !end.After(start) {
+		return 0, errors.New("billing period must have a positive duration")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+	var cost float64
+	if err := db.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(effective_cost), 0)
+		FROM usage_metrics
+		WHERE provider_id = ? AND created_at >= ? AND created_at < ?`,
+		providerID,
+		start.UTC().Format(time.RFC3339Nano),
+		end.UTC().Format(time.RFC3339Nano),
+	).Scan(&cost); err != nil {
+		return 0, fmt.Errorf("query provider usage cost: %w", err)
+	}
+	return nonNegativeFloat(cost), nil
+}
+
+// UpsertBillingReconciliation persists an official bill snapshot. Re-entering
+// a closed period replaces the prior snapshot, which is useful when a provider
+// finalizes delayed usage data.
+func (db *DB) UpsertBillingReconciliation(record BillingReconciliation) (BillingReconciliation, error) {
+	if db == nil || db.db == nil {
+		return BillingReconciliation{}, errors.New("storage is closed")
+	}
+	record.ProviderID = strings.TrimSpace(record.ProviderID)
+	if record.ProviderID == "" {
+		return BillingReconciliation{}, errors.New("provider id cannot be empty")
+	}
+	if record.PeriodStart.IsZero() || record.PeriodEnd.IsZero() || !record.PeriodEnd.After(record.PeriodStart) {
+		return BillingReconciliation{}, errors.New("billing period must have a positive duration")
+	}
+	record.ProviderName = strings.TrimSpace(record.ProviderName)
+	record.Source = strings.TrimSpace(record.Source)
+	if record.Source == "" {
+		record.Source = "official-manual"
+	}
+	record.Note = strings.TrimSpace(record.Note)
+	record.UsageDetailsJSON = strings.TrimSpace(record.UsageDetailsJSON)
+	record.OfficialCost = nonNegativeFloat(record.OfficialCost)
+	record.EstimatedCost = nonNegativeFloat(record.EstimatedCost)
+	record.Difference = record.OfficialCost - record.EstimatedCost
+	now := time.Now().UTC()
+	if record.CreatedAt.IsZero() {
+		record.CreatedAt = now
+	}
+	record.UpdatedAt = now
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+	_, err := db.db.ExecContext(ctx, `
+		INSERT INTO usage_billing_reconciliations (
+			provider_id, provider_name, period_start, period_end, official_cost, estimated_cost,
+			difference, source, note, usage_details_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider_id, period_start, period_end) DO UPDATE SET
+			provider_name = excluded.provider_name,
+			official_cost = excluded.official_cost,
+			estimated_cost = excluded.estimated_cost,
+			difference = excluded.difference,
+			source = excluded.source,
+			note = excluded.note,
+			usage_details_json = excluded.usage_details_json,
+			updated_at = excluded.updated_at`,
+		record.ProviderID,
+		record.ProviderName,
+		record.PeriodStart.UTC().Format(time.RFC3339Nano),
+		record.PeriodEnd.UTC().Format(time.RFC3339Nano),
+		record.OfficialCost,
+		record.EstimatedCost,
+		record.Difference,
+		record.Source,
+		record.Note,
+		record.UsageDetailsJSON,
+		record.CreatedAt.UTC().Format(time.RFC3339Nano),
+		record.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return BillingReconciliation{}, fmt.Errorf("upsert billing reconciliation: %w", err)
+	}
+	return db.BillingReconciliation(record.ProviderID, record.PeriodStart, record.PeriodEnd)
+}
+
+func (db *DB) BillingReconciliation(providerID string, start, end time.Time) (BillingReconciliation, error) {
+	if db == nil || db.db == nil {
+		return BillingReconciliation{}, errors.New("storage is closed")
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return BillingReconciliation{}, errors.New("provider id cannot be empty")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+	row := db.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, provider_name, period_start, period_end, official_cost, estimated_cost,
+			difference, source, note, usage_details_json, created_at, updated_at
+		FROM usage_billing_reconciliations
+		WHERE provider_id = ? AND period_start = ? AND period_end = ?`,
+		providerID,
+		start.UTC().Format(time.RFC3339Nano),
+		end.UTC().Format(time.RFC3339Nano),
+	)
+	record, err := scanBillingReconciliation(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BillingReconciliation{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return BillingReconciliation{}, fmt.Errorf("query billing reconciliation: %w", err)
+	}
+	return record, nil
+}
+
+func (db *DB) LatestBillingReconciliation(providerID string) (BillingReconciliation, error) {
+	if db == nil || db.db == nil {
+		return BillingReconciliation{}, errors.New("storage is closed")
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return BillingReconciliation{}, errors.New("provider id cannot be empty")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
+	defer cancel()
+	row := db.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, provider_name, period_start, period_end, official_cost, estimated_cost,
+			difference, source, note, usage_details_json, created_at, updated_at
+		FROM usage_billing_reconciliations
+		WHERE provider_id = ?
+		ORDER BY period_end DESC, updated_at DESC, id DESC
+		LIMIT 1`, providerID)
+	record, err := scanBillingReconciliation(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BillingReconciliation{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return BillingReconciliation{}, fmt.Errorf("query latest billing reconciliation: %w", err)
+	}
+	return record, nil
+}
+
 type rowScanner interface {
 	Scan(...any) error
 }
@@ -298,6 +484,12 @@ func scanUsageRecord(scanner rowScanner) (UsageRecord, error) {
 		&record.InputTokens,
 		&record.OutputTokens,
 		&record.EffectiveCost,
+		&record.PricingSource,
+		&record.PricingVersion,
+		&record.InputPricePerMillion,
+		&record.OutputPricePerMillion,
+		&record.CacheHitPricePerMillion,
+		&record.CacheMissPricePerMillion,
 	); err != nil {
 		return UsageRecord{}, fmt.Errorf("scan usage: %w", err)
 	}
@@ -307,6 +499,42 @@ func scanUsageRecord(scanner rowScanner) (UsageRecord, error) {
 			return UsageRecord{}, fmt.Errorf("parse usage timestamp: %w", err)
 		}
 		record.CreatedAt = parsed
+	}
+	return record, nil
+}
+
+func scanBillingReconciliation(scanner rowScanner) (BillingReconciliation, error) {
+	var record BillingReconciliation
+	var periodStart, periodEnd, createdAt, updatedAt string
+	if err := scanner.Scan(
+		&record.ID,
+		&record.ProviderID,
+		&record.ProviderName,
+		&periodStart,
+		&periodEnd,
+		&record.OfficialCost,
+		&record.EstimatedCost,
+		&record.Difference,
+		&record.Source,
+		&record.Note,
+		&record.UsageDetailsJSON,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return BillingReconciliation{}, err
+	}
+	var err error
+	if record.PeriodStart, err = time.Parse(time.RFC3339Nano, periodStart); err != nil {
+		return BillingReconciliation{}, fmt.Errorf("parse billing period start: %w", err)
+	}
+	if record.PeriodEnd, err = time.Parse(time.RFC3339Nano, periodEnd); err != nil {
+		return BillingReconciliation{}, fmt.Errorf("parse billing period end: %w", err)
+	}
+	if record.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return BillingReconciliation{}, fmt.Errorf("parse billing reconciliation created at: %w", err)
+	}
+	if record.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+		return BillingReconciliation{}, fmt.Errorf("parse billing reconciliation updated at: %w", err)
 	}
 	return record, nil
 }

@@ -178,6 +178,9 @@ type ModelProviderSetting struct {
 	ReasoningProfile         string          `json:"reasoningProfile"`
 	Enabled                  bool            `json:"enabled"`
 	APIKeyConfigured         bool            `json:"apiKeyConfigured"`
+	BillingKeyConfigured     bool            `json:"billingKeyConfigured"`
+	BillingProjectID         string          `json:"billingProjectId,omitempty"`
+	BillingAPIKeyID          string          `json:"billingApiKeyId,omitempty"`
 	DefaultModelID           string          `json:"defaultModelId"`
 	ContextWindowTokens      int             `json:"contextWindowTokens"`
 	InputPricePerMillion     float64         `json:"inputPricePerMillion"`
@@ -847,6 +850,8 @@ func normalizeModelSettings(settings ModelSettings, _ ModelSettings) ModelSettin
 			provider.BaseURL = defaultBaseURLForProtocol(provider.Protocol)
 		}
 		provider.BalanceURL = strings.TrimSpace(provider.BalanceURL)
+		provider.BillingProjectID = strings.TrimSpace(provider.BillingProjectID)
+		provider.BillingAPIKeyID = strings.TrimSpace(provider.BillingAPIKeyID)
 		provider.ExtraHeaders = strings.TrimSpace(provider.ExtraHeaders)
 		provider.ExtraBodyJSON = strings.TrimSpace(provider.ExtraBodyJSON)
 		provider.ReasoningProfile = normalizeReasoningProfile(provider.ReasoningProfile, provider.Protocol)

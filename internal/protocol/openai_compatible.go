@@ -710,16 +710,29 @@ type openAICompletionResponse struct {
 }
 
 type openAIUsage struct {
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 func (u openAIUsage) toTokenUsage() *TokenUsage {
+	cached := u.PromptTokensDetails.CachedTokens
+	if cached < 0 {
+		cached = 0
+	}
+	if cached > u.PromptTokens {
+		cached = u.PromptTokens
+	}
+	uncached := u.PromptTokens - cached
 	return &TokenUsage{
-		PromptTokens:     u.PromptTokens,
-		CompletionTokens: u.CompletionTokens,
-		TotalTokens:      u.TotalTokens,
+		PromptTokens:          u.PromptTokens,
+		CompletionTokens:      u.CompletionTokens,
+		TotalTokens:           u.TotalTokens,
+		PromptCacheHitTokens:  cached,
+		PromptCacheMissTokens: uncached,
 	}
 }
 

@@ -95,6 +95,28 @@ func TestOpenAICompatibleListModelsAllowsLocalNoAuth(t *testing.T) {
 	}
 }
 
+func TestOpenAIUsagePreservesPromptCacheBreakdown(t *testing.T) {
+	usage := openAIUsage{
+		PromptTokens:     100,
+		CompletionTokens: 24,
+		TotalTokens:      124,
+	}
+	usage.PromptTokensDetails.CachedTokens = 72
+
+	got := usage.toTokenUsage()
+	if got.PromptTokens != 100 || got.CompletionTokens != 24 || got.PromptCacheHitTokens != 72 || got.PromptCacheMissTokens != 28 {
+		t.Fatalf("token usage = %#v", got)
+	}
+}
+
+func TestOpenAIUsageClampsInvalidCachedTokens(t *testing.T) {
+	usage := openAIUsage{PromptTokens: 10}
+	usage.PromptTokensDetails.CachedTokens = 24
+	if got := usage.toTokenUsage(); got.PromptCacheHitTokens != 10 || got.PromptCacheMissTokens != 0 {
+		t.Fatalf("token usage = %#v", got)
+	}
+}
+
 func TestOpenAICompatibleStreamUsesCompatibilityOptions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {

@@ -724,7 +724,7 @@ func (s *Service) recordDelegatedTaskUsage(result delegatedTaskResult) {
 	}
 	for index := range result.usage {
 		usage := result.usage[index]
-		s.recordUsageMetrics(usageMetricsFor(result.route.Provider, &usage), result.route)
+		s.recordUsageMetrics(usageMetricsFor(result.route.Provider, result.route.ModelID, &usage), result.route)
 	}
 }
 

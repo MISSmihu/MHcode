@@ -68,6 +68,7 @@ import {
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
 import { Portal } from "solid-js/web";
+import { AppTitleBar } from "./components/AppTitleBar";
 import { ReasoningMenu } from "./components/ReasoningMenu";
 import { SidePanelHost } from "./components/SidePanelHost";
 import type { SidePanelView } from "./components/SidePanelHost";
@@ -92,6 +93,7 @@ import {
 	revealPlugin,
   saveDeepSeekAPIKey,
   saveModelProviderAPIKey,
+  saveModelProviderBillingAPIKey,
   startChatMessageForSession,
 	resumePausedTeamTask,
 	abandonPausedTeamTask,
@@ -105,6 +107,10 @@ import {
   saveRuntimeSettings,
   testDeepSeekConnection,
   clearModelProviderAPIKey,
+  clearModelProviderBillingAPIKey,
+  getUsageBillingReport,
+  syncUsageBilling,
+  reconcileUsageBilling,
   deleteModelProvider,
   listCheckpoints,
   rewindToCheckpoint,
@@ -142,6 +148,8 @@ import {
   openURLInSystemBrowser,
 	revealSecretResult,
   importSkillMarkdown,
+  getUpdateState,
+  onUpdateState,
 } from "./services/workbench";
 import { defaultReasoningLevel, reasoningOptions as fallbackReasoningOptions } from "./state/reasoning";
 import type {
@@ -161,6 +169,10 @@ import type {
   ReasoningLevel,
   RuntimeSettings,
   SkillImportResult,
+  UpdateState,
+  UsageBillingReconciliationInput,
+  UsageBillingReport,
+  UsageBillingSyncInput,
   UsageMetrics,
   WorkbenchState,
   WorkspaceFileRequest,
@@ -238,6 +250,8 @@ type SessionRenameDialogState = {
   session: SessionInfo;
   title: string;
 };
+
+const updateBannerVisibleStatuses = new Set(["available", "downloading", "downloaded", "installing"]);
 
 type ConfirmationState = ConfirmationRequest & {
   resolve: (result: ConfirmationResult) => void;
@@ -320,8 +334,12 @@ function App() {
   const [resettingSession, setResettingSession] = createSignal(false);
   const [apiKeyDraft, setAPIKeyDraft] = createSignal("");
   const [providerKeyDrafts, setProviderKeyDrafts] = createSignal<Record<string, string>>({});
+  const [providerBillingKeyDrafts, setProviderBillingKeyDrafts] = createSignal<Record<string, string>>({});
   const [savingProviderID, setSavingProviderID] = createSignal("");
+  const [savingProviderBillingID, setSavingProviderBillingID] = createSignal("");
   const [clearingProviderID, setClearingProviderID] = createSignal("");
+  const [clearingProviderBillingID, setClearingProviderBillingID] = createSignal("");
+  const [usageBillingReports, setUsageBillingReports] = createSignal<Record<string, UsageBillingReport | undefined>>({});
   const [syncingProviderID, setSyncingProviderID] = createSignal("");
   const [deletingProviderID, setDeletingProviderID] = createSignal("");
   const [refreshingMCPID, setRefreshingMCPID] = createSignal("");
@@ -346,6 +364,9 @@ function App() {
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [activeSettingsCategory, setActiveSettingsCategory] = createSignal<SettingsCategory>("general");
   const [error, setError] = createSignal("");
+  const [updateBannerState, setUpdateBannerState] = createSignal<UpdateState>();
+  const [updateBannerVisible, setUpdateBannerVisible] = createSignal(false);
+  const [updateBannerProgress, setUpdateBannerProgress] = createSignal(1);
   const [confirmation, setConfirmation] = createSignal<ConfirmationState>();
   const [sidebarWidth, setSidebarWidth] = createSignal(readStoredSidebarWidth());
   const [resizingSidebar, setResizingSidebar] = createSignal(false);
@@ -412,6 +433,9 @@ function App() {
   let mouseBrowserResizeActive = false;
   let browserPanelWidthInitialized = storedBrowserPanelWidth !== undefined;
   let composerHistory: ComposerHistory = emptyComposerHistory();
+  let updateBannerTimer: number | undefined;
+  let updateBannerDeadline = 0;
+  let updateBannerSignature = "";
 
   const syncUIAppearance = () => {
     const next = applyUIAppearance(uiAppearance(), shellRef);
@@ -446,7 +470,10 @@ function App() {
   const runtimeSettings = createMemo(() => state()?.runtimeSettings ?? fallbackRuntimeSettings());
   const configFiles = createMemo(() => state()?.configFiles ?? fallbackConfigFiles());
   const activeRuntimeDraft = createMemo(() => runtimeDraft() ?? runtimeSettings());
-  const hasProviderKeyDrafts = createMemo(() => Object.values(providerKeyDrafts()).some((apiKey) => apiKey.trim()));
+  const hasProviderKeyDrafts = createMemo(() =>
+    Object.values(providerKeyDrafts()).some((apiKey) => apiKey.trim()) ||
+    Object.values(providerBillingKeyDrafts()).some((apiKey) => apiKey.trim()),
+  );
   const diagnostics = createMemo(() => state()?.cacheDiagnostics ?? []);
   const deepSeek = createMemo(() => state()?.deepSeek ?? fallbackDeepSeekState());
   const deepSeekSession = createMemo(() => state()?.deepSeekSession ?? fallbackDeepSeekSession());
@@ -1573,6 +1600,65 @@ function App() {
     }
   };
 
+  const clearUpdateBannerTimer = () => {
+    if (updateBannerTimer !== undefined) {
+      window.clearInterval(updateBannerTimer);
+      updateBannerTimer = undefined;
+    }
+  };
+
+  const dismissUpdateBanner = () => {
+    clearUpdateBannerTimer();
+    setUpdateBannerVisible(false);
+  };
+
+  const startUpdateBannerCountdown = () => {
+    clearUpdateBannerTimer();
+    const durationMs = 8_000;
+    updateBannerDeadline = Date.now() + durationMs;
+    setUpdateBannerProgress(1);
+    updateBannerTimer = window.setInterval(() => {
+      const remaining = Math.max(0, updateBannerDeadline - Date.now());
+      setUpdateBannerProgress(remaining / durationMs);
+      if (remaining === 0) dismissUpdateBanner();
+    }, 80);
+  };
+
+  const presentUpdateBanner = (next: UpdateState) => {
+    setUpdateBannerState(next);
+    const status = next.status?.trim().toLowerCase() ?? "";
+    if (!updateBannerVisibleStatuses.has(status)) {
+      updateBannerSignature = "";
+      dismissUpdateBanner();
+      return;
+    }
+    const signature = [status, next.latestVersion ?? "", next.message ?? ""].join("\u0000");
+    if (signature === updateBannerSignature) return;
+    updateBannerSignature = signature;
+    setUpdateBannerVisible(true);
+    if (["downloading", "installing"].includes(status)) {
+      clearUpdateBannerTimer();
+      setUpdateBannerProgress(1);
+      return;
+    }
+    startUpdateBannerCountdown();
+  };
+
+  const updateBannerBusy = createMemo(() => ["downloading", "installing"].includes(updateBannerState()?.status ?? ""));
+  const updateBannerTitle = createMemo(() => {
+    const update = updateBannerState();
+    switch (update?.status) {
+      case "checking": return "正在检查更新";
+      case "available": return `发现新版本 ${update.latestVersion || ""}`.trim();
+      case "downloading": return `正在下载 ${update.latestVersion || "更新"}`;
+      case "downloaded": return `${update.latestVersion || "新版本"} 已下载`;
+      case "installing": return "正在准备安装";
+      case "current": return "MHcode 已是最新版本";
+      case "error": return "自动更新检查失败";
+      default: return "软件更新";
+    }
+  });
+
   onMount(() => {
     applyThemeMode(themeMode());
     applySidebarWidth(sidebarWidth(), shellRef);
@@ -1594,6 +1680,8 @@ function App() {
     const unsubscribeBrowserClose = onBrowserPreviewClose(closeBrowserPanel);
     const unsubscribeChatTask = onChatTaskEvent(handleChatTaskEvent);
     const unsubscribeMCPState = onMCPState(setState);
+    const unsubscribeUpdateState = onUpdateState(presentUpdateBanner);
+    void getUpdateState().then(presentUpdateBanner).catch(() => undefined);
     const closeActionMenusOnOutsidePress = (event: PointerEvent) => {
       const target = event.target;
       if (projectMenu()) {
@@ -1629,6 +1717,8 @@ function App() {
     onCleanup(unsubscribeBrowserClose);
     onCleanup(unsubscribeChatTask);
     onCleanup(unsubscribeMCPState);
+    onCleanup(unsubscribeUpdateState);
+    onCleanup(clearUpdateBannerTimer);
     onCleanup(() => window.removeEventListener("pointerdown", closeActionMenusOnOutsidePress));
     onCleanup(() => window.removeEventListener("keydown", closeProjectUIOnEscape));
   });
@@ -1664,7 +1754,8 @@ function App() {
   };
 
   createEffect(() => {
-    applyThemeMode(themeMode(), shellRef);
+    const mode = themeMode();
+    applyThemeMode(mode, shellRef);
   });
 
   createEffect(() => {
@@ -1764,6 +1855,13 @@ function App() {
     }));
   };
 
+  const setProviderBillingKeyDraft = (providerID: string, value: string) => {
+    setProviderBillingKeyDrafts((current) => ({
+      ...current,
+      [providerID]: value,
+    }));
+  };
+
   const saveProviderKey = async (providerID: string) => {
     const apiKey = providerKeyDrafts()[providerID]?.trim() ?? "";
     if (!apiKey) {
@@ -1803,6 +1901,77 @@ function App() {
     }
   };
 
+  const saveProviderBillingKey = async (providerID: string) => {
+    const apiKey = providerBillingKeyDrafts()[providerID]?.trim() ?? "";
+    if (!apiKey) {
+      setError("请先填写官方账单读取凭据。");
+      return;
+    }
+    setSavingProviderBillingID(providerID);
+    setError("");
+    try {
+      if (runtimeDraft()) {
+        setState(await saveRuntimeSettings(activeRuntimeDraft()));
+        setRuntimeDraft(undefined);
+      }
+      setState(await saveModelProviderBillingAPIKey(providerID, apiKey));
+      setProviderBillingKeyDraft(providerID, "");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSavingProviderBillingID("");
+    }
+  };
+
+  const clearProviderBillingKey = async (providerID: string) => {
+    setClearingProviderBillingID(providerID);
+    setError("");
+    try {
+      if (runtimeDraft()) {
+        setState(await saveRuntimeSettings(activeRuntimeDraft()));
+        setRuntimeDraft(undefined);
+      }
+      setState(await clearModelProviderBillingAPIKey(providerID));
+      setProviderBillingKeyDraft(providerID, "");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setClearingProviderBillingID("");
+    }
+  };
+
+  const rememberUsageBillingReport = (report: UsageBillingReport) => {
+    if (!report.providerId) return;
+    setUsageBillingReports((current) => ({ ...current, [report.providerId]: report }));
+  };
+
+  const loadUsageBillingReport = async (providerID: string) => {
+    if (!providerID) return;
+    try {
+      rememberUsageBillingReport(await getUsageBillingReport(providerID));
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  const syncUsageBillingReport = async (input: UsageBillingSyncInput) => {
+    setError("");
+    try {
+      rememberUsageBillingReport(await syncUsageBilling(input));
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
+  const reconcileUsageBillingReport = async (input: UsageBillingReconciliationInput) => {
+    setError("");
+    try {
+      rememberUsageBillingReport(await reconcileUsageBilling(input));
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
+
   const removeModelProvider = async (providerID: string) => {
     const provider = activeRuntimeDraft().model.providers.find((item) => item.id === providerID);
     if (!provider) return;
@@ -1823,6 +1992,16 @@ function App() {
       }
       setState(await deleteModelProvider(providerID));
       setProviderKeyDrafts((current) => {
+        const next = { ...current };
+        delete next[providerID];
+        return next;
+      });
+      setProviderBillingKeyDrafts((current) => {
+        const next = { ...current };
+        delete next[providerID];
+        return next;
+      });
+      setUsageBillingReports((current) => {
         const next = { ...current };
         delete next[providerID];
         return next;
@@ -1967,10 +2146,16 @@ function App() {
     try {
       let next = await saveRuntimeSettings(activeRuntimeDraft());
       const pendingProviderKeys = Object.entries(providerKeyDrafts()).filter(([, apiKey]) => apiKey.trim());
+      const pendingProviderBillingKeys = Object.entries(providerBillingKeyDrafts()).filter(([, apiKey]) => apiKey.trim());
       const savedProviderIDs: string[] = [];
+      const savedProviderBillingIDs: string[] = [];
       for (const [providerID, apiKey] of pendingProviderKeys) {
         next = await saveModelProviderAPIKey(providerID, apiKey.trim());
         savedProviderIDs.push(providerID);
+      }
+      for (const [providerID, apiKey] of pendingProviderBillingKeys) {
+        next = await saveModelProviderBillingAPIKey(providerID, apiKey.trim());
+        savedProviderBillingIDs.push(providerID);
       }
       setState(next);
       setRuntimeDraft(undefined);
@@ -1978,6 +2163,15 @@ function App() {
         setProviderKeyDrafts((current) => {
           const copy = { ...current };
           for (const providerID of savedProviderIDs) {
+            delete copy[providerID];
+          }
+          return copy;
+        });
+      }
+      if (savedProviderBillingIDs.length > 0) {
+        setProviderBillingKeyDrafts((current) => {
+          const copy = { ...current };
+          for (const providerID of savedProviderBillingIDs) {
             delete copy[providerID];
           }
           return copy;
@@ -3596,9 +3790,51 @@ function App() {
       ref={shellRef}
       style={{ "--sidebar-width": `${sidebarWidth()}px` } as JSX.CSSProperties}
     >
+      <AppTitleBar />
+      <Show when={updateBannerVisible() && updateBannerState()}>
+        {(update) => (
+          <section
+            class="app-update-banner"
+            classList={{ busy: updateBannerBusy(), error: update().status === "error", available: update().status === "available" }}
+            aria-live="polite"
+            aria-label="软件更新状态"
+          >
+            <div class="app-update-banner-icon" aria-hidden="true">
+              <Show when={update().status === "error"} fallback={
+                <Show when={updateBannerBusy()} fallback={<CheckCircle2 size={17} />}>
+                  <RefreshCw size={17} class="spinning" />
+                </Show>
+              }>
+                <AlertTriangle size={17} />
+              </Show>
+            </div>
+            <div class="app-update-banner-copy">
+              <strong>{updateBannerTitle()}</strong>
+              <span>{update().message}</span>
+            </div>
+            <Show when={["available", "downloaded", "error"].includes(update().status)}>
+              <button
+                class="app-update-banner-action"
+                type="button"
+                onClick={() => {
+                  dismissUpdateBanner();
+                  openSettings("about");
+                }}
+              >
+                {update().status === "downloaded" ? "安装" : update().status === "available" ? "查看" : "设置"}
+              </button>
+            </Show>
+            <button class="app-update-banner-close" type="button" title="关闭更新提示" onClick={dismissUpdateBanner}>
+              <X size={15} />
+            </button>
+            <div class="app-update-banner-timer" aria-hidden="true">
+              <span classList={{ indeterminate: updateBannerBusy() }} style={{ width: `${updateBannerProgress() * 100}%` }} />
+            </div>
+          </section>
+        )}
+      </Show>
       <aside class="mh-sidebar" aria-label="MHcode 导航">
         <div class="sidebar-top">
-          <div class="brand-mark">M</div>
           <button
             class="ghost-icon"
             type="button"
@@ -4872,7 +5108,8 @@ function App() {
 			refreshPlugins={refreshPluginRuntime}
 			revealPlugin={openInstalledPlugin}
 			uninstallPlugin={removeInstalledPlugin}
-            providerKeyDrafts={providerKeyDrafts()}
+			providerKeyDrafts={providerKeyDrafts()}
+			providerBillingKeyDrafts={providerBillingKeyDrafts()}
             reasoningOptions={options()}
             runtimeDraft={activeRuntimeDraft()}
             sandboxCapabilities={state()?.sandboxCapabilities ?? {
@@ -4886,15 +5123,19 @@ function App() {
               summary: "桌面运行时连接后显示系统沙箱能力。",
             }}
             runtimeDirty={Boolean(runtimeDraft()) || hasProviderKeyDrafts()}
-            configFiles={configFiles()}
-            clearProviderKey={clearProviderKey}
+			configFiles={configFiles()}
+			clearProviderKey={clearProviderKey}
+			clearProviderBillingKey={clearProviderBillingKey}
             deleteProvider={removeModelProvider}
-            saveKey={saveKey}
-            saveProviderKey={saveProviderKey}
+			saveKey={saveKey}
+			saveProviderKey={saveProviderKey}
+			saveProviderBillingKey={saveProviderBillingKey}
             saveRuntime={saveRuntime}
-            clearingProviderID={clearingProviderID()}
+			clearingProviderID={clearingProviderID()}
+			clearingProviderBillingID={clearingProviderBillingID()}
             deletingProviderID={deletingProviderID()}
-            savingProviderID={savingProviderID()}
+			savingProviderID={savingProviderID()}
+			savingProviderBillingID={savingProviderBillingID()}
             savingKey={savingKey()}
             savingRuntime={savingRuntime()}
             selectCategory={setActiveSettingsCategory}
@@ -4905,7 +5146,8 @@ function App() {
             snapshots={snapshots()}
             testConnection={testConnection}
             testingDeepSeek={testingDeepSeek()}
-            setProviderKeyDraft={setProviderKeyDraft}
+			setProviderKeyDraft={setProviderKeyDraft}
+			setProviderBillingKeyDraft={setProviderBillingKeyDraft}
             syncProviderModels={syncProviderModels}
             syncingProviderID={syncingProviderID()}
             themeMode={themeMode()}
@@ -4915,8 +5157,12 @@ function App() {
             updatingReasoning={updatingReasoning()}
             resetRuntimeDraft={resetRuntimeDraft}
             resetSidebarWidth={resetSidebarWidth}
-            usage={usage()}
-            usageLedger={state()?.usageLedger}
+			usage={usage()}
+			usageLedger={state()?.usageLedger}
+			usageBillingReports={usageBillingReports()}
+			loadUsageBillingReport={loadUsageBillingReport}
+			syncUsageBilling={syncUsageBillingReport}
+			reconcileUsageBilling={reconcileUsageBillingReport}
             confirmAction={confirmAction}
           />
         </aside>

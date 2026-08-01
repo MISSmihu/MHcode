@@ -81,8 +81,12 @@ func TestAgentMCPToolLoopPreservesPrivateContext(t *testing.T) {
 		Enabled: true,
 		Roots:   []string{t.TempDir()},
 	})
-	if _, ok := service.buildToolRegistryForContext(scopedCtx).Get(addToolName); ok {
-		t.Fatal("MCP tool without a host-enforceable path boundary leaked into a scoped turn")
+	scopedRegistry := service.buildToolRegistryForContext(scopedCtx)
+	if _, ok := scopedRegistry.Get(addToolName); !ok {
+		t.Fatal("read-only MCP tool should remain available in a scoped turn")
+	}
+	if _, ok := scopedRegistry.Get(mutateToolName); ok {
+		t.Fatal("mutating MCP tool without a host-enforceable path boundary leaked into a scoped turn")
 	}
 
 	userPrompt := "Use the remote MCP tool to add 2 and 3."

@@ -27,6 +27,9 @@ import type {
   SkillImportResult,
   TeamRole,
   UpdateState,
+  UsageBillingReconciliationInput,
+  UsageBillingReport,
+  UsageBillingSyncInput,
   UsageMetrics,
   WorkbenchState,
 } from "./types";
@@ -73,8 +76,10 @@ export type SettingsCenterProps = {
   sandboxCapabilities: WorkbenchState["sandboxCapabilities"];
   clearingKey: boolean;
   clearingProviderID: string;
+  clearingProviderBillingID: string;
   clearKey: () => void;
   clearProviderKey: (providerID: string) => Promise<void> | void;
+  clearProviderBillingKey: (providerID: string) => Promise<void> | void;
   deleteProvider: (providerID: string) => Promise<void> | void;
   deletingProviderID: string;
   contextPreview: WorkbenchState["contextPreview"] | undefined;
@@ -102,6 +107,8 @@ export type SettingsCenterProps = {
 	revealPlugin: (id: string) => Promise<void> | void;
 	uninstallPlugin: (id: string) => Promise<void> | void;
   providerKeyDrafts: Record<string, string>;
+  providerBillingKeyDrafts: Record<string, string>;
+  usageBillingReports: Record<string, UsageBillingReport | undefined>;
   reasoningOptions: WorkbenchState["reasoningOptions"];
   runtimeDraft: RuntimeSettings;
   runtimeDirty: boolean;
@@ -121,8 +128,14 @@ export type SettingsCenterProps = {
   resetRuntimeDraft: () => void;
   resetSidebarWidth: () => void;
   saveProviderKey: (providerID: string) => Promise<void> | void;
+  saveProviderBillingKey: (providerID: string) => Promise<void> | void;
   savingProviderID: string;
+  savingProviderBillingID: string;
   setProviderKeyDraft: (providerID: string, value: string) => void;
+  setProviderBillingKeyDraft: (providerID: string, value: string) => void;
+  loadUsageBillingReport: (providerID: string) => Promise<void> | void;
+  syncUsageBilling: (input: UsageBillingSyncInput) => Promise<void> | void;
+  reconcileUsageBilling: (input: UsageBillingReconciliationInput) => Promise<void> | void;
   syncProviderModels: (providerID: string) => Promise<void> | void;
   syncingProviderID: string;
   testConnection: () => void;
@@ -274,20 +287,26 @@ export function SettingsCenter(props: SettingsCenterProps) {
           <Match when={props.activeCategory === "models"}>
             <ModelSettingsPanel
               clearProviderKey={props.clearProviderKey}
+              clearProviderBillingKey={props.clearProviderBillingKey}
               deleteProvider={props.deleteProvider}
               deletingProviderID={props.deletingProviderID}
               clearingProviderID={props.clearingProviderID}
+              clearingProviderBillingID={props.clearingProviderBillingID}
               profile={props.profile}
               providerKeyDrafts={props.providerKeyDrafts}
+              providerBillingKeyDrafts={props.providerBillingKeyDrafts}
               reasoningOptions={props.reasoningOptions}
               resetRuntimeDraft={props.resetRuntimeDraft}
               runtimeDirty={props.runtimeDirty}
               runtimeDraft={props.runtimeDraft}
               saveProviderKey={props.saveProviderKey}
+              saveProviderBillingKey={props.saveProviderBillingKey}
               saveRuntime={props.saveRuntime}
               savingProviderID={props.savingProviderID}
+              savingProviderBillingID={props.savingProviderBillingID}
               savingRuntime={props.savingRuntime}
               setProviderKeyDraft={props.setProviderKeyDraft}
+              setProviderBillingKeyDraft={props.setProviderBillingKeyDraft}
               syncProviderModels={props.syncProviderModels}
               syncingProviderID={props.syncingProviderID}
               updateRuntimeDraft={props.updateRuntimeDraft}
@@ -347,6 +366,12 @@ export function SettingsCenter(props: SettingsCenterProps) {
               sessionHasCacheTokens={props.sessionHasCacheTokens}
               usage={props.usage}
               usageLedger={props.usageLedger}
+              providers={props.runtimeDraft.model.providers}
+              selectedProviderID={props.runtimeDraft.model.selectedProviderId}
+              usageBillingReports={props.usageBillingReports}
+              loadUsageBillingReport={props.loadUsageBillingReport}
+              syncUsageBilling={props.syncUsageBilling}
+              reconcileUsageBilling={props.reconcileUsageBilling}
             />
           </Match>
           <Match when={props.activeCategory === "environment"}>
@@ -1174,22 +1199,58 @@ function reasoningProfileDescription(profile: string) {
   }
 }
 
+function officialBillingKind(baseURL: string): "openai" | "anthropic" | "gemini" | "xai" | "deepseek" | "" {
+  try {
+    switch (new URL(baseURL.trim()).hostname.toLowerCase()) {
+      case "api.openai.com":
+        return "openai";
+      case "api.anthropic.com":
+        return "anthropic";
+      case "generativelanguage.googleapis.com":
+        return "gemini";
+      case "api.x.ai":
+        return "xai";
+      case "api.deepseek.com":
+        return "deepseek";
+      default:
+        return "";
+    }
+  } catch {
+    return "";
+  }
+}
+
+function supportsAutomaticBillingSync(kind: ReturnType<typeof officialBillingKind>) {
+  return kind === "openai";
+}
+
+function billingCredentialDescription(configured: boolean) {
+  if (configured) return "账单读取凭据已保存到本机凭据管理器，不写入配置文件。";
+  return "先使用当前 API Key 同步；若被 OpenAI 拒绝权限，再保存你自己的 OpenAI Admin Key。";
+}
+
 export function ModelSettingsPanel(props: {
   clearProviderKey: (providerID: string) => Promise<void> | void;
+  clearProviderBillingKey: (providerID: string) => Promise<void> | void;
   clearingProviderID: string;
+  clearingProviderBillingID: string;
   deleteProvider: (providerID: string) => Promise<void> | void;
   deletingProviderID: string;
   profile: WorkbenchState["reasoning"];
   providerKeyDrafts: Record<string, string>;
+  providerBillingKeyDrafts: Record<string, string>;
   reasoningOptions: WorkbenchState["reasoningOptions"];
   resetRuntimeDraft: () => void;
   runtimeDirty: boolean;
   runtimeDraft: RuntimeSettings;
   saveProviderKey: (providerID: string) => Promise<void> | void;
+  saveProviderBillingKey: (providerID: string) => Promise<void> | void;
   saveRuntime: () => void;
   savingProviderID: string;
+  savingProviderBillingID: string;
   savingRuntime: boolean;
   setProviderKeyDraft: (providerID: string, value: string) => void;
+  setProviderBillingKeyDraft: (providerID: string, value: string) => void;
   syncProviderModels: (providerID: string) => Promise<void> | void;
   syncingProviderID: string;
   updateRuntimeDraft: (patch: Partial<RuntimeSettings>) => void;
@@ -1532,6 +1593,93 @@ export function ModelSettingsPanel(props: {
                       </div>
                     }
                   />
+                  <Show when={supportsAutomaticBillingSync(officialBillingKind(provider().baseUrl))}>
+                    {(_automaticBillingSupported) => (
+                      <>
+                        <SettingsRow
+                          title="官方账单读取凭据"
+                          description={billingCredentialDescription(Boolean(provider().billingKeyConfigured))}
+                          control={
+                            <div class="settings-row-stack">
+                              <input
+                                class="settings-input row-control"
+                                type="password"
+                                autocomplete="off"
+                                value={props.providerBillingKeyDrafts[provider().id] ?? ""}
+                                placeholder={provider().billingKeyConfigured ? "输入新账单 Key 可覆盖" : "可选：账单读取 Key"}
+                                onInput={(event) => props.setProviderBillingKeyDraft(provider().id, event.currentTarget.value)}
+                              />
+                              <div class="settings-row-actions">
+                                <button
+                                  class="settings-soft-button"
+                                  type="button"
+                                  disabled={props.savingProviderBillingID === provider().id}
+                                  onClick={() => void props.saveProviderBillingKey(provider().id)}
+                                >
+                                  <Save size={14} />
+                                  {props.savingProviderBillingID === provider().id ? "保存中" : "保存账单凭据"}
+                                </button>
+                                <button
+                                  class="settings-soft-button"
+                                  type="button"
+                                  disabled={!provider().billingKeyConfigured || props.clearingProviderBillingID === provider().id}
+                                  onClick={() => void props.clearProviderBillingKey(provider().id)}
+                                >
+                                  清除账单凭据
+                                </button>
+                              </div>
+                            </div>
+                          }
+                        />
+                        <SettingsRow
+                          title="OpenAI 账单范围"
+                          description="填项目 ID 或专供 MHcode 的 API Key ID 后，才能把组织账单作为这一路请求的对账依据。"
+                          control={
+                            <div class="provider-billing-scope-grid">
+                              <label>
+                                <span>项目 ID</span>
+                                <input
+                                  class="settings-input"
+                                  value={provider().billingProjectId ?? ""}
+                                  spellcheck={false}
+                                  placeholder="proj_..."
+                                  onInput={(event) => updateProvider(provider().id, { billingProjectId: event.currentTarget.value })}
+                                />
+                              </label>
+                              <label>
+                                <span>API Key ID</span>
+                                <input
+                                  class="settings-input"
+                                  value={provider().billingApiKeyId ?? ""}
+                                  spellcheck={false}
+                                  placeholder="key_..."
+                                  onInput={(event) => updateProvider(provider().id, { billingApiKeyId: event.currentTarget.value })}
+                                />
+                              </label>
+                            </div>
+                          }
+                        />
+                      </>
+                    )}
+                  </Show>
+                  <Show when={officialBillingKind(provider().baseUrl) && !supportsAutomaticBillingSync(officialBillingKind(provider().baseUrl))}>
+                    <SettingsRow
+                      title="官方账单同步"
+                      description="当前版本尚未接入该供应商的自动账单接口。MHcode 会保留本地 Token 估算；请在“使用统计”中导入官方账单金额对账。"
+                      control={
+                        <Show when={provider().billingKeyConfigured}>
+                          <button
+                            class="settings-soft-button"
+                            type="button"
+                            disabled={props.clearingProviderBillingID === provider().id}
+                            onClick={() => void props.clearProviderBillingKey(provider().id)}
+                          >
+                            清除旧账单凭据
+                          </button>
+                        </Show>
+                      }
+                    />
+                  </Show>
                   <SettingsRow
                     title="测试并获取模型"
                     description={provider().lastSyncMessage || "会使用上方 API 地址与密钥确认连接，并用返回结果填充模型列表。"}
@@ -4455,6 +4603,55 @@ export function SwitchControl(props: { checked: boolean; label?: string; onChang
   );
 }
 
+function localBillingDateValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function defaultBillingDates() {
+  const today = new Date();
+  return {
+    start: localBillingDateValue(new Date(today.getFullYear(), today.getMonth(), 1)),
+    end: localBillingDateValue(today),
+  };
+}
+
+function billingPeriodInput(providerID: string, startDate: string, endDate: string): UsageBillingSyncInput | undefined {
+  const start = new Date(`${startDate}T00:00:00`);
+  const inclusiveEnd = new Date(`${endDate}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(inclusiveEnd.getTime())) return undefined;
+  inclusiveEnd.setDate(inclusiveEnd.getDate() + 1);
+  if (inclusiveEnd <= start) return undefined;
+  return {
+    providerId: providerID,
+    periodStart: start.toISOString(),
+    periodEnd: inclusiveEnd.toISOString(),
+  };
+}
+
+function usageBillingStatusLabel(status: string) {
+  switch (status) {
+    case "verified": return "已核验";
+    case "warning": return "建议复核";
+    case "outside_tolerance": return "误差过大";
+    case "scope_required": return "需要范围";
+    case "custom_reconciled": return "已记录";
+    case "custom_provider": return "自定义渠道";
+    case "preview": return "预览模式";
+    case "unavailable": return "暂不可用";
+    default: return "待对账";
+  }
+}
+
+function usageBillingStatusTone(status: string): "good" | "watch" | "bad" | "neutral" {
+  if (status === "verified") return "good";
+  if (status === "warning" || status === "scope_required" || status === "needs_reconciliation") return "watch";
+  if (status === "outside_tolerance" || status === "unavailable") return "bad";
+  return "neutral";
+}
+
 export function CachePanel(props: {
   cacheHealth: WorkbenchState["cacheHealth"];
   cacheHitRate: number;
@@ -4465,53 +4662,312 @@ export function CachePanel(props: {
   sessionHasCacheTokens: boolean;
   usage: UsageMetrics;
   usageLedger?: WorkbenchState["usageLedger"];
+  providers: ModelProviderSetting[];
+  selectedProviderID: string;
+  usageBillingReports: Record<string, UsageBillingReport | undefined>;
+  loadUsageBillingReport: (providerID: string) => Promise<void> | void;
+  syncUsageBilling: (input: UsageBillingSyncInput) => Promise<void> | void;
+  reconcileUsageBilling: (input: UsageBillingReconciliationInput) => Promise<void> | void;
 }) {
+  const dates = defaultBillingDates();
+  const [providerID, setProviderID] = createSignal(props.selectedProviderID || props.providers[0]?.id || "");
+  const [periodStart, setPeriodStart] = createSignal(dates.start);
+  const [periodEnd, setPeriodEnd] = createSignal(dates.end);
+  const [manualCost, setManualCost] = createSignal("");
+  const [manualNote, setManualNote] = createSignal("");
+  const activeProvider = createMemo(() => props.providers.find((provider) => provider.id === providerID()));
+  const report = createMemo(() => props.usageBillingReports[providerID()]);
+  const validPeriod = createMemo(() => billingPeriodInput(providerID(), periodStart(), periodEnd()));
+  const totalTokens = createMemo(() => (props.usageLedger?.totalInputTokens ?? 0) + (props.usageLedger?.totalOutputTokens ?? 0));
+  const sessionTokens = createMemo(() => (props.usageLedger?.sessionInputTokens ?? 0) + (props.usageLedger?.sessionOutputTokens ?? 0));
+  const cacheRate = createMemo(() => props.hasCacheTokens ? Math.max(0, Math.min(1, props.cacheHitRate)) : 0);
+  const officialTokens = createMemo(() => {
+    const current = report();
+    return (current?.officialInputTokens ?? 0) + (current?.officialOutputTokens ?? 0);
+  });
+  const usageLastRecordedAt = createMemo(() => {
+    const value = props.usageLedger?.lastRecordedAt;
+    if (!value) return "暂无本地请求记录";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "本地账本已启用" : `最近写入 ${date.toLocaleString()}`;
+  });
+
+  createEffect(() => {
+    const available = props.providers;
+    if (available.length === 0) {
+      if (providerID()) setProviderID("");
+      return;
+    }
+    const preferred = available.some((provider) => provider.id === providerID())
+      ? providerID()
+      : (props.selectedProviderID && available.some((provider) => provider.id === props.selectedProviderID)
+        ? props.selectedProviderID
+        : available[0].id);
+    if (preferred !== providerID()) {
+      setProviderID(preferred);
+      return;
+    }
+    void props.loadUsageBillingReport(preferred);
+  });
+
+  const syncOfficialBill = () => {
+    const input = validPeriod();
+    if (!input || report()?.providerKind !== "openai") return;
+    void props.syncUsageBilling(input);
+  };
+
+  const saveManualBill = () => {
+    const input = validPeriod();
+    const officialCost = Number(manualCost());
+    if (!input || !Number.isFinite(officialCost) || officialCost < 0) return;
+    void props.reconcileUsageBilling({
+      ...input,
+      officialCost,
+      source: "用户录入官方账单",
+      note: manualNote().trim(),
+    });
+  };
+
   return (
-    <div class="settings-page-body">
-      <PanelSection icon={<ShieldCheck size={16} />} title="命中率">
-        <div class="cache-readout">
-          <strong>{formatPercent(props.cacheHitRate, props.hasCacheTokens)}</strong>
-          <span>{cacheStatusLabel(props.cacheHealth.status)}</span>
-          <small>
-            目标 {formatPercent(props.cacheTarget, true)} · hit {formatInteger(props.usage.promptCacheHitTokens)} / miss{" "}
-            {formatInteger(props.usage.promptCacheMissTokens)}
-          </small>
+    <div class="settings-page-body usage-dashboard">
+      <section class="usage-dashboard-hero">
+        <div class="usage-dashboard-title">
+          <span>本机账本</span>
+          <h2>使用统计</h2>
+          <p>查看真实请求、Token、缓存效率与账单对账。数据只保存在本机；官方账单仅在你主动同步时读取。</p>
         </div>
-        <MetricGrid
-          items={[
-            ["会话命中", formatPercent(props.session.sessionCacheHitRate, props.sessionHasCacheTokens)],
-            ["会话 hit/miss", `${formatInteger(props.session.sessionCacheHitTokens)} / ${formatInteger(props.session.sessionCacheMissTokens)}`],
-            ["miss 预算", formatInteger(props.cacheHealth.missTokenBudget)],
-            ["达标 hit", formatInteger(props.cacheHealth.requiredHitTokens)],
-            ["还差 hit", formatInteger(props.cacheHealth.additionalHitTokensNeeded)],
-            ["稳定前缀", `${formatInteger(props.session.stablePromptTokens)} tok`],
-            ["系统 hash", shortHash(props.session.systemPromptHash)],
-            ["样本", `${props.cacheHealth.shortPrompt ? "短样本" : "常规"} · ${formatInteger(props.cacheHealth.sampleCount)} 轮`],
-          ]}
-        />
-      </PanelSection>
-      <PanelSection icon={<Database size={16} />} title="用量账本">
-        <MetricGrid
-          items={[
-            ["本会话请求", formatInteger(props.usageLedger?.sessionSamples ?? 0)],
-            ["累计请求", formatInteger(props.usageLedger?.totalSamples ?? 0)],
-            ["本会话 Token", formatInteger((props.usageLedger?.sessionInputTokens ?? 0) + (props.usageLedger?.sessionOutputTokens ?? 0))],
-            ["累计 Token", formatInteger((props.usageLedger?.totalInputTokens ?? 0) + (props.usageLedger?.totalOutputTokens ?? 0))],
-            ["本会话成本", formatCost(props.usageLedger?.sessionEffectiveCost ?? 0)],
-            ["累计成本", formatCost(props.usageLedger?.totalEffectiveCost ?? 0)],
-          ]}
-        />
-        <Show when={props.usageLedger?.lastError}>
-          <p class="empty-line">用量账本暂不可用：{props.usageLedger?.lastError}</p>
+        <div class="usage-dashboard-meta">
+          <span>当前统计供应商</span>
+          <strong>{activeProvider()?.name || "未选择供应商"}</strong>
+          <span>{usageLastRecordedAt()}</span>
+        </div>
+      </section>
+
+      <section class="usage-dashboard-summary" aria-label="用量概览">
+        <div class="usage-dashboard-metric">
+          <span>累计成本</span>
+          <strong>{formatCost(props.usageLedger?.totalEffectiveCost ?? 0)}</strong>
+          <small>本地费率估算</small>
+        </div>
+        <div class="usage-dashboard-metric">
+          <span>累计 Token</span>
+          <strong>{formatInteger(totalTokens())}</strong>
+          <small>输入 {formatInteger(props.usageLedger?.totalInputTokens ?? 0)} · 输出 {formatInteger(props.usageLedger?.totalOutputTokens ?? 0)}</small>
+        </div>
+        <div class="usage-dashboard-metric">
+          <span>累计请求</span>
+          <strong>{formatInteger(props.usageLedger?.totalSamples ?? 0)}</strong>
+          <small>本会话 {formatInteger(props.usageLedger?.sessionSamples ?? 0)} 次</small>
+        </div>
+        <div class="usage-dashboard-metric">
+          <span>缓存命中</span>
+          <strong>{formatPercent(props.cacheHitRate, props.hasCacheTokens)}</strong>
+          <small>{cacheStatusLabel(props.cacheHealth.status)}</small>
+        </div>
+      </section>
+
+      <div class="usage-dashboard-detail-grid">
+        <section>
+          <header class="usage-dashboard-section-head">
+            <div>
+              <span>当前会话</span>
+              <h3>缓存与上下文</h3>
+            </div>
+          </header>
+          <div class="usage-cache-overview">
+            <div class="usage-cache-disc">
+              <span>
+                <strong>{formatPercent(props.session.sessionCacheHitRate, props.sessionHasCacheTokens)}</strong>
+                <small>会话命中</small>
+              </span>
+            </div>
+            <div class="usage-cache-detail">
+              <p>目标 {formatPercent(props.cacheTarget, true)}，稳定前缀 {formatInteger(props.session.stablePromptTokens)} Token。</p>
+              <div class="usage-cache-meter" style={{ "--usage-cache-percent": `${Math.round(cacheRate() * 100)}%` } as JSX.CSSProperties}>
+                <span />
+              </div>
+              <div class="usage-cache-values">
+                <span><small>缓存读取</small><strong>{formatInteger(props.usage.promptCacheHitTokens)}</strong></span>
+                <span><small>缓存未命中</small><strong>{formatInteger(props.usage.promptCacheMissTokens)}</strong></span>
+                <span><small>本会话 Token</small><strong>{formatInteger(sessionTokens())}</strong></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <header class="usage-dashboard-section-head">
+            <div>
+              <span>官方账单</span>
+              <h3>最近一次对账</h3>
+            </div>
+            <Show when={report()}>
+              {(currentReport) => <StatusPill tone={usageBillingStatusTone(currentReport().status)} icon={<Database size={13} />} label={usageBillingStatusLabel(currentReport().status)} />}
+            </Show>
+          </header>
+          <div class="usage-billing-snapshot">
+            <p>{report()?.reconciliationSource ? report()?.message : "尚未同步官方账单。本地金额仅用于即时估算。"}</p>
+            <div class="usage-billing-snapshot-grid">
+              <span><small>官方金额</small><strong>{report()?.reconciliationSource ? formatCost(report()?.officialCost ?? 0) : "待同步"}</strong></span>
+              <span><small>官方 Token</small><strong>{report()?.reconciliationSource ? formatInteger(officialTokens()) : "待同步"}</strong></span>
+              <span><small>账单误差</small><strong>{report()?.reconciliationSource ? formatCost(report()?.absoluteDifference ?? 0) : "--"}</strong></span>
+              <span><small>对账范围</small><strong>{report()?.scope || "未设置"}</strong></span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="usage-dashboard-section usage-billing-workspace">
+        <header class="usage-dashboard-section-head">
+          <div>
+            <span>按供应商和周期</span>
+            <h3>账单与官方 Token</h3>
+          </div>
+          <div class="usage-billing-toolbar">
+            <label>
+              <span>供应商</span>
+            <SelectControl
+              ariaLabel="账单供应商"
+              value={providerID()}
+              options={props.providers.map((provider) => ({ value: provider.id, label: provider.name || provider.id }))}
+              onChange={(value) => setProviderID(value)}
+            />
+          </label>
+          <label>
+            <span>开始日期</span>
+            <input class="settings-input" type="date" value={periodStart()} onInput={(event) => setPeriodStart(event.currentTarget.value)} />
+          </label>
+          <label>
+            <span>结束日期</span>
+            <input class="settings-input" type="date" min={periodStart()} value={periodEnd()} onInput={(event) => setPeriodEnd(event.currentTarget.value)} />
+          </label>
+          <div class="usage-billing-actions">
+            <button class="settings-soft-button" type="button" disabled={!providerID()} onClick={() => void props.loadUsageBillingReport(providerID())}>
+              <RefreshCw size={14} />
+              刷新
+            </button>
+            <button
+              class="settings-soft-button"
+              type="button"
+              disabled={!validPeriod() || report()?.providerKind !== "openai"}
+              onClick={syncOfficialBill}
+            >
+              <Download size={14} />
+              同步官方账单
+            </button>
+          </div>
+          </div>
+        </header>
+        <p class="usage-billing-period-note">结束日期按当天完整计算；同步仅会连接官方域名，账单凭据不会发送到中转地址。</p>
+        <Show when={report()} fallback={<p class="empty-line">正在读取该供应商的账单对账状态。</p>}>
+          {(currentReport) => (
+            <div class="usage-billing-report">
+              <div class="usage-billing-report-head">
+                <div>
+                  <strong>{activeProvider()?.name || currentReport().providerName}</strong>
+                  <span>{currentReport().scope}</span>
+                </div>
+                <StatusPill tone={usageBillingStatusTone(currentReport().status)} icon={<Database size={13} />} label={usageBillingStatusLabel(currentReport().status)} />
+              </div>
+              <p class="usage-billing-message">{currentReport().message}</p>
+              <MetricGrid
+                items={[
+                  ["本地估算", formatCost(currentReport().estimatedCost)],
+                  ["官方账单", currentReport().reconciliationSource ? formatCost(currentReport().officialCost) : "未同步"],
+                  ["账单误差", currentReport().reconciliationSource ? formatCost(currentReport().absoluteDifference) : "--"],
+                  ["官方请求", formatInteger(currentReport().officialRequests)],
+                  ["官方输入", formatInteger(currentReport().officialInputTokens)],
+                  ["官方输出", formatInteger(currentReport().officialOutputTokens)],
+                  ["缓存读取", formatInteger(currentReport().officialCachedTokens)],
+                  ["缓存写入", formatInteger(currentReport().officialCacheWriteTokens)],
+                  ["未缓存输入", formatInteger(currentReport().officialUncachedTokens)],
+                ]}
+              />
+              <Show when={currentReport().periodStart && currentReport().periodEnd}>
+                <p class="usage-billing-meta">最近对账周期：{new Date(currentReport().periodStart!).toLocaleString()} 至 {new Date(currentReport().periodEnd!).toLocaleString()}</p>
+              </Show>
+              <Show when={(currentReport().officialUsage?.length ?? 0) > 0}>
+                <details class="usage-billing-details">
+                  <summary>按模型查看官方 Token 明细（{currentReport().officialUsage?.length ?? 0}）</summary>
+                  <div class="usage-billing-model-list">
+                    <For each={currentReport().officialUsage ?? []}>
+                      {(model) => (
+                        <div class="usage-billing-model-row">
+                          <strong>{model.modelId}</strong>
+                          <span>输入 {formatInteger(model.inputTokens)}</span>
+                          <span>输出 {formatInteger(model.outputTokens)}</span>
+                          <span>缓存读 {formatInteger(model.cachedTokens)}</span>
+                          <span>缓存写 {formatInteger(model.cacheWriteTokens)}</span>
+                          <span>未缓存 {formatInteger(model.uncachedTokens)}</span>
+                          <Show when={model.inputTextTokens || model.outputTextTokens || model.cachedTextTokens}>
+                            <span>文本 I/O {formatInteger(model.inputTextTokens)} / {formatInteger(model.outputTextTokens)}，缓存 {formatInteger(model.cachedTextTokens)}</span>
+                          </Show>
+                          <Show when={model.inputAudioTokens || model.outputAudioTokens || model.cachedAudioTokens}>
+                            <span>音频 I/O {formatInteger(model.inputAudioTokens)} / {formatInteger(model.outputAudioTokens)}，缓存 {formatInteger(model.cachedAudioTokens)}</span>
+                          </Show>
+                          <Show when={model.inputImageTokens || model.outputImageTokens || model.cachedImageTokens}>
+                            <span>图像 I/O {formatInteger(model.inputImageTokens)} / {formatInteger(model.outputImageTokens)}，缓存 {formatInteger(model.cachedImageTokens)}</span>
+                          </Show>
+                          <span>{formatInteger(model.requests)} 次</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </details>
+              </Show>
+              <div class="usage-billing-manual">
+                <div>
+                  <strong>手动账单对账</strong>
+                  <span>{currentReport().recommendedSource}</span>
+                </div>
+                <div class="usage-billing-manual-fields">
+                  <input
+                    class="settings-input numeric"
+                    type="number"
+                    min="0"
+                    step="0.0001"
+                    placeholder="官方美元金额"
+                    value={manualCost()}
+                    onInput={(event) => setManualCost(event.currentTarget.value)}
+                  />
+                  <input
+                    class="settings-input"
+                    placeholder="可选备注"
+                    value={manualNote()}
+                    onInput={(event) => setManualNote(event.currentTarget.value)}
+                  />
+                  <button
+                    class="settings-soft-button"
+                    type="button"
+                    disabled={!validPeriod() || !manualCost().trim() || Number(manualCost()) < 0}
+                    onClick={saveManualBill}
+                  >
+                    <Save size={14} />
+                    保存对账
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </Show>
-      </PanelSection>
-      <PanelSection icon={<AlertTriangle size={16} />} title="诊断">
+      </section>
+      <section class="usage-dashboard-section">
+        <header class="usage-dashboard-section-head">
+          <div>
+            <span>运行状态</span>
+            <h3>诊断</h3>
+          </div>
+          <AlertTriangle size={16} />
+        </header>
         <div class="diagnostic-stack">
           <For each={props.diagnostics} fallback={<p class="empty-line">暂无诊断</p>}>
             {(item) => <p>{item}</p>}
           </For>
         </div>
-      </PanelSection>
+        <Show when={props.usageLedger?.lastError}>
+          <p class="empty-line">用量账本暂不可用：{props.usageLedger?.lastError}</p>
+        </Show>
+      </section>
     </div>
   );
 }

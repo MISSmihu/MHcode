@@ -550,6 +550,63 @@ func (s *Service) ClearModelProviderAPIKey(providerID string) (WorkbenchState, e
 	return s.workbenchStateLocked(), nil
 }
 
+// SaveModelProviderBillingAPIKey stores an optional OpenAI Admin Key used only
+// for the official organization Usage and Costs endpoints. It is kept separate
+// from the inference key because billing access can be organization-wide.
+func (s *Service) SaveModelProviderBillingAPIKey(providerID string, apiKey string) (WorkbenchState, error) {
+	release, err := s.beginActivity("saving a billing credential")
+	if err != nil {
+		return s.WorkbenchState(), err
+	}
+	defer release()
+	providerID = strings.TrimSpace(providerID)
+	apiKey = strings.TrimSpace(apiKey)
+	if providerID == "" {
+		return s.workbenchStateLocked(), errors.New("模型提供商不能为空")
+	}
+	if apiKey == "" {
+		return s.workbenchStateLocked(), errors.New("账单读取凭据不能为空")
+	}
+	settings := s.runtimeSettings.Normalized()
+	provider, _, ok := findModelProvider(settings.Model.Providers, providerID)
+	if !ok {
+		return s.workbenchStateLocked(), fmt.Errorf("未找到模型提供商：%s", providerID)
+	}
+	if officialBillingProviderKind(provider) != "openai" {
+		return s.workbenchStateLocked(), errors.New("当前版本仅支持保存 OpenAI 官方账单读取凭据；其他供应商请先使用手动账单对账")
+	}
+	if err := s.secretVault.Set(secretServiceName, providerBillingSecretAccountName(provider.ID), apiKey); err != nil {
+		return s.workbenchStateLocked(), err
+	}
+	if stored, err := s.secretVault.Get(secretServiceName, providerBillingSecretAccountName(provider.ID)); err != nil {
+		return s.workbenchStateLocked(), fmt.Errorf("verify saved billing credential: %w", err)
+	} else if stored != apiKey {
+		return s.workbenchStateLocked(), errors.New("verify saved billing credential: stored value does not match")
+	}
+	return s.workbenchStateLocked(), nil
+}
+
+func (s *Service) ClearModelProviderBillingAPIKey(providerID string) (WorkbenchState, error) {
+	release, err := s.beginActivity("clearing a billing credential")
+	if err != nil {
+		return s.WorkbenchState(), err
+	}
+	defer release()
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return s.workbenchStateLocked(), errors.New("模型提供商不能为空")
+	}
+	settings := s.runtimeSettings.Normalized()
+	provider, _, ok := findModelProvider(settings.Model.Providers, providerID)
+	if !ok {
+		return s.workbenchStateLocked(), fmt.Errorf("未找到模型提供商：%s", providerID)
+	}
+	if err := s.secretVault.Delete(secretServiceName, providerBillingSecretAccountName(provider.ID)); err != nil {
+		return s.workbenchStateLocked(), err
+	}
+	return s.workbenchStateLocked(), nil
+}
+
 func (s *Service) DeleteModelProvider(providerID string) (WorkbenchState, error) {
 	release, err := s.beginActivity("deleting a model provider")
 	if err != nil {
@@ -589,6 +646,9 @@ func (s *Service) DeleteModelProvider(providerID string) (WorkbenchState, error)
 		return s.workbenchStateLocked(), err
 	}
 	if err := s.secretVault.Delete(secretServiceName, providerSecretAccountName(providerID)); err != nil {
+		return s.workbenchStateLocked(), err
+	}
+	if err := s.secretVault.Delete(secretServiceName, providerBillingSecretAccountName(providerID)); err != nil {
 		return s.workbenchStateLocked(), err
 	}
 	s.runtimeSettings = s.runtimeSettingsWithSecretFlags(settings)
@@ -2567,6 +2627,7 @@ func (s *Service) runtimeSettingsWithSecretFlags(settings RuntimeSettings) Runti
 	settings = settings.Normalized()
 	for index, provider := range settings.Model.Providers {
 		provider.APIKeyConfigured = providerAPIKeyConfigured(s.secretVault, provider.ID)
+		provider.BillingKeyConfigured = providerBillingKeyConfigured(s.secretVault, provider.ID)
 		provider.SupportsModelFetch = supportsModelFetch(provider.Protocol)
 		settings.Model.Providers[index] = provider
 	}
@@ -2689,11 +2750,24 @@ func providerSecretAccountName(providerID string) string {
 	return "model-provider:" + providerID + ":api-key"
 }
 
+func providerBillingSecretAccountName(providerID string) string {
+	providerID = strings.TrimSpace(providerID)
+	return "model-provider:" + providerID + ":billing-key"
+}
+
 func providerAPIKeyConfigured(secretVault vault.Vault, providerID string) bool {
 	if secretVault == nil {
 		return false
 	}
 	_, err := secretVault.Get(secretServiceName, providerSecretAccountName(providerID))
+	return err == nil
+}
+
+func providerBillingKeyConfigured(secretVault vault.Vault, providerID string) bool {
+	if secretVault == nil {
+		return false
+	}
+	_, err := secretVault.Get(secretServiceName, providerBillingSecretAccountName(providerID))
 	return err == nil
 }
 

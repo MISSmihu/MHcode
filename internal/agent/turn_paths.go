@@ -99,8 +99,8 @@ func withTurnTaskScopeContext(preview RequestContext, scope turnTaskScope, works
 		return filepath.ToSlash(path)
 	}
 	lines := []string{
-		"本轮任务范围由宿主锁定；目标不存在时只能在目标范围内创建，不得用已有兄弟项目代替。",
-		"只能读取或写入以下目标：",
+		"用户已明确授权以下本轮目标：目录授权包含全部后代，文件授权仅包含该文件。",
+		"可读取已配置工作区中的相关资料作为参考，但不得修改未列出的文件，也不得用已有兄弟项目代替目标。",
 	}
 	for _, path := range scope.Roots {
 		lines = append(lines, "- directory: "+formatPath(path))
@@ -109,7 +109,7 @@ func withTurnTaskScopeContext(preview RequestContext, scope turnTaskScope, works
 		lines = append(lines, "- file: "+formatPath(path))
 	}
 	if scope.RequireWrite {
-		lines = append(lines, "本轮包含创建或修改意图；只有目标范围内的真实文件变更才能报告完成。")
+		lines = append(lines, "用户要求创建或修改；只有目标范围内的真实文件变更才能报告完成。")
 	}
 	volatile := append([]ContextSection(nil), preview.VolatileTail...)
 	volatile = append(volatile, ContextSection{Name: "task_scope", Content: strings.Join(lines, "\n")})

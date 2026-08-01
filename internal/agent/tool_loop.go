@@ -397,21 +397,20 @@ func (s *Service) buildMutableToolRegistryForContext(ctx context.Context, includ
 			KnownHostsPath: s.scopedSSHKnownHostsPath(),
 		})
 	}
-	// Git and persistent terminals operate at workspace/session scope rather
-	// than a single declared target. Hide them for a turn-scoped task instead
-	// of letting them observe or mutate sibling projects.
-	if s.config.Git != nil && !policy.TaskScopeEnabled {
-		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: readOnly})
+	// A scoped turn may still inspect repository state, but Git mutations and
+	// persistent terminal sessions cannot be constrained to one target path.
+	if s.config.Git != nil {
+		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: readOnly || policy.TaskScopeEnabled})
 	}
 	if s.config.Terminal != nil && s.runtimeSettings.ShellAccess && !readOnly && !policy.TaskScopeEnabled {
 		reg.Add(TerminalTool{Policy: policy, Controller: s.config.Terminal})
 	}
-	// Generic MCP schemas do not provide a host-enforceable local filesystem
-	// boundary. Built-in scoped tools remain available; remote MCP tools return
-	// on the next unscoped turn.
-	if s.mcpManager != nil && !policy.TaskScopeEnabled {
+	// Read-only MCP tools remain useful for research in a scoped turn. Mutating
+	// MCP tools stay hidden because their local path boundary is not generally
+	// enforceable by the host.
+	if s.mcpManager != nil {
 		for _, remoteTool := range s.mcpManager.Tools() {
-			if readOnly {
+			if readOnly || policy.TaskScopeEnabled {
 				readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
 				if !ok || !readOnlyTool.ReadOnly() {
 					continue
@@ -452,7 +451,7 @@ func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Re
 		reg.Add(tools.RenderArtifactTool{Policy: policy, Controller: s})
 		reg.Add(tools.InspectVisualTool{Policy: policy, Controller: s})
 	}
-	if s.config.Git != nil && !policy.TaskScopeEnabled {
+	if s.config.Git != nil {
 		reg.Add(GitTool{Policy: policy, Controller: s.config.Git, ReadOnlyOnly: true})
 	}
 	if s.runtimeSettings.NetworkAccess {
@@ -460,7 +459,7 @@ func (s *Service) buildReadOnlyRegistryForContext(ctx context.Context) *tools.Re
 		reg.Add(tools.ReadWebpageTool{Policy: policy, Browser: s.webpageBrowserRenderer()})
 		reg.Add(tools.WebSearchTool{Policy: policy})
 	}
-	if s.mcpManager != nil && !policy.TaskScopeEnabled {
+	if s.mcpManager != nil {
 		for _, remoteTool := range s.mcpManager.Tools() {
 			readOnlyTool, ok := remoteTool.(interface{ ReadOnly() bool })
 			if ok && readOnlyTool.ReadOnly() {

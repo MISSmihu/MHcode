@@ -3,6 +3,57 @@ import { describe, expect, test } from "bun:test";
 import { hasMeaningfulTurnOutput, hasUsablePartialResult } from "../src/lib/chat-results";
 
 describe("chat UI regressions", () => {
+  test("uses a theme-aware frameless title bar with complete window controls", async () => {
+    const [main, app, titlebar, workbench, css] = await Promise.all([
+      Bun.file(new URL("../../main.go", import.meta.url)).text(),
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/AppTitleBar.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    expect(main).toContain("Frameless: true");
+    expect(main).toContain("DisableFramelessWindowDecorations: false");
+    expect(app).toContain("<AppTitleBar />");
+    expect(titlebar).toContain("WindowMinimise");
+    expect(titlebar).toContain("WindowToggleMaximise");
+    expect(titlebar).toContain("WindowIsMaximised");
+    expect(titlebar).toContain("Quit");
+    expect(css).toContain("--wails-draggable: drag");
+    expect(css).toContain("grid-template-rows: var(--app-titlebar-height) minmax(0, 1fr)");
+    expect(css).toContain("top: var(--app-titlebar-height)");
+    expect(app).not.toContain("syncNativeWindowTheme");
+    expect(workbench).not.toContain("ApplyNativeWindowTheme");
+  });
+
+  test("keeps settings and side panels inside the title-bar-adjusted viewport", async () => {
+    const [css, polish] = await Promise.all([
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/polish.css", import.meta.url)).text(),
+    ]);
+    expect(css).toContain("height: calc(var(--ui-layout-height, 100vh) - var(--app-titlebar-height));");
+    expect(polish).toContain("height: calc(var(--ui-layout-height, 100vh) - var(--app-titlebar-height));");
+    expect(css).toContain(".settings-nav {");
+    expect(css).toContain("overscroll-behavior: contain;");
+    expect(css).toContain(".side-panel-host {");
+    expect(css).toContain(".side-panel-pages {");
+    expect(css).toContain("max-height: 100%;");
+  });
+
+  test("uses a data-backed usage dashboard instead of generic settings cards", async () => {
+    const [panels, css] = await Promise.all([
+      Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+    ]);
+    expect(panels).toContain('class="settings-page-body usage-dashboard"');
+    expect(panels).toContain('class="usage-dashboard-summary"');
+    expect(panels).toContain('class="usage-cache-disc"');
+    expect(panels).toContain("usage-billing-workspace");
+    expect(panels).toContain("officialTokens");
+    expect(css).toContain(".usage-dashboard {");
+    expect(css).toContain(".usage-dashboard-summary {");
+    expect(css).toContain(".usage-cache-disc {");
+  });
+
   test("keeps private subagent reasoning out of the user-facing panel", async () => {
     const panel = await Bun.file(new URL("../src/components/SubagentPanel.tsx", import.meta.url)).text();
     expect(panel).not.toContain("subagentReasoning");
@@ -430,7 +481,8 @@ describe("chat UI regressions", () => {
   });
 
   test("provides real updater and persistent Agent automation settings", async () => {
-    const [panels, services, constants, types, css] = await Promise.all([
+    const [app, panels, services, constants, types, css] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
       Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
       Bun.file(new URL("../src/constants.tsx", import.meta.url)).text(),
@@ -452,6 +504,24 @@ describe("chat UI regressions", () => {
     expect(types).toContain("export type UpdateState");
     expect(css).toContain(".automation-settings-page");
     expect(css).toContain(".about-download-progress");
+    expect(app).toContain("onUpdateState(presentUpdateBanner)");
+    expect(app).toContain('class="app-update-banner"');
+    expect(app).toContain("startUpdateBannerCountdown");
+    expect(app).toContain('new Set(["available", "downloading", "downloaded", "installing"])');
+    expect(css).toContain("top: calc(var(--app-titlebar-height) + 20px);");
+    expect(css).toContain(".app-update-banner-timer span.indeterminate");
+    expect(css).toContain("@keyframes update-banner-indeterminate");
+  });
+
+  test("removes the redundant sidebar letter mark", async () => {
+    const [app, css, polish] = await Promise.all([
+      Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+      Bun.file(new URL("../src/styles/polish.css", import.meta.url)).text(),
+    ]);
+    expect(app).not.toContain('class="brand-mark"');
+    expect(css).not.toContain(".brand-mark");
+    expect(polish).not.toContain(".brand-mark");
   });
 
   test("switches to the backend replacement after deleting the exact active conversation", async () => {

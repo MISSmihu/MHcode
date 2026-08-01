@@ -46,7 +46,7 @@ type LiveUsageState struct {
 	UsageLedger      UsageLedgerState     `json:"usageLedger"`
 }
 
-func usageMetricsFor(provider ModelProviderSetting, usage *protocol.TokenUsage) cache.UsageMetrics {
+func usageMetricsFor(provider ModelProviderSetting, modelID string, usage *protocol.TokenUsage) cache.UsageMetrics {
 	if usage == nil {
 		return cache.UsageMetrics{}
 	}
@@ -56,32 +56,32 @@ func usageMetricsFor(provider ModelProviderSetting, usage *protocol.TokenUsage) 
 		InputTokens:           usage.PromptTokens,
 		OutputTokens:          usage.CompletionTokens,
 	}
-	metrics.EffectiveCost = estimateUsageCost(provider, metrics)
+	metrics.EffectiveCost = estimateUsageCost(usagePricingSnapshotFor(provider, modelID, metrics.InputTokens), metrics)
 	return metrics
 }
 
-func estimateUsageCost(provider ModelProviderSetting, metrics cache.UsageMetrics) float64 {
+func estimateUsageCost(pricing usagePricingSnapshot, metrics cache.UsageMetrics) float64 {
 	regularInput := metrics.InputTokens - metrics.PromptCacheHitTokens - metrics.PromptCacheMissTokens
 	if regularInput < 0 {
 		regularInput = 0
 	}
-	cacheHitPrice := provider.CacheHitPricePerMillion
+	cacheHitPrice := pricing.CacheHitPricePerMillion
 	if cacheHitPrice == 0 {
-		cacheHitPrice = provider.InputPricePerMillion
+		cacheHitPrice = pricing.InputPricePerMillion
 	}
-	cacheMissPrice := provider.CacheMissPricePerMillion
+	cacheMissPrice := pricing.CacheMissPricePerMillion
 	if cacheMissPrice == 0 {
-		cacheMissPrice = provider.InputPricePerMillion
+		cacheMissPrice = pricing.InputPricePerMillion
 	}
 	const perMillion = 1_000_000
-	return (float64(regularInput)*provider.InputPricePerMillion +
+	return (float64(regularInput)*pricing.InputPricePerMillion +
 		float64(metrics.PromptCacheHitTokens)*cacheHitPrice +
 		float64(metrics.PromptCacheMissTokens)*cacheMissPrice +
-		float64(metrics.OutputTokens)*provider.OutputPricePerMillion) / perMillion
+		float64(metrics.OutputTokens)*pricing.OutputPricePerMillion) / perMillion
 }
 
 func (s *Service) recordLiveUsage(usage *protocol.TokenUsage, route chatRoute, sink ChatEventSink) cache.UsageMetrics {
-	metrics := usageMetricsFor(route.Provider, usage)
+	metrics := usageMetricsFor(route.Provider, route.ModelID, usage)
 	s.metrics = metrics
 	s.recordUsageMetrics(metrics, route)
 	snapshot := s.liveUsageState()
@@ -201,19 +201,26 @@ func (s *Service) recordUsageMetrics(metrics cache.UsageMetrics, route chatRoute
 	}
 
 	recordedAt := time.Now().UTC()
+	pricing := usagePricingSnapshotFor(route.Provider, route.ModelID, metrics.InputTokens)
 	record := storage.UsageRecord{
-		CreatedAt:             recordedAt,
-		SessionID:             strings.TrimSpace(s.sessionID),
-		ProviderID:            route.Provider.ID,
-		ProviderName:          route.Provider.Name,
-		Protocol:              route.Provider.Protocol,
-		ModelID:               route.ModelID,
-		Reasoning:             string(s.reasoning),
-		PromptCacheHitTokens:  metrics.PromptCacheHitTokens,
-		PromptCacheMissTokens: metrics.PromptCacheMissTokens,
-		InputTokens:           metrics.InputTokens,
-		OutputTokens:          metrics.OutputTokens,
-		EffectiveCost:         metrics.EffectiveCost,
+		CreatedAt:                recordedAt,
+		SessionID:                strings.TrimSpace(s.sessionID),
+		ProviderID:               route.Provider.ID,
+		ProviderName:             route.Provider.Name,
+		Protocol:                 route.Provider.Protocol,
+		ModelID:                  route.ModelID,
+		Reasoning:                string(s.reasoning),
+		PromptCacheHitTokens:     metrics.PromptCacheHitTokens,
+		PromptCacheMissTokens:    metrics.PromptCacheMissTokens,
+		InputTokens:              metrics.InputTokens,
+		OutputTokens:             metrics.OutputTokens,
+		EffectiveCost:            metrics.EffectiveCost,
+		PricingSource:            pricing.Source,
+		PricingVersion:           pricing.Version,
+		InputPricePerMillion:     pricing.InputPricePerMillion,
+		OutputPricePerMillion:    pricing.OutputPricePerMillion,
+		CacheHitPricePerMillion:  pricing.CacheHitPricePerMillion,
+		CacheMissPricePerMillion: pricing.CacheMissPricePerMillion,
 	}
 	if err := s.usageStore.AppendUsage(record); err != nil {
 		s.usageLedger.LastError = err.Error()

@@ -139,6 +139,76 @@ export type UsageLedgerState = {
   lastError?: string;
 };
 
+export type UsageBillingModelUsage = {
+  modelId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  uncachedTokens: number;
+  inputTextTokens: number;
+  outputTextTokens: number;
+  cachedTextTokens: number;
+  inputAudioTokens: number;
+  cachedAudioTokens: number;
+  outputAudioTokens: number;
+  inputImageTokens: number;
+  cachedImageTokens: number;
+  outputImageTokens: number;
+  requests: number;
+};
+
+export type UsageBillingReport = {
+  providerId: string;
+  providerName: string;
+  providerKind: string;
+  officialProvider: boolean;
+  status: string;
+  message: string;
+  verified: boolean;
+  toleranceUsd: number;
+  warningToleranceUsd: number;
+  periodStart?: string;
+  periodEnd?: string;
+  estimatedCost: number;
+  officialCost: number;
+  difference: number;
+  absoluteDifference: number;
+  reconciliationSource?: string;
+  reconciledAt?: string;
+  recommendedSource: string;
+  scope: string;
+  scopeConfigured: boolean;
+  officialUsage: UsageBillingModelUsage[];
+  officialInputTokens: number;
+  officialOutputTokens: number;
+  officialCachedTokens: number;
+  officialCacheWriteTokens: number;
+  officialUncachedTokens: number;
+  officialInputTextTokens: number;
+  officialOutputTextTokens: number;
+  officialCachedTextTokens: number;
+  officialInputAudioTokens: number;
+  officialCachedAudioTokens: number;
+  officialOutputAudioTokens: number;
+  officialInputImageTokens: number;
+  officialCachedImageTokens: number;
+  officialOutputImageTokens: number;
+  officialRequests: number;
+};
+
+export type UsageBillingSyncInput = {
+  providerId: string;
+  periodStart: string;
+  periodEnd: string;
+};
+
+export type UsageBillingReconciliationInput = UsageBillingSyncInput & {
+  officialCost: number;
+  source: string;
+  note?: string;
+};
+
 export type CacheHealth = {
   status: "pending" | "ok" | "watch" | "warming" | "cold" | "low" | string;
   message: string;
@@ -585,6 +655,9 @@ export type ModelProviderSetting = {
   reasoningProfile?: string;
   enabled: boolean;
   apiKeyConfigured: boolean;
+  billingKeyConfigured?: boolean;
+  billingProjectId?: string;
+  billingApiKeyId?: string;
   defaultModelId: string;
   contextWindowTokens: number;
   inputPricePerMillion?: number;

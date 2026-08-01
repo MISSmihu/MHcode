@@ -70,7 +70,7 @@ func (t GitTool) Execute(ctx context.Context, rawArgs json.RawMessage) (tools.Re
 	}
 	action := strings.ToLower(strings.TrimSpace(args.Action))
 	if t.ReadOnlyOnly && gitActionMutates(action) {
-		return toolError(t.Name(), "this Git tool is read-only during planning"), nil
+		return toolError(t.Name(), "当前 Git 工具仅允许查看状态和差异"), nil
 	}
 	if gitActionMutates(action) && strings.EqualFold(t.Policy.FilesystemAccess, "read-only") {
 		return toolError(t.Name(), "Git write operations are disabled in read-only mode"), nil

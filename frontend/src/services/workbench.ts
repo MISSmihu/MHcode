@@ -1,6 +1,6 @@
 import { defaultReasoningLevel, reasoningOptions } from "../state/reasoning";
 import { defaultTeamSettings } from "../team-config";
-import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, OpenSourceLicense, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillImportResult, SkillIndexEntry, TerminalSessionState, UpdateState, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
+import type { AppInfo, AutomationState, AutomationTask, ChatAttachment, ChatResult, ChatTaskEvent, ChatTaskState, ApprovalRequest, BranchInfo, BrowserFrame, BrowserInspector, BrowserPreview, BrowserState, CheckpointInfo, GitDiff, GitStatus, MessagePart, OpenSourceLicense, ProjectInfo, ProjectNode, SecretResultReveal, SessionInfo, SessionMessage, ReasoningLevel, RuntimeSettings, ServerSnapshot, SkillDetail, SkillImportResult, SkillIndexEntry, TerminalSessionState, UpdateState, UsageBillingReconciliationInput, UsageBillingReport, UsageBillingSyncInput, WorkbenchState, WorkspaceDirectoryListing, WorkspaceFilePreview } from "../types";
 
 type WailsAppBinding = {
   GetWorkbenchState: () => Promise<WorkbenchState>;
@@ -45,6 +45,11 @@ type WailsAppBinding = {
   StopAutomationTask?: (taskID: string) => Promise<AutomationState>;
   SaveModelProviderAPIKey: (providerID: string, apiKey: string) => Promise<WorkbenchState>;
   ClearModelProviderAPIKey: (providerID: string) => Promise<WorkbenchState>;
+	SaveModelProviderBillingAPIKey?: (providerID: string, apiKey: string) => Promise<WorkbenchState>;
+	ClearModelProviderBillingAPIKey?: (providerID: string) => Promise<WorkbenchState>;
+	GetUsageBillingReport?: (providerID: string) => Promise<UsageBillingReport>;
+	ReconcileUsageBilling?: (input: UsageBillingReconciliationInput) => Promise<UsageBillingReport>;
+	SyncUsageBilling?: (input: UsageBillingSyncInput) => Promise<UsageBillingReport>;
   DeleteModelProvider?: (providerID: string) => Promise<WorkbenchState>;
   RefreshModelProviderModels: (providerID: string) => Promise<WorkbenchState>;
   RefreshMCPServer?: (serverID: string) => Promise<WorkbenchState>;
@@ -548,7 +553,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.15",
+  version: "0.3.16",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",
@@ -797,6 +802,72 @@ export async function clearModelProviderAPIKey(providerID: string): Promise<Work
     checkedAt: undefined,
   }));
   return cloneState(fallbackState);
+}
+
+export async function saveModelProviderBillingAPIKey(providerID: string, apiKey: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.SaveModelProviderBillingAPIKey) {
+    return binding.SaveModelProviderBillingAPIKey(providerID, apiKey);
+  }
+  fallbackState = updateFallbackProvider(providerID, (provider) => ({
+    ...provider,
+    billingKeyConfigured: Boolean(apiKey.trim()),
+  }));
+  return cloneState(fallbackState);
+}
+
+export async function clearModelProviderBillingAPIKey(providerID: string): Promise<WorkbenchState> {
+  const binding = wailsBinding();
+  if (binding?.ClearModelProviderBillingAPIKey) {
+    return binding.ClearModelProviderBillingAPIKey(providerID);
+  }
+  fallbackState = updateFallbackProvider(providerID, (provider) => ({
+    ...provider,
+    billingKeyConfigured: false,
+  }));
+  return cloneState(fallbackState);
+}
+
+export async function getUsageBillingReport(providerID: string): Promise<UsageBillingReport> {
+  const binding = wailsBinding();
+  if (binding?.GetUsageBillingReport) {
+    return binding.GetUsageBillingReport(providerID);
+  }
+  return fallbackUsageBillingReport(providerID);
+}
+
+export async function syncUsageBilling(input: UsageBillingSyncInput): Promise<UsageBillingReport> {
+  const binding = wailsBinding();
+  if (binding?.SyncUsageBilling) {
+    return binding.SyncUsageBilling(input);
+  }
+  return {
+    ...fallbackUsageBillingReport(input.providerId),
+    status: "preview",
+    message: "预览模式不连接官方账单接口。请在桌面应用中同步。",
+    periodStart: input.periodStart,
+    periodEnd: input.periodEnd,
+  };
+}
+
+export async function reconcileUsageBilling(input: UsageBillingReconciliationInput): Promise<UsageBillingReport> {
+  const binding = wailsBinding();
+  if (binding?.ReconcileUsageBilling) {
+    return binding.ReconcileUsageBilling(input);
+  }
+  const report = fallbackUsageBillingReport(input.providerId);
+  return {
+    ...report,
+    status: report.officialProvider ? "preview" : "custom_reconciled",
+    message: "预览模式已模拟保存账单对账；桌面应用会写入本地用量账本。",
+    periodStart: input.periodStart,
+    periodEnd: input.periodEnd,
+    officialCost: input.officialCost,
+    estimatedCost: 0,
+    difference: input.officialCost,
+    absoluteDifference: Math.abs(input.officialCost),
+    reconciliationSource: input.source,
+  };
 }
 
 export async function deleteModelProvider(providerID: string): Promise<WorkbenchState> {
@@ -2127,6 +2198,61 @@ function updateFallbackProvider(
         providers,
       },
     }),
+  };
+}
+
+function fallbackUsageBillingReport(providerID: string): UsageBillingReport {
+  const provider = fallbackState.runtimeSettings.model.providers.find((candidate) => candidate.id === providerID)
+    ?? fallbackState.runtimeSettings.model.providers.find((candidate) => candidate.id === fallbackState.runtimeSettings.model.selectedProviderId);
+  const host = (() => {
+    try {
+      return new URL(provider?.baseUrl ?? "").hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  })();
+  const kind = host === "api.openai.com" ? "openai"
+    : host === "api.anthropic.com" ? "anthropic"
+      : host === "generativelanguage.googleapis.com" ? "gemini"
+        : host === "api.x.ai" ? "xai"
+          : host === "api.deepseek.com" ? "deepseek"
+            : "";
+  const officialProvider = Boolean(kind);
+  return {
+    providerId: provider?.id ?? providerID,
+    providerName: provider?.name ?? "未选择供应商",
+    providerKind: kind,
+    officialProvider,
+    status: officialProvider ? "needs_reconciliation" : "custom_provider",
+    message: officialProvider
+      ? "尚未同步该供应商的官方账单。"
+      : "自定义或中转供应商仅显示本地估算，不会标记为官方准确费用。",
+    verified: false,
+    toleranceUsd: 2,
+    warningToleranceUsd: 3,
+    estimatedCost: 0,
+    officialCost: 0,
+    difference: 0,
+    absoluteDifference: 0,
+    recommendedSource: officialProvider ? "使用该供应商的官方账单接口或账单导出对账。" : "填写供应商实际费率后，可手动录入账单金额对账。",
+    scope: kind === "openai" ? "整个 OpenAI 组织" : "供应商账单周期",
+    scopeConfigured: kind !== "openai" || Boolean(provider?.billingProjectId || provider?.billingApiKeyId),
+    officialUsage: [],
+    officialInputTokens: 0,
+    officialOutputTokens: 0,
+    officialCachedTokens: 0,
+    officialCacheWriteTokens: 0,
+    officialUncachedTokens: 0,
+    officialInputTextTokens: 0,
+    officialOutputTextTokens: 0,
+    officialCachedTextTokens: 0,
+    officialInputAudioTokens: 0,
+    officialCachedAudioTokens: 0,
+    officialOutputAudioTokens: 0,
+    officialInputImageTokens: 0,
+    officialCachedImageTokens: 0,
+    officialOutputImageTokens: 0,
+    officialRequests: 0,
   };
 }
 

@@ -37,5 +37,40 @@ func InitialMigrations() []Migration {
 				"CREATE INDEX IF NOT EXISTS usage_metrics_provider_model_id ON usage_metrics(provider_id, model_id, id)",
 			},
 		},
+		{
+			Version: 3,
+			Name:    "usage_pricing_snapshots_and_reconciliation",
+			Statements: []string{
+				"ALTER TABLE usage_metrics ADD COLUMN pricing_source TEXT NOT NULL DEFAULT ''",
+				"ALTER TABLE usage_metrics ADD COLUMN pricing_version TEXT NOT NULL DEFAULT ''",
+				"ALTER TABLE usage_metrics ADD COLUMN input_price_per_million REAL NOT NULL DEFAULT 0",
+				"ALTER TABLE usage_metrics ADD COLUMN output_price_per_million REAL NOT NULL DEFAULT 0",
+				"ALTER TABLE usage_metrics ADD COLUMN cache_hit_price_per_million REAL NOT NULL DEFAULT 0",
+				"ALTER TABLE usage_metrics ADD COLUMN cache_miss_price_per_million REAL NOT NULL DEFAULT 0",
+				`CREATE TABLE IF NOT EXISTS usage_billing_reconciliations (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					provider_id TEXT NOT NULL,
+					provider_name TEXT NOT NULL DEFAULT '',
+					period_start TEXT NOT NULL,
+					period_end TEXT NOT NULL,
+					official_cost REAL NOT NULL DEFAULT 0,
+					estimated_cost REAL NOT NULL DEFAULT 0,
+					difference REAL NOT NULL DEFAULT 0,
+					source TEXT NOT NULL DEFAULT '',
+					note TEXT NOT NULL DEFAULT '',
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL,
+					UNIQUE(provider_id, period_start, period_end)
+				)`,
+				"CREATE INDEX IF NOT EXISTS usage_billing_reconciliations_provider_updated ON usage_billing_reconciliations(provider_id, updated_at DESC)",
+			},
+		},
+		{
+			Version: 4,
+			Name:    "usage_billing_usage_details",
+			Statements: []string{
+				"ALTER TABLE usage_billing_reconciliations ADD COLUMN usage_details_json TEXT NOT NULL DEFAULT ''",
+			},
+		},
 	}
 }

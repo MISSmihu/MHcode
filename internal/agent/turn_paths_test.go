@@ -117,14 +117,14 @@ func TestTurnTaskScopeIsAddedToPrivateModelContext(t *testing.T) {
 	}
 	preview := withTurnTaskScopeContext(RequestContext{}, scope, workspace)
 	contextText := formatPrivateTurnContext(preview)
-	for _, expected := range []string{"[task_scope]", "mhcode-agent-web-test", "不得用已有兄弟项目代替", "真实文件变更"} {
+	for _, expected := range []string{"[task_scope]", "mhcode-agent-web-test", "目录授权包含全部后代", "不得修改未列出的文件", "真实文件变更"} {
 		if !strings.Contains(contextText, expected) {
 			t.Fatalf("private task scope context is missing %q: %s", expected, contextText)
 		}
 	}
 }
 
-func TestTurnTaskScopeHidesWorkspaceWideGitAndTerminal(t *testing.T) {
+func TestTurnTaskScopeKeepsReadOnlyGitButHidesPersistentTerminal(t *testing.T) {
 	workspace := t.TempDir()
 	service := NewService(ServiceConfig{
 		SkillsDir: t.TempDir(),
@@ -139,10 +139,12 @@ func TestTurnTaskScopeHidesWorkspaceWideGitAndTerminal(t *testing.T) {
 		Roots:   []string{filepath.Join(workspace, "mhcode-agent-web-test")},
 	})
 	registry := service.buildToolRegistryForContext(ctx)
-	for _, name := range []string{"git", "terminal"} {
-		if _, ok := registry.Get(name); ok {
-			t.Fatalf("workspace-wide tool %q leaked into a scoped turn", name)
-		}
+	gitTool, ok := registry.Get("git")
+	if !ok || !gitTool.(GitTool).ReadOnlyOnly {
+		t.Fatal("scoped turn should retain read-only Git inspection")
+	}
+	if _, ok := registry.Get("terminal"); ok {
+		t.Fatal("persistent terminal leaked into a scoped turn")
 	}
 	if _, ok := registry.Get("run_command"); !ok {
 		t.Fatal("scoped run_command should remain available with its strict working-directory guard")

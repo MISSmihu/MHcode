@@ -341,6 +341,30 @@ func (a *App) RefreshModelProviderModels(providerID string) (agent.WorkbenchStat
 	return a.service.RefreshModelProviderModels(ctx, providerID)
 }
 
+func (a *App) SaveModelProviderBillingAPIKey(providerID string, apiKey string) (agent.WorkbenchState, error) {
+	return a.service.SaveModelProviderBillingAPIKey(providerID, apiKey)
+}
+
+func (a *App) ClearModelProviderBillingAPIKey(providerID string) (agent.WorkbenchState, error) {
+	return a.service.ClearModelProviderBillingAPIKey(providerID)
+}
+
+func (a *App) GetUsageBillingReport(providerID string) (agent.UsageBillingReport, error) {
+	return a.service.UsageBillingReport(providerID)
+}
+
+func (a *App) ReconcileUsageBilling(input agent.UsageBillingReconciliationInput) (agent.UsageBillingReport, error) {
+	return a.service.ReconcileUsageBilling(input)
+}
+
+func (a *App) SyncUsageBilling(input agent.UsageBillingSyncInput) (agent.UsageBillingReport, error) {
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.service.SyncUsageBilling(ctx, input)
+}
+
 // ListCheckpoints 返回当前会话的可回退检查点（供前端 Timeline）。
 func (a *App) ListCheckpoints() []agent.CheckpointInfo {
 	return a.service.ListCheckpoints()

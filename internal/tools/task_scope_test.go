@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestTaskScopeRejectsUnrelatedReadsAndWrites(t *testing.T) {
+func TestTaskScopeAllowsReferenceReadsButRejectsUnrelatedWrites(t *testing.T) {
 	workspace := t.TempDir()
 	target := filepath.Join(workspace, "mhcode-agent-web-test")
 	unrelated := filepath.Join(workspace, "existing-project")
@@ -30,11 +30,11 @@ func TestTaskScopeRejectsUnrelatedReadsAndWrites(t *testing.T) {
 		TaskScopeRoots:   []string{target},
 	}
 
-	if _, err := policy.ResolveReadPath(filepath.Join(unrelated, "admin.css")); !errors.Is(err, ErrPathOutsideTaskScope) {
-		t.Fatalf("unrelated read error = %v", err)
+	if _, err := policy.ResolveReadPath(filepath.Join(unrelated, "admin.css")); err != nil {
+		t.Fatalf("authorized workspace reference read failed: %v", err)
 	}
-	if _, err := policy.ResolveReadPath(filepath.Join(workspace, "index.html")); !errors.Is(err, ErrPathOutsideTaskScope) {
-		t.Fatalf("unrelated root-file read error = %v", err)
+	if _, err := policy.ResolveReadPath(filepath.Join(workspace, "index.html")); err != nil {
+		t.Fatalf("authorized workspace root read failed: %v", err)
 	}
 	if _, err := policy.ResolveWritePath(filepath.Join(workspace, "index.html")); !errors.Is(err, ErrPathOutsideTaskScope) {
 		t.Fatalf("root-level unrelated write error = %v", err)
@@ -67,6 +67,25 @@ func TestTaskScopeAllowsCreatingMissingTargetDirectory(t *testing.T) {
 	}
 }
 
+func TestTaskScopeDirectoryIncludesDescendantsButFileGrantIsExact(t *testing.T) {
+	workspace := t.TempDir()
+	directory := filepath.Join(workspace, "exports")
+	file := filepath.Join(workspace, "README.md")
+	policy := SandboxPolicy{
+		WorkspaceRoot: workspace, FilesystemAccess: "workspace-write",
+		TaskScopeEnabled: true, TaskScopeRoots: []string{directory}, TaskScopeFiles: []string{file},
+	}
+	if _, err := policy.ResolveWritePath(filepath.Join(directory, "nested", "report.txt")); err != nil {
+		t.Fatalf("directory descendant was rejected: %v", err)
+	}
+	if _, err := policy.ResolveWritePath(file); err != nil {
+		t.Fatalf("exact file grant was rejected: %v", err)
+	}
+	if _, err := policy.ResolveWritePath(filepath.Join(workspace, "README.md.bak")); !errors.Is(err, ErrPathOutsideTaskScope) {
+		t.Fatalf("file grant unexpectedly included a sibling path: %v", err)
+	}
+}
+
 func TestTaskScopeAllowsOnlyAncestorsWhenCreatingTarget(t *testing.T) {
 	workspace := t.TempDir()
 	target := filepath.Join(workspace, "nested", "mhcode-agent-web-test")
@@ -82,7 +101,7 @@ func TestTaskScopeAllowsOnlyAncestorsWhenCreatingTarget(t *testing.T) {
 	}
 }
 
-func TestTaskScopeDirectoryAndSearchToolsSkipSiblingProjects(t *testing.T) {
+func TestTaskScopeDirectoryAndSearchToolsCanReadWorkspaceReferences(t *testing.T) {
 	workspace := t.TempDir()
 	target := filepath.Join(workspace, "mhcode-agent-web-test")
 	unrelated := filepath.Join(workspace, "existing-project")
@@ -110,7 +129,7 @@ func TestTaskScopeDirectoryAndSearchToolsSkipSiblingProjects(t *testing.T) {
 		t.Fatalf("list result=%#v err=%v", listed, err)
 	}
 	listOutput := listed.Parts[0].Output
-	if !strings.Contains(listOutput, "mhcode-agent-web-test/index.html") || strings.Contains(listOutput, "existing-project") || strings.Contains(listOutput, "admin.css") {
+	if !strings.Contains(listOutput, "mhcode-agent-web-test/index.html") || !strings.Contains(listOutput, "existing-project") || !strings.Contains(listOutput, "admin.css") {
 		t.Fatalf("scoped list output = %q", listOutput)
 	}
 
@@ -119,7 +138,7 @@ func TestTaskScopeDirectoryAndSearchToolsSkipSiblingProjects(t *testing.T) {
 	if err != nil || searched.IsError {
 		t.Fatalf("search result=%#v err=%v", searched, err)
 	}
-	if !strings.Contains(searched.Parts[0].Output, "mhcode-agent-web-test/index.html") || strings.Contains(searched.Parts[0].Output, "admin.css") {
+	if !strings.Contains(searched.Parts[0].Output, "mhcode-agent-web-test/index.html") || !strings.Contains(searched.Parts[0].Output, "admin.css") {
 		t.Fatalf("scoped search output = %q", searched.Parts[0].Output)
 	}
 
@@ -131,7 +150,7 @@ func TestTaskScopeDirectoryAndSearchToolsSkipSiblingProjects(t *testing.T) {
 		t.Fatalf("grep result=%#v err=%v", grepped, err)
 	}
 	grepOutput := decodeGrepOutput(t, grepped)
-	if grepOutput.Engine != "go" || grepOutput.Count != 1 || grepOutput.Matches[0].Path != "mhcode-agent-web-test/index.html" {
+	if grepOutput.Engine != "go" || grepOutput.Count != 2 {
 		t.Fatalf("scoped grep output = %#v", grepOutput)
 	}
 
@@ -141,7 +160,7 @@ func TestTaskScopeDirectoryAndSearchToolsSkipSiblingProjects(t *testing.T) {
 		t.Fatalf("glob result=%#v err=%v", globbed, err)
 	}
 	globOutput := decodeGlobOutput(t, globbed)
-	if globOutput.Count != 1 || globOutput.Entries[0].Path != "mhcode-agent-web-test/index.html" {
+	if globOutput.Count != 2 {
 		t.Fatalf("scoped glob output = %#v", globOutput)
 	}
 }

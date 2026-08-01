@@ -29,18 +29,20 @@ func main() {
 	app := NewApp()
 
 	err := wails.Run(&options.App{
-		Title:  "MHcode",
-		Width:  1280,
-		Height: 820,
+		Title:     "MHcode",
+		Width:     1280,
+		Height:    820,
+		Frameless: true,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
 		BackgroundColour: &options.RGBA{R: 247, G: 248, B: 245, A: 1},
 		Windows: &windows.Options{
-			WebviewUserDataPath: webviewUserDataDir(),
+			WebviewUserDataPath:               webviewUserDataDir(),
+			DisableFramelessWindowDecorations: false,
 		},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
 		Bind: []interface{}{
 			app,
 		},

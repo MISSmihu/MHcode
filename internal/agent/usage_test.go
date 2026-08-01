@@ -32,7 +32,7 @@ func TestUsageLedgerRecordsCostAndRestoresCurrentSession(t *testing.T) {
 		OutputPricePerMillion: 2,
 	}
 	route := chatRoute{Provider: provider, ModelID: "model-a"}
-	metrics := usageMetricsFor(provider, &protocol.TokenUsage{
+	metrics := usageMetricsFor(provider, "model-a", &protocol.TokenUsage{
 		PromptTokens:          100,
 		CompletionTokens:      10,
 		PromptCacheHitTokens:  80,
@@ -66,6 +66,23 @@ func TestUsageLedgerRecordsCostAndRestoresCurrentSession(t *testing.T) {
 	}
 	if reloadedState.DeepSeekSession.SessionCacheHitTokens != 80 || reloadedState.DeepSeekSession.SessionCacheMissTokens != 20 {
 		t.Fatalf("restored session cache = %#v", reloadedState.DeepSeekSession)
+	}
+}
+
+func TestUsageMetricsUseOfficialOpenAIPricingCatalog(t *testing.T) {
+	provider := ModelProviderSetting{ID: "openai", Name: "OpenAI", BaseURL: "https://api.openai.com/v1"}
+	metrics := usageMetricsFor(provider, "gpt-5.6-sol-2026-07-31", &protocol.TokenUsage{
+		PromptTokens:          1_000_000,
+		CompletionTokens:      1_000_000,
+		PromptCacheHitTokens:  200_000,
+		PromptCacheMissTokens: 800_000,
+	})
+	if metrics.EffectiveCost < 34.099 || metrics.EffectiveCost > 34.101 {
+		t.Fatalf("catalog estimate = %f, want 34.1", metrics.EffectiveCost)
+	}
+	pricing := usagePricingSnapshotFor(provider, "gpt-5.6-sol-2026-07-31", 1_000_000)
+	if pricing.Source != "official-catalog" || pricing.Version != openAITextPricingCatalogVersion {
+		t.Fatalf("pricing snapshot = %#v", pricing)
 	}
 }
 
