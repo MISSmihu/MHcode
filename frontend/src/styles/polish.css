@@ -1037,6 +1037,10 @@ body[data-theme="light"] .review-error,
   padding-top: 12px;
 }
 
+.settings-page-body.extension-center-page {
+  padding-top: 0;
+}
+
 .app-confirm-overlay {
   position: fixed;
   inset: 0;

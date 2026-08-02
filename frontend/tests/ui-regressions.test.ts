@@ -139,13 +139,14 @@ describe("chat UI regressions", () => {
 	});
 
 	test("provides a verified extension catalog with CodeGraph lifecycle actions", async () => {
-		const [app, constants, panels, services, types, css] = await Promise.all([
+		const [app, constants, panels, services, types, css, polish] = await Promise.all([
 			Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../src/constants.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
 			Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
 			Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+			Bun.file(new URL("../src/styles/polish.css", import.meta.url)).text(),
 		]);
 		expect(constants).toContain('{ id: "extensions", label: "扩展中心"');
 		expect(panels).toContain("<ExtensionSettingsPanel");
@@ -160,6 +161,12 @@ describe("chat UI regressions", () => {
 		expect(app).toContain("applyWorkbenchState={setState}");
 		expect(css).toContain(".extension-center-page {");
 		expect(css).toContain(".extension-workspace {");
+		expect(css).toMatch(/\.extension-center-page \{[\s\S]*?padding-top: 0;/);
+		expect(polish).toMatch(/\.settings-page-body\.extension-center-page\s*\{[^}]*padding-top: 0;/);
+		expect(css).toMatch(/\.extension-toolbar \{[\s\S]*?isolation: isolate;/);
+		expect(css).toMatch(/\.extension-workspace \{[\s\S]*?grid-auto-rows: max-content;[\s\S]*?height: max-content;/);
+		expect(css).toMatch(/\.extension-workspace \{[\s\S]*?grid-template-columns: minmax\(290px, \.82fr\) minmax\(0, 1\.38fr\);/);
+		expect(css).not.toMatch(/\.extension-workspace\s*\{[^}]*border-bottom:/);
 		expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.extension-workspace \{[\s\S]*?grid-template-columns: 1fr;/);
 		expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.extension-list \{[\s\S]*?grid-template-columns: 1fr;/);
 	});

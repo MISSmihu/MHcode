@@ -8969,13 +8969,14 @@ body[data-theme="light"] .skill-document .code-block .hljs,
   display: grid;
   align-content: start;
   gap: 12px;
-  padding-top: 10px;
+  padding-top: 0;
 }
 
 .extension-toolbar {
   position: sticky;
   top: 0;
   z-index: 3;
+  isolation: isolate;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -9116,11 +9117,12 @@ body[data-theme="light"] .skill-document .code-block .hljs,
 
 .extension-workspace {
   display: grid;
-  grid-template-columns: minmax(290px, .82fr) minmax(450px, 1.38fr);
+  grid-template-columns: minmax(290px, .82fr) minmax(0, 1.38fr);
+  grid-auto-rows: max-content;
   align-items: start;
   min-width: 0;
   min-height: 560px;
-  border-bottom: 1px solid var(--border-color);
+  height: max-content;
 }
 
 .extension-list-pane {
