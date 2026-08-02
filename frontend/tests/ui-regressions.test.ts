@@ -32,6 +32,8 @@ describe("chat UI regressions", () => {
     expect(titlebar).toContain("WindowToggleMaximise");
     expect(titlebar).toContain("WindowIsMaximised");
     expect(titlebar).toContain("Quit");
+    expect(titlebar).toContain("window as Window & { runtime?: DesktopRuntime }");
+    expect(titlebar).not.toContain("../../wailsjs/runtime/runtime");
     expect(css).toContain("--wails-draggable: drag");
     expect(css).toContain("grid-template-rows: var(--app-titlebar-height) minmax(0, 1fr)");
     expect(css).toContain("top: var(--app-titlebar-height)");
