@@ -5072,6 +5072,7 @@ function App() {
           </div>
           <SettingsCenter
             activeCategory={activeSettingsCategory()}
+			applyWorkbenchState={setState}
             apiKeyDraft={apiKeyDraft()}
             cacheHealth={cacheHealth()}
             cacheHitRate={cacheHitRate()}

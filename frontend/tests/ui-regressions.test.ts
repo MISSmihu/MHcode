@@ -3,6 +3,20 @@ import { describe, expect, test } from "bun:test";
 import { hasMeaningfulTurnOutput, hasUsablePartialResult } from "../src/lib/chat-results";
 
 describe("chat UI regressions", () => {
+  test("provides a managed CodeGraph preset and Chinese activity timeline", async () => {
+    const [panels, messageContent] = await Promise.all([
+      Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/components/chat/MessageContent.tsx", import.meta.url)).text(),
+    ]);
+    expect(panels).toContain('title="添加 CodeGraph 预设"');
+    expect(panels).toContain('{ key: "CODEGRAPH_NO_DAEMON", value: "1" }');
+    expect(panels).toContain('{ key: "CODEGRAPH_TELEMETRY", value: "0" }');
+    expect(panels).toContain('args: ["serve", "--mcp"]');
+    expect(messageContent).toContain('return "codegraph"');
+    expect(messageContent).toContain('"正在分析代码关系"');
+    expect(messageContent).toContain('return "代码关系分析"');
+  });
+
   test("uses a theme-aware frameless title bar with complete window controls", async () => {
     const [main, app, titlebar, workbench, css] = await Promise.all([
       Bun.file(new URL("../../main.go", import.meta.url)).text(),
@@ -122,6 +136,32 @@ describe("chat UI regressions", () => {
 		expect(css).toContain("grid-template-columns: 250px minmax(0, 1fr);");
 		expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.plugin-settings-page \{[\s\S]*?grid-template-columns: 1fr;/);
 		expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.plugin-list \{[\s\S]*?grid-template-columns: 1fr;/);
+	});
+
+	test("provides a verified extension catalog with CodeGraph lifecycle actions", async () => {
+		const [app, constants, panels, services, types, css] = await Promise.all([
+			Bun.file(new URL("../src/app.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/constants.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+			Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+			Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+			Bun.file(new URL("../src/styles.css", import.meta.url)).text(),
+		]);
+		expect(constants).toContain('{ id: "extensions", label: "扩展中心"');
+		expect(panels).toContain("<ExtensionSettingsPanel");
+		expect(panels).toContain("来源已核验");
+		expect(panels).toContain("runExtensionProjectAction(item.id, action.id)");
+		expect(panels).toContain('class="extension-action-output"');
+		expect(services).toContain("GetExtensionCatalog?:");
+		expect(services).toContain("InstallExtension?:");
+		expect(services).toContain('id: "mcp.codegraph"');
+		expect(types).toContain("export type ExtensionCatalogState");
+		expect(types).toContain("export type ExtensionOperationResult");
+		expect(app).toContain("applyWorkbenchState={setState}");
+		expect(css).toContain(".extension-center-page {");
+		expect(css).toContain(".extension-workspace {");
+		expect(css).toMatch(/@media \(max-width: 980px\)[\s\S]*?\.extension-workspace \{[\s\S]*?grid-template-columns: 1fr;/);
+		expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.extension-list \{[\s\S]*?grid-template-columns: 1fr;/);
 	});
 
 	test("renders generated office artifacts without treating available files as edits", async () => {

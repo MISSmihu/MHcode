@@ -14,6 +14,7 @@ import (
 	"github.com/MISSmihu/MHcode/internal/automation"
 	"github.com/MISSmihu/MHcode/internal/browserengine"
 	"github.com/MISSmihu/MHcode/internal/computercontrol"
+	"github.com/MISSmihu/MHcode/internal/extensions"
 	"github.com/MISSmihu/MHcode/internal/storage"
 	"github.com/MISSmihu/MHcode/internal/terminal"
 	"github.com/MISSmihu/MHcode/internal/vault"
@@ -32,6 +33,7 @@ type App struct {
 	git               workspacegit.Service
 	updater           *appupdate.Service
 	automations       *automation.Service
+	extensions        *extensions.Service
 	runtimeSettingsMu sync.RWMutex
 	runtimeSettings   agent.RuntimeSettings
 }
@@ -58,6 +60,7 @@ func NewApp() *App {
 			CacheDir:       updateCacheDir(),
 		}),
 		automations: automations,
+		extensions:  newExtensionService(),
 	}
 	app.service = agent.NewService(agent.ServiceConfig{
 		AppVersion:             appVersion,
