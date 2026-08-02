@@ -638,11 +638,20 @@ func resolveStructuredSearchRoot(policy SandboxPolicy, input string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("cannot access search path: %w", err)
 	}
+	resolved = normalizeResolvedSearchRoot(root, resolved)
 	resolved, err = policy.ResolveReadPath(resolved)
 	if err != nil {
 		return "", fmt.Errorf("resolved search path is outside the allowed roots: %w", err)
 	}
 	return filepath.Clean(resolved), nil
+}
+
+func normalizeResolvedSearchRoot(original, resolved string) string {
+	resolved = filepath.Clean(resolved)
+	if filepath.IsAbs(resolved) {
+		return resolved
+	}
+	return filepath.Clean(original)
 }
 
 func stableSearchPath(policy SandboxPolicy, absolutePath string) string {
