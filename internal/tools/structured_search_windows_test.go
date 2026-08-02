@@ -19,6 +19,17 @@ func TestNormalizeResolvedSearchRootKeepsAbsoluteWindowsRoot(t *testing.T) {
 	}
 }
 
+func TestSearchRelativePathRejectsEscapingWindowsPaths(t *testing.T) {
+	for _, relative := range []string{`..`, `..\outside\file.go`, `C:\outside\file.go`} {
+		if searchRelativePathStaysWithinRoot(relative) {
+			t.Fatalf("escaping relative path %q was accepted", relative)
+		}
+	}
+	if !searchRelativePathStaysWithinRoot(filepath.Join("src", "文件.go")) {
+		t.Fatal("workspace-relative path was rejected")
+	}
+}
+
 func TestStructuredSearchWindowsUnicodeWorkspace(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "Windows 中文 项目")
 	path := filepath.Join(root, "目录 含空格", "代码.go")
