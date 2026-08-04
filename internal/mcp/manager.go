@@ -47,6 +47,18 @@ type ServerConfig struct {
 	ToolResultPolicy string
 	WorkspaceRoot    string
 	AllowNetwork     bool
+	Vision           VisionToolConfig
+}
+
+type VisionToolConfig struct {
+	Enabled           bool
+	ToolName          string
+	ImageArgument     string
+	PromptArgument    string
+	MIMETypeArgument  string
+	FileNameArgument  string
+	InputMode         string
+	AllowRemoteImages bool
 }
 
 type ServerStatus struct {
@@ -159,7 +171,7 @@ func (m *Manager) connectServer(ctx context.Context, config ServerConfig, key st
 		return server
 	}
 
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "mhcode", Title: "MHcode", Version: "0.3.19"}, &sdkmcp.ClientOptions{
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "mhcode", Title: "MHcode", Version: "0.3.20"}, &sdkmcp.ClientOptions{
 		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		KeepAlive: 30 * time.Second,
 		ToolListChangedHandler: func(context.Context, *sdkmcp.ToolListChangedRequest) {
@@ -277,6 +289,8 @@ func fetchServerTools(ctx context.Context, session *sdkmcp.ClientSession, config
 		schema, _ := json.Marshal(tool.InputSchema)
 		descriptors = append(descriptors, ToolDescriptor{
 			Name:            namespacedToolName(config.ID, tool.Name),
+			RemoteName:      tool.Name,
+			Description:     strings.TrimSpace(tool.Description),
 			InputSchemaHash: HashSchema(string(schema)),
 			OutputPolicy:    config.ToolResultPolicy,
 		})
@@ -396,6 +410,25 @@ func normalizeServerConfigs(configs []ServerConfig) []ServerConfig {
 		config.URL = strings.TrimSpace(config.URL)
 		config.WorkingDirectory = strings.TrimSpace(config.WorkingDirectory)
 		config.WorkspaceRoot = strings.TrimSpace(config.WorkspaceRoot)
+		config.Vision.ToolName = strings.TrimSpace(config.Vision.ToolName)
+		config.Vision.ImageArgument = strings.TrimSpace(config.Vision.ImageArgument)
+		if config.Vision.ImageArgument == "" {
+			config.Vision.ImageArgument = "image"
+		}
+		config.Vision.PromptArgument = strings.TrimSpace(config.Vision.PromptArgument)
+		if config.Vision.PromptArgument == "" {
+			config.Vision.PromptArgument = "prompt"
+		}
+		config.Vision.MIMETypeArgument = strings.TrimSpace(config.Vision.MIMETypeArgument)
+		config.Vision.FileNameArgument = strings.TrimSpace(config.Vision.FileNameArgument)
+		switch config.Vision.InputMode {
+		case "base64", "data-url":
+		default:
+			config.Vision.InputMode = "data-url"
+		}
+		if config.Vision.ToolName == "" {
+			config.Vision.Enabled = false
+		}
 		if strings.HasPrefix(config.Command, "builtin:") {
 			config.Transport = TransportBuiltin
 		}

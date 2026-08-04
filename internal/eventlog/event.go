@@ -205,6 +205,8 @@ type MessageAttachment struct {
 	Data           string `json:"data"`
 	Size           int    `json:"size,omitempty"`
 	CharacterCount int    `json:"characterCount,omitempty"`
+	VisualAnalysis string `json:"visualAnalysis,omitempty"`
+	VisualTool     string `json:"visualTool,omitempty"`
 }
 
 // MessagePart 对齐前端/tools 的结构化片段，供 Timeline 与重建对话使用。

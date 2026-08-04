@@ -537,7 +537,7 @@ func (s *Service) rebuildSessionFromEvents() {
 		case eventlog.EventUserMessage:
 			teamFailureAwaitingTerminal = false
 			attachments := fromEventAttachments(ev.Payload.Attachments)
-			if context := markdownReferenceRequestContext(attachments); context != "" {
+			if context := attachmentReferenceRequestContext(attachments); context != "" {
 				rebuilt = append(rebuilt, protocol.Message{
 					Role: "user", Content: context, InternalKind: contextRequestKind,
 				})
@@ -771,6 +771,7 @@ func toEventAttachments(attachments []ChatAttachment) []eventlog.MessageAttachme
 		converted = append(converted, eventlog.MessageAttachment{
 			Kind: attachment.Kind, Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
 			Size: attachment.Size, CharacterCount: attachment.CharacterCount,
+			VisualAnalysis: attachment.VisualAnalysis, VisualTool: attachment.VisualTool,
 		})
 	}
 	return converted
@@ -785,6 +786,7 @@ func fromEventAttachments(attachments []eventlog.MessageAttachment) []ChatAttach
 		converted = append(converted, ChatAttachment{
 			Kind: attachment.Kind, Name: attachment.Name, MIMEType: attachment.MIMEType, Data: attachment.Data,
 			Size: attachment.Size, CharacterCount: attachment.CharacterCount,
+			VisualAnalysis: attachment.VisualAnalysis, VisualTool: attachment.VisualTool,
 		})
 	}
 	return converted

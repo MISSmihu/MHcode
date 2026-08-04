@@ -15,8 +15,10 @@ import (
 	"testing"
 
 	"github.com/MISSmihu/MHcode/internal/eventlog"
+	"github.com/MISSmihu/MHcode/internal/mcp"
 	"github.com/MISSmihu/MHcode/internal/protocol"
 	"github.com/MISSmihu/MHcode/internal/tools"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type scriptedCompletion struct {
@@ -1141,6 +1143,56 @@ func TestToolLoopFeedsScreenshotAttachmentToNextModelCall(t *testing.T) {
 	}, nil)
 	if err != nil || outcome.Content != "image inspected" || completionCalls != 2 {
 		t.Fatalf("outcome = %#v, calls = %d, err = %v", outcome, completionCalls, err)
+	}
+}
+
+func TestTextOnlyRouteAnalyzesToolImageThroughMCP(t *testing.T) {
+	visionServer := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "vision-test", Version: "1.0.0"}, nil)
+	var calls atomic.Int32
+	sdkmcp.AddTool(visionServer, &sdkmcp.Tool{Name: "inspect_image"}, func(_ context.Context, _ *sdkmcp.CallToolRequest, input struct {
+		Image  string `json:"image"`
+		Prompt string `json:"prompt"`
+	}) (*sdkmcp.CallToolResult, any, error) {
+		calls.Add(1)
+		if !strings.HasPrefix(input.Image, "data:image/png;base64,") || !strings.Contains(input.Prompt, "capture_image") {
+			return nil, nil, fmt.Errorf("unexpected vision request: %#v", input)
+		}
+		return &sdkmcp.CallToolResult{Content: []sdkmcp.Content{
+			&sdkmcp.TextContent{Text: "截图显示保存按钮被遮挡"},
+		}}, nil, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return visionServer }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	manager := mcp.NewManager()
+	defer manager.Close()
+	statuses := manager.Configure(context.Background(), []mcp.ServerConfig{{
+		ID: "vision", Name: "Vision", Transport: mcp.TransportStreamableHTTP, URL: httpServer.URL,
+		Enabled: true, AllowNetwork: true, ToolResultPolicy: "summary-first",
+		Vision: mcp.VisionToolConfig{
+			Enabled: true, ToolName: "inspect_image", ImageArgument: "image", PromptArgument: "prompt",
+			InputMode: "data-url", AllowRemoteImages: true,
+		},
+	}})
+	if len(statuses) != 1 || statuses[0].State != "ready" {
+		t.Fatalf("vision MCP statuses = %#v", statuses)
+	}
+
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir()})
+	service.mcpManager = manager
+	service.runtimeSettings.Model = ModelSettings{
+		SelectedProviderID: "local-text", SelectedModelID: "deepseek-chat",
+		Providers: []ModelProviderSetting{{
+			ID: "local-text", Name: "Local text", Protocol: "local", BaseURL: "http://127.0.0.1:11434/v1",
+			Enabled: true, Models: []ProviderModel{{ID: "deepseek-chat"}},
+		}},
+	}
+	feedback, attachments := service.bridgeToolResultImages(context.Background(), "capture_image", []tools.Attachment{{
+		Name: "capture.png", MIMEType: "image/png", Data: "aGVsbG8=",
+	}})
+	if calls.Load() != 1 || len(attachments) != 0 || !strings.Contains(feedback, "保存按钮被遮挡") {
+		t.Fatalf("calls=%d feedback=%q attachments=%#v", calls.Load(), feedback, attachments)
 	}
 }
 

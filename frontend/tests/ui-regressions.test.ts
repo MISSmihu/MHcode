@@ -17,6 +17,21 @@ describe("chat UI regressions", () => {
     expect(messageContent).toContain('return "代码关系分析"');
   });
 
+  test("provides an explicit MCP vision bridge with remote image consent", async () => {
+    const [panels, workbench, types] = await Promise.all([
+      Bun.file(new URL("../src/settings-panels.tsx", import.meta.url)).text(),
+      Bun.file(new URL("../src/services/workbench.ts", import.meta.url)).text(),
+      Bun.file(new URL("../src/types.ts", import.meta.url)).text(),
+    ]);
+    expect(types).toContain("export type MCPVisionSetting");
+    expect(types).toContain("allowRemoteImages: boolean");
+    expect(workbench).toContain("normalizeMCPVisionSetting(server.vision)");
+    expect(panels).toContain('title="作为视觉辅助工具"');
+    expect(panels).toContain('title="视觉工具"');
+    expect(panels).toContain('title="允许上传图片到远程 MCP"');
+    expect(panels).toContain("远程上传授权仅作用于这个 MCP 服务器");
+  });
+
   test("uses a theme-aware frameless title bar with complete window controls", async () => {
     const [main, app, titlebar, workbench, css] = await Promise.all([
       Bun.file(new URL("../../main.go", import.meta.url)).text(),

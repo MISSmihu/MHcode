@@ -10,6 +10,8 @@ import (
 
 type ToolDescriptor struct {
 	Name            string `json:"name"`
+	RemoteName      string `json:"remoteName,omitempty"`
+	Description     string `json:"description,omitempty"`
 	InputSchemaHash string `json:"inputSchemaHash"`
 	OutputPolicy    string `json:"outputPolicy"`
 }

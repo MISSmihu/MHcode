@@ -106,6 +106,8 @@ type ChatAttachment struct {
 	Data           string `json:"data"`
 	Size           int    `json:"size,omitempty"`
 	CharacterCount int    `json:"characterCount,omitempty"`
+	VisualAnalysis string `json:"-"`
+	VisualTool     string `json:"-"`
 }
 
 type DeepSeekState struct {
@@ -1038,11 +1040,16 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if err != nil {
 		return ChatResult{State: s.workbenchStateLocked()}, err
 	}
-	if hasImageChatAttachments(attachments) && strings.EqualFold(route.Provider.Protocol, "deepseek") {
-		return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, errors.New("当前 DeepSeek 原生协议不支持图片输入，请切换到支持视觉的 OpenAI-compatible、Anthropic 或 Gemini 模型")
+	if hasImageChatAttachments(attachments) && routeRequiresVisionBridge(route) {
+		timing.Start("vision", "正在调用 MCP 视觉辅助", route.ModelID)
+		attachments, err = s.bridgeChatImagesWithMCP(ctx, prompt, attachments, sink)
+		if err != nil {
+			return ChatResult{State: s.workbenchStateLocked(), Model: route.ModelID}, err
+		}
 	}
 	timing.Start("context", "\u6b63\u5728\u7ec4\u88c5\u9879\u76ee\u4e0a\u4e0b\u6587", route.ModelID)
 	preview := withMarkdownReferenceDocuments(s.contextPreviewForInputLocked(prompt), attachments)
+	preview = withVisualAttachmentAnalyses(preview, attachments)
 	preview = withTurnTaskScopeContext(preview, turnTaskScopeFrom(ctx), s.runtimeSettings.WorkspaceRoot)
 	thinkingMode, reasoningEffort := s.thinkingConfigForRoute(route)
 	s.ensureProviderSession(route, preview, thinkingMode, reasoningEffort)
@@ -1159,7 +1166,7 @@ func (s *Service) sendChatMessage(ctx context.Context, prompt string, rawAttachm
 	if !resumeTeamRun {
 		s.recordUserEventWithAttachments(prompt, attachments)
 	}
-	requestMessages := cloneProtocolMessages(s.sessionMessages)
+	requestMessages := protocolMessagesForRoute(cloneProtocolMessages(s.sessionMessages), route)
 	prefixDiagnostic := s.compareRequestPrefix(requestMessages)
 
 	chatProvider, err := s.chatProviderWithFallback(route, sink)
@@ -1387,6 +1394,16 @@ func (s *Service) mcpServerConfigs() []mcp.ServerConfig {
 			ToolResultPolicy: server.ToolResultPolicy,
 			WorkspaceRoot:    settings.WorkspaceRoot,
 			AllowNetwork:     settings.NetworkAccess,
+			Vision: mcp.VisionToolConfig{
+				Enabled:           server.Vision.Enabled,
+				ToolName:          server.Vision.ToolName,
+				ImageArgument:     server.Vision.ImageArgument,
+				PromptArgument:    server.Vision.PromptArgument,
+				MIMETypeArgument:  server.Vision.MIMETypeArgument,
+				FileNameArgument:  server.Vision.FileNameArgument,
+				InputMode:         server.Vision.InputMode,
+				AllowRemoteImages: server.Vision.AllowRemoteImages,
+			},
 		})
 	}
 	return configs
@@ -1848,6 +1865,9 @@ func protocolAttachments(attachments []ChatAttachment) []protocol.Attachment {
 	converted := make([]protocol.Attachment, 0, len(attachments))
 	for _, attachment := range attachments {
 		if chatAttachmentKind(attachment) != chatAttachmentKindImage {
+			continue
+		}
+		if strings.TrimSpace(attachment.VisualAnalysis) != "" {
 			continue
 		}
 		converted = append(converted, protocol.Attachment{

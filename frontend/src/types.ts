@@ -118,6 +118,8 @@ export type ExtensionActionResult = {
 
 export type ToolDescriptor = {
   name: string;
+  remoteName?: string;
+  description?: string;
   inputSchemaHash: string;
   outputPolicy: string;
 };
@@ -620,6 +622,17 @@ export type MCPSettings = {
   servers: MCPServerSetting[];
 };
 
+export type MCPVisionSetting = {
+  enabled: boolean;
+  toolName: string;
+  imageArgument: string;
+  promptArgument: string;
+  mimeTypeArgument?: string;
+  fileNameArgument?: string;
+  inputMode: "data-url" | "base64" | string;
+  allowRemoteImages: boolean;
+};
+
 export type MCPServerSetting = {
   id: string;
   name: string;
@@ -633,6 +646,7 @@ export type MCPServerSetting = {
   headers: KeyValue[];
   enabled: boolean;
   toolResultPolicy: "summary-first" | "balanced" | "raw-local" | string;
+  vision: MCPVisionSetting;
   schemaSnapshotHash?: string;
   lastSnapshotAt?: string;
 };

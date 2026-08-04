@@ -606,7 +606,7 @@ export function onMCPState(handler: (state: WorkbenchState) => void): () => void
 
 const fallbackAppInfo: AppInfo = {
   name: "MHcode",
-  version: "0.3.19",
+  version: "0.3.20",
   goVersion: "浏览器预览",
   operatingSystem: "web",
   architecture: "preview",
@@ -1074,6 +1074,7 @@ export async function installExtension(id: string): Promise<ExtensionOperationRe
 					headers: [],
 					enabled: true,
 					toolResultPolicy: "summary-first",
+					vision: defaultMCPVisionSetting(),
 				}]},
 			},
 		};
@@ -1997,6 +1998,38 @@ function pendingCacheHealth() {
   };
 }
 
+function defaultMCPVisionSetting(): RuntimeSettings["mcp"]["servers"][number]["vision"] {
+  return {
+    enabled: false,
+    toolName: "",
+    imageArgument: "image",
+    promptArgument: "prompt",
+    mimeTypeArgument: "",
+    fileNameArgument: "",
+    inputMode: "data-url",
+    allowRemoteImages: false,
+  };
+}
+
+function normalizeMCPVisionSetting(
+  value: Partial<RuntimeSettings["mcp"]["servers"][number]["vision"]> | null | undefined,
+): RuntimeSettings["mcp"]["servers"][number]["vision"] {
+  const defaults = defaultMCPVisionSetting();
+  const toolName = String(value?.toolName ?? "").trim();
+  return {
+    ...defaults,
+    ...value,
+    enabled: Boolean(value?.enabled && toolName),
+    toolName,
+    imageArgument: String(value?.imageArgument ?? defaults.imageArgument).trim() || defaults.imageArgument,
+    promptArgument: String(value?.promptArgument ?? defaults.promptArgument).trim() || defaults.promptArgument,
+    mimeTypeArgument: String(value?.mimeTypeArgument ?? "").trim(),
+    fileNameArgument: String(value?.fileNameArgument ?? "").trim(),
+    inputMode: value?.inputMode === "base64" ? "base64" : "data-url",
+    allowRemoteImages: Boolean(value?.allowRemoteImages),
+  };
+}
+
 function defaultRuntimeSettings(): RuntimeSettings {
   return {
     sandboxMode: "workspace-write",
@@ -2076,6 +2109,7 @@ function defaultRuntimeSettings(): RuntimeSettings {
           headers: [],
           enabled: true,
           toolResultPolicy: "summary-first",
+          vision: defaultMCPVisionSetting(),
         },
       ],
     },
@@ -2279,6 +2313,7 @@ function normalizeRuntimeSettings(settings: RuntimeSettings): RuntimeSettings {
           ? server.headers.map((item) => ({ key: item.key.trim(), value: item.value.trim() })).filter((item) => item.key)
           : [],
         toolResultPolicy: server.toolResultPolicy || "summary-first",
+        vision: normalizeMCPVisionSetting(server.vision),
       })),
     },
 		plugins: {

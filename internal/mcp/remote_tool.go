@@ -2,9 +2,13 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/MISSmihu/MHcode/internal/tools"
@@ -75,6 +79,10 @@ func (t *RemoteTool) argumentsForCall(rawArgs json.RawMessage) (map[string]any, 
 }
 
 func (m *Manager) callTool(ctx context.Context, serverID, remoteName, displayName string, arguments map[string]any, rawArgs json.RawMessage, workingDirectory string) (tools.Result, error) {
+	return m.callToolWithDisplay(ctx, serverID, remoteName, displayName, arguments, rawArgs, workingDirectory, "")
+}
+
+func (m *Manager) callToolWithDisplay(ctx context.Context, serverID, remoteName, displayName string, arguments map[string]any, rawArgs json.RawMessage, workingDirectory, displayInput string) (tools.Result, error) {
 	m.mu.RLock()
 	server := m.servers[serverID]
 	if server == nil || server.session == nil || server.status.State != "ready" {
@@ -84,7 +92,10 @@ func (m *Manager) callTool(ctx context.Context, serverID, remoteName, displayNam
 	session := server.session
 	resultPolicy := server.config.ToolResultPolicy
 	m.mu.RUnlock()
-	input := remoteToolInputForDisplay(remoteName, arguments)
+	input := strings.TrimSpace(displayInput)
+	if input == "" {
+		input = remoteToolInputForDisplay(remoteName, arguments)
+	}
 	if input == "" {
 		input = truncateText(string(rawArgs), 1200)
 	}
@@ -103,9 +114,21 @@ func (m *Manager) callTool(ctx context.Context, serverID, remoteName, displayNam
 			server.status.Message = truncateText(err.Error(), 1200)
 		}
 		m.mu.Unlock()
+		tools.EmitProgress(ctx, tools.ResultPart{
+			Kind:             tools.PartToolCall,
+			Name:             displayName,
+			Status:           "error",
+			Input:            input,
+			Output:           truncateText(err.Error(), 1200),
+			WorkingDirectory: workingDirectory,
+		})
 		return tools.Result{}, err
 	}
 	summary := summarizeCallToolResult(result, resultPolicy)
+	attachments, attachmentWarnings := callToolResultAttachments(result)
+	if len(attachmentWarnings) > 0 {
+		summary = strings.TrimSpace(summary + "\n" + strings.Join(attachmentWarnings, "\n"))
+	}
 	status := "ok"
 	if result.IsError {
 		status = "error"
@@ -121,6 +144,7 @@ func (m *Manager) callTool(ctx context.Context, serverID, remoteName, displayNam
 			Output:           summary,
 			WorkingDirectory: workingDirectory,
 		}},
+		Attachments: attachments,
 	}, nil
 }
 
@@ -139,7 +163,101 @@ func remoteToolInputForDisplay(remoteName string, arguments map[string]any) stri
 			return strings.TrimSpace(value)
 		}
 	}
+	for _, value := range arguments {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		text = strings.TrimSpace(text)
+		if strings.HasPrefix(strings.ToLower(text), "data:image/") || looksLikeLargeBase64(text) {
+			return "包含图片或二进制数据（已隐藏）"
+		}
+	}
 	return ""
+}
+
+const maxMCPImageAttachmentBytes = 8 * 1024 * 1024
+
+func callToolResultAttachments(result *sdkmcp.CallToolResult) ([]tools.Attachment, []string) {
+	if result == nil {
+		return nil, nil
+	}
+	attachments := make([]tools.Attachment, 0, len(result.Content))
+	warnings := make([]string, 0)
+	imageIndex := 0
+	for _, content := range result.Content {
+		var name, mimeType string
+		var data []byte
+		switch item := content.(type) {
+		case *sdkmcp.ImageContent:
+			if item == nil {
+				continue
+			}
+			imageIndex++
+			mimeType = strings.ToLower(strings.TrimSpace(item.MIMEType))
+			data = item.Data
+			name = generatedMCPImageName(imageIndex, mimeType)
+		case *sdkmcp.EmbeddedResource:
+			if item == nil || item.Resource == nil {
+				continue
+			}
+			mimeType = strings.ToLower(strings.TrimSpace(item.Resource.MIMEType))
+			if !strings.HasPrefix(mimeType, "image/") || len(item.Resource.Blob) == 0 {
+				continue
+			}
+			imageIndex++
+			data = item.Resource.Blob
+			name = mcpResourceName(item.Resource.URI, imageIndex, mimeType)
+		default:
+			continue
+		}
+		if !strings.HasPrefix(mimeType, "image/") {
+			warnings = append(warnings, fmt.Sprintf("MCP 返回了未声明为图片的内容 %q，已忽略", mimeType))
+			continue
+		}
+		if len(data) == 0 {
+			warnings = append(warnings, fmt.Sprintf("MCP 返回的图片 %s 为空，已忽略", name))
+			continue
+		}
+		if len(data) > maxMCPImageAttachmentBytes {
+			warnings = append(warnings, fmt.Sprintf("MCP 返回的图片 %s 超过 8 MiB，已忽略", name))
+			continue
+		}
+		attachments = append(attachments, tools.Attachment{
+			Name: name, MIMEType: mimeType, Data: base64.StdEncoding.EncodeToString(data),
+		})
+	}
+	return attachments, warnings
+}
+
+func generatedMCPImageName(index int, mimeType string) string {
+	extension := ".png"
+	if extensions, err := mime.ExtensionsByType(mimeType); err == nil && len(extensions) > 0 {
+		extension = extensions[0]
+	}
+	return fmt.Sprintf("mcp-image-%d%s", index, extension)
+}
+
+func mcpResourceName(rawURI string, index int, mimeType string) string {
+	if parsed, err := url.Parse(strings.TrimSpace(rawURI)); err == nil {
+		if base := strings.TrimSpace(path.Base(parsed.Path)); base != "" && base != "." && base != "/" {
+			return base
+		}
+	}
+	return generatedMCPImageName(index, mimeType)
+}
+
+func looksLikeLargeBase64(value string) bool {
+	if len(value) < 512 {
+		return false
+	}
+	for _, char := range value[:512] {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '+' || char == '/' || char == '=' || char == '\r' || char == '\n' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func summarizeCallToolResult(result *sdkmcp.CallToolResult, policy string) string {
@@ -155,6 +273,19 @@ func summarizeCallToolResult(result *sdkmcp.CallToolResult, policy string) strin
 			}
 		case *sdkmcp.ResourceLink:
 			parts = append(parts, fmt.Sprintf("resource: %s", item.URI))
+		case *sdkmcp.EmbeddedResource:
+			if item == nil || item.Resource == nil {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(item.Resource.MIMEType)), "image/") && len(item.Resource.Blob) > 0 {
+				parts = append(parts, fmt.Sprintf("image resource: %s (%s, %d bytes)", item.Resource.URI, item.Resource.MIMEType, len(item.Resource.Blob)))
+				continue
+			}
+			if text := strings.TrimSpace(item.Resource.Text); text != "" {
+				parts = append(parts, text)
+			} else {
+				parts = append(parts, fmt.Sprintf("resource: %s", item.Resource.URI))
+			}
 		case *sdkmcp.ImageContent:
 			parts = append(parts, fmt.Sprintf("image: %s (%d bytes)", item.MIMEType, len(item.Data)))
 		case *sdkmcp.AudioContent:

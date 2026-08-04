@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+
+	"github.com/MISSmihu/MHcode/internal/protocol"
 )
 
 func TestNormalizeChatAttachments(t *testing.T) {
@@ -113,5 +115,61 @@ func TestMarkdownAttachmentPersistsAndRebuildsPrivateContext(t *testing.T) {
 	history := reloaded.GetSessionMessages()
 	if len(history) != 1 || len(history[0].Attachments) != 1 || history[0].Attachments[0].CharacterCount == 0 {
 		t.Fatalf("restored visible history = %#v", history)
+	}
+}
+
+func TestVisualAnalysisPersistsAndRebuildsTextOnlyContext(t *testing.T) {
+	sessions := t.TempDir()
+	config := ServiceConfig{SkillsDir: t.TempDir(), SessionsDir: sessions}
+	service := NewService(config)
+	attachment := ChatAttachment{
+		Kind: chatAttachmentKindImage, Name: "settings.png", MIMEType: "image/png", Data: "aGVsbG8=",
+		VisualAnalysis: "设置页右侧的保存按钮被底部栏遮挡。", VisualTool: "mcp__vision__inspect_image",
+	}
+	service.recordUserEventWithAttachments("看看这个界面", []ChatAttachment{attachment})
+
+	reloaded := NewService(config)
+	if len(reloaded.sessionMessages) != 2 {
+		t.Fatalf("restored protocol messages = %#v", reloaded.sessionMessages)
+	}
+	privateContext := reloaded.sessionMessages[0]
+	if privateContext.InternalKind != contextRequestKind ||
+		!strings.Contains(privateContext.Content, "设置页右侧的保存按钮被底部栏遮挡") ||
+		!strings.Contains(privateContext.Content, "mcp__vision__inspect_image") {
+		t.Fatalf("restored visual context = %#v", privateContext)
+	}
+	if len(reloaded.sessionMessages[1].Attachments) != 0 {
+		t.Fatalf("text-only rebuilt message retained raw image: %#v", reloaded.sessionMessages[1])
+	}
+	history := reloaded.GetSessionMessages()
+	if len(history) != 1 || len(history[0].Attachments) != 1 {
+		t.Fatalf("visible history = %#v", history)
+	}
+	restored := history[0].Attachments[0]
+	if restored.VisualAnalysis != attachment.VisualAnalysis || restored.VisualTool != attachment.VisualTool || restored.Data != attachment.Data {
+		t.Fatalf("restored visual attachment = %#v", restored)
+	}
+}
+
+func TestProtocolMessagesForTextRouteDropsImagesWithoutMutatingSession(t *testing.T) {
+	original := []protocol.Message{{
+		Role: "user", Content: "inspect",
+		Attachments: []protocol.Attachment{{Name: "screen.png", MIMEType: "image/png", Data: "aGVsbG8="}},
+	}}
+	filtered := protocolMessagesForRoute(cloneProtocolMessages(original), chatRoute{
+		Provider: ModelProviderSetting{Protocol: "deepseek-official"}, ModelID: "deepseek-chat",
+	})
+	if len(filtered[0].Attachments) != 0 {
+		t.Fatalf("text route attachments = %#v", filtered[0].Attachments)
+	}
+	if len(original[0].Attachments) != 1 {
+		t.Fatalf("session messages were mutated: %#v", original)
+	}
+
+	multimodal := protocolMessagesForRoute(cloneProtocolMessages(original), chatRoute{
+		Provider: ModelProviderSetting{Protocol: "anthropic"}, ModelID: "claude-opus-5",
+	})
+	if len(multimodal[0].Attachments) != 1 {
+		t.Fatalf("multimodal route lost image: %#v", multimodal)
 	}
 }

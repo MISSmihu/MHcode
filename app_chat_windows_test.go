@@ -274,8 +274,12 @@ func windowsProcessIsRunning(pid uint32) bool {
 	if err != nil {
 		return false
 	}
-	_ = windows.CloseHandle(handle)
-	return true
+	defer windows.CloseHandle(handle)
+	var exitCode uint32
+	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return false
+	}
+	return exitCode == 259
 }
 
 func waitForWindowsProcessExit(t *testing.T, pid uint32, timeout time.Duration) {

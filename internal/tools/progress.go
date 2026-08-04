@@ -17,6 +17,14 @@ func WithProgressSink(ctx context.Context, sink ProgressSink) context.Context {
 	return context.WithValue(ctx, progressSinkKey{}, sink)
 }
 
+func ProgressSinkFromContext(ctx context.Context) ProgressSink {
+	if ctx == nil {
+		return nil
+	}
+	sink, _ := ctx.Value(progressSinkKey{}).(ProgressSink)
+	return sink
+}
+
 // EmitProgress publishes a best-effort transient update for a running tool.
 func EmitProgress(ctx context.Context, part ResultPart) {
 	if ctx == nil {

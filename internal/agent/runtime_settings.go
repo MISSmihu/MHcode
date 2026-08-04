@@ -45,7 +45,7 @@ type RuntimeSettings struct {
 	Memory                 MemorySettings          `json:"memory"`
 }
 
-const runtimeSettingsSchemaVersion = 13
+const runtimeSettingsSchemaVersion = 14
 
 type SkillsSettings struct {
 	Disabled []string `json:"disabled"`
@@ -120,20 +120,32 @@ type MCPSettings struct {
 }
 
 type MCPServerSetting struct {
-	ID                 string     `json:"id"`
-	Name               string     `json:"name"`
-	Transport          string     `json:"transport"`
-	Command            string     `json:"command"`
-	Args               []string   `json:"args"`
-	Env                []KeyValue `json:"env"`
-	PassEnvironment    []string   `json:"passEnvironment"`
-	WorkingDirectory   string     `json:"workingDirectory"`
-	URL                string     `json:"url"`
-	Headers            []KeyValue `json:"headers"`
-	Enabled            bool       `json:"enabled"`
-	ToolResultPolicy   string     `json:"toolResultPolicy"`
-	SchemaSnapshotHash string     `json:"schemaSnapshotHash,omitempty"`
-	LastSnapshotAt     string     `json:"lastSnapshotAt,omitempty"`
+	ID                 string           `json:"id"`
+	Name               string           `json:"name"`
+	Transport          string           `json:"transport"`
+	Command            string           `json:"command"`
+	Args               []string         `json:"args"`
+	Env                []KeyValue       `json:"env"`
+	PassEnvironment    []string         `json:"passEnvironment"`
+	WorkingDirectory   string           `json:"workingDirectory"`
+	URL                string           `json:"url"`
+	Headers            []KeyValue       `json:"headers"`
+	Enabled            bool             `json:"enabled"`
+	ToolResultPolicy   string           `json:"toolResultPolicy"`
+	Vision             MCPVisionSetting `json:"vision"`
+	SchemaSnapshotHash string           `json:"schemaSnapshotHash,omitempty"`
+	LastSnapshotAt     string           `json:"lastSnapshotAt,omitempty"`
+}
+
+type MCPVisionSetting struct {
+	Enabled           bool   `json:"enabled"`
+	ToolName          string `json:"toolName"`
+	ImageArgument     string `json:"imageArgument"`
+	PromptArgument    string `json:"promptArgument"`
+	MIMETypeArgument  string `json:"mimeTypeArgument,omitempty"`
+	FileNameArgument  string `json:"fileNameArgument,omitempty"`
+	InputMode         string `json:"inputMode"`
+	AllowRemoteImages bool   `json:"allowRemoteImages"`
 }
 
 type KeyValue struct {
@@ -277,6 +289,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 					PassEnvironment:  []string{},
 					Enabled:          true,
 					ToolResultPolicy: "summary-first",
+					Vision:           defaultMCPVisionSetting(),
 				},
 			},
 		},
@@ -815,9 +828,41 @@ func normalizeMCPSettings(settings MCPSettings, defaults MCPSettings) MCPSetting
 			"balanced":      true,
 			"raw-local":     true,
 		})
+		server.Vision = normalizeMCPVisionSetting(server.Vision)
 		cleaned = append(cleaned, server)
 	}
 	settings.Servers = cleaned
+	return settings
+}
+
+func defaultMCPVisionSetting() MCPVisionSetting {
+	return MCPVisionSetting{
+		ImageArgument:  "image",
+		PromptArgument: "prompt",
+		InputMode:      "data-url",
+	}
+}
+
+func normalizeMCPVisionSetting(settings MCPVisionSetting) MCPVisionSetting {
+	defaults := defaultMCPVisionSetting()
+	settings.ToolName = strings.TrimSpace(settings.ToolName)
+	settings.ImageArgument = strings.TrimSpace(settings.ImageArgument)
+	if settings.ImageArgument == "" {
+		settings.ImageArgument = defaults.ImageArgument
+	}
+	settings.PromptArgument = strings.TrimSpace(settings.PromptArgument)
+	if settings.PromptArgument == "" {
+		settings.PromptArgument = defaults.PromptArgument
+	}
+	settings.MIMETypeArgument = strings.TrimSpace(settings.MIMETypeArgument)
+	settings.FileNameArgument = strings.TrimSpace(settings.FileNameArgument)
+	settings.InputMode = normalizeChoice(settings.InputMode, defaults.InputMode, map[string]bool{
+		"data-url": true,
+		"base64":   true,
+	})
+	if settings.ToolName == "" {
+		settings.Enabled = false
+	}
 	return settings
 }
 

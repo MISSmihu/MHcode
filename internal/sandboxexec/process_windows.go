@@ -49,6 +49,24 @@ func startPlatformProcess(cmd *exec.Cmd, limits Limits) (*platformProcess, error
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
+	// exec.CommandContext normally cancels by killing only the root process.
+	// Route that callback through the Job Object so cancellation also reaches
+	// every descendant. A cancellation can race with Start, so hold the callback
+	// until the suspended process has either joined the Job Object or setup has
+	// failed; otherwise an empty job could be terminated just before assignment.
+	releaseCancellation := func() {}
+	if cmd.Cancel != nil {
+		containmentReady := make(chan struct{})
+		var readyOnce sync.Once
+		releaseCancellation = func() {
+			readyOnce.Do(func() { close(containmentReady) })
+		}
+		cmd.Cancel = func() error {
+			<-containmentReady
+			return control.terminate(cmd)
+		}
+	}
+	defer releaseCancellation()
 	var limitedToken windows.Token
 	if limits.RestrictPrivileges {
 		limitedToken, err = createLimitedUserToken()

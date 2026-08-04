@@ -10100,6 +10100,23 @@ body[data-theme="light"] .skill-document .code-block .hljs,
   max-width: none;
 }
 
+.mcp-vision-privacy-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 14px 12px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.mcp-vision-privacy-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--warning);
+}
+
 .mcp-server-editor-section > .settings-actions {
   position: sticky;
   bottom: -44px;

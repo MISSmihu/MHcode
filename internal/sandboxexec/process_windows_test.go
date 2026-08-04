@@ -3,6 +3,7 @@
 package sandboxexec
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -195,6 +196,76 @@ func TestWindowsJobObjectTerminatesDescendantProcess(t *testing.T) {
 	if windowsProcessRunning(uint32(childPID)) {
 		t.Fatalf("descendant process %d survived Job Object termination", childPID)
 	}
+}
+
+func TestWindowsCommandContextCancellationTerminatesDescendantProcess(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "context-child.pid")
+	quotedPIDFile := strings.ReplaceAll(pidFile, "'", "''")
+	script := fmt.Sprintf(
+		"$child = Start-Process powershell.exe -ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; [IO.File]::WriteAllText('%s', [string]$child.Id); Wait-Process -Id $child.Id",
+		quotedPIDFile,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-Command", script)
+	process, err := Start(cmd, Limits{MemoryBytes: 768 * 1024 * 1024, MaxProcesses: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = process.Terminate() }()
+	waited := make(chan error, 1)
+	go func() { waited <- process.Wait() }()
+
+	childPID := waitForWindowsChildPID(t, pidFile, waited)
+	if !windowsProcessRunning(childPID) {
+		t.Fatal("descendant process exited before context cancellation")
+	}
+
+	cancel()
+	select {
+	case waitErr := <-waited:
+		if waitErr == nil {
+			t.Fatal("cancelled command unexpectedly exited successfully")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("contained root process did not exit after context cancellation")
+	}
+	waitForWindowsProcessExit(t, childPID, 10*time.Second)
+}
+
+func waitForWindowsChildPID(t *testing.T, pidFile string, waited <-chan error) uint32 {
+	t.Helper()
+	deadline := time.NewTimer(15 * time.Second)
+	ticker := time.NewTicker(40 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		raw, err := os.ReadFile(pidFile)
+		if err == nil {
+			pid, parseErr := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 32)
+			if parseErr == nil && pid > 0 {
+				return uint32(pid)
+			}
+		}
+		select {
+		case waitErr := <-waited:
+			t.Fatalf("contained root process exited before descendant startup: %v", waitErr)
+		case <-deadline.C:
+			t.Fatal("descendant process did not start within 15 seconds")
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForWindowsProcessExit(t *testing.T, pid uint32, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !windowsProcessRunning(pid) {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	t.Fatalf("descendant process %d survived cancellation", pid)
 }
 
 func windowsProcessRunning(pid uint32) bool {

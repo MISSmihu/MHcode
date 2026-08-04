@@ -2489,6 +2489,17 @@ const mcpTransportOptions = [
   { value: "sse", label: "旧版 SSE" },
 ];
 
+const defaultMCPVisionSetting = (): MCPServerSetting["vision"] => ({
+  enabled: false,
+  toolName: "",
+  imageArgument: "image",
+  promptArgument: "prompt",
+  mimeTypeArgument: "",
+  fileNameArgument: "",
+  inputMode: "data-url",
+  allowRemoteImages: false,
+});
+
 function mcpStatusLabel(state?: string) {
   switch (state) {
     case "ready": return "运行中";
@@ -3112,7 +3123,34 @@ export function McpSettingsPanel(props: {
     () => props.runtimeDraft.mcp.servers.find((server) => server.id === activeServerID()) ?? props.runtimeDraft.mcp.servers[0],
   );
   const activeStatus = createMemo(() => props.statuses.find((status) => status.id === activeServer()?.id));
+  const activeSnapshot = createMemo(() => props.snapshots.find((snapshot) => snapshot.server === activeServer()?.id));
+  const visionToolOptions = createMemo(() => {
+    const server = activeServer();
+    if (!server) return [];
+    const prefix = `mcp__${server.id}__`;
+    const options = (activeSnapshot()?.tools ?? []).map((tool) => {
+      const remoteName = tool.remoteName?.trim() || (tool.name.startsWith(prefix) ? tool.name.slice(prefix.length) : tool.name);
+      return {
+        value: remoteName,
+        label: tool.description?.trim() ? `${remoteName} · ${tool.description.trim()}` : remoteName,
+      };
+    }).filter((option) => option.value);
+    const configured = server.vision?.toolName?.trim();
+    if (configured && !options.some((option) => option.value === configured)) {
+      options.unshift({ value: configured, label: `${configured} · 当前配置` });
+    }
+    return options;
+  });
   const statusFor = (id: string) => props.statuses.find((status) => status.id === id);
+  const updateVision = (server: MCPServerSetting, patch: Partial<MCPServerSetting["vision"]>) => {
+    updateServer(server.id, {
+      vision: { ...defaultMCPVisionSetting(), ...server.vision, ...patch },
+    });
+  };
+  const setVisionEnabled = (server: MCPServerSetting, enabled: boolean) => {
+    const toolName = server.vision?.toolName?.trim() || visionToolOptions()[0]?.value || "";
+    updateVision(server, { enabled, toolName });
+  };
 
   createEffect(() => {
     if (!props.runtimeDraft.mcp.servers.some((server) => server.id === activeServerID())) {
@@ -3138,6 +3176,7 @@ export function McpSettingsPanel(props: {
       headers: [],
       enabled: false,
       toolResultPolicy: "summary-first",
+      vision: defaultMCPVisionSetting(),
     };
     updateServers([...props.runtimeDraft.mcp.servers, server]);
     setActiveServerID(server.id);
@@ -3184,6 +3223,7 @@ export function McpSettingsPanel(props: {
       headers: [],
       enabled: true,
       toolResultPolicy: "summary-first",
+      vision: defaultMCPVisionSetting(),
     };
     updateServers([...props.runtimeDraft.mcp.servers, server]);
     setActiveServerID(server.id);
@@ -3440,6 +3480,127 @@ export function McpSettingsPanel(props: {
                   }
                 />
               </SettingsCard>
+
+              <Show when={server().transport !== "builtin"}>
+                <SettingsCard>
+                  <SettingsRow
+                    title="作为视觉辅助工具"
+                    description="文本模型收到图片时，先调用这里选择的 MCP 工具，再使用它返回的文字或结构化分析继续任务"
+                    control={
+                      <SwitchControl
+                        label="作为视觉辅助工具"
+                        checked={server().vision?.enabled ?? false}
+                        onChange={(value) => setVisionEnabled(server(), value)}
+                      />
+                    }
+                  />
+                  <SettingsRow
+                    title="视觉工具"
+                    description={visionToolOptions().length > 0 ? "工具名称来自当前服务器的 schema 快照" : "保存并刷新服务器后读取可选工具"}
+                    control={
+                      <select
+                        class="settings-select"
+                        value={server().vision?.toolName ?? ""}
+                        onChange={(event) => updateVision(server(), {
+                          toolName: event.currentTarget.value,
+                          enabled: Boolean(event.currentTarget.value) && (server().vision?.enabled ?? false),
+                        })}
+                      >
+                        <option value="">选择工具</option>
+                        <For each={visionToolOptions()}>
+                          {(option) => <option value={option.value}>{option.label}</option>}
+                        </For>
+                      </select>
+                    }
+                  />
+
+                  <Show when={server().vision?.toolName || server().vision?.enabled}>
+                    <SettingsRow
+                      title="图片参数"
+                      description="接收图片数据的工具参数名"
+                      control={
+                        <input
+                          class="settings-input row-control"
+                          value={server().vision?.imageArgument ?? "image"}
+                          spellcheck={false}
+                          onInput={(event) => updateVision(server(), { imageArgument: event.currentTarget.value })}
+                        />
+                      }
+                    />
+                    <SettingsRow
+                      title="提示词参数"
+                      description="接收视觉分析要求的工具参数名"
+                      control={
+                        <input
+                          class="settings-input row-control"
+                          value={server().vision?.promptArgument ?? "prompt"}
+                          spellcheck={false}
+                          onInput={(event) => updateVision(server(), { promptArgument: event.currentTarget.value })}
+                        />
+                      }
+                    />
+                    <SettingsRow
+                      title="图片输入格式"
+                      description="按 MCP 工具的参数约定选择"
+                      control={
+                        <SelectControl
+                          value={server().vision?.inputMode ?? "data-url"}
+                          options={[
+                            { value: "data-url", label: "Data URL" },
+                            { value: "base64", label: "纯 Base64" },
+                          ]}
+                          onChange={(value) => updateVision(server(), { inputMode: value })}
+                        />
+                      }
+                    />
+                    <SettingsRow
+                      title="MIME 参数"
+                      description="可选；留空时不单独发送 MIME 类型"
+                      control={
+                        <input
+                          class="settings-input row-control"
+                          value={server().vision?.mimeTypeArgument ?? ""}
+                          spellcheck={false}
+                          placeholder="mimeType"
+                          onInput={(event) => updateVision(server(), { mimeTypeArgument: event.currentTarget.value })}
+                        />
+                      }
+                    />
+                    <SettingsRow
+                      title="文件名参数"
+                      description="可选；留空时不单独发送原始文件名"
+                      control={
+                        <input
+                          class="settings-input row-control"
+                          value={server().vision?.fileNameArgument ?? ""}
+                          spellcheck={false}
+                          placeholder="fileName"
+                          onInput={(event) => updateVision(server(), { fileNameArgument: event.currentTarget.value })}
+                        />
+                      }
+                    />
+                  </Show>
+
+                  <Show when={server().transport === "streamable-http" || server().transport === "sse"}>
+                    <SettingsRow
+                      danger={Boolean(server().vision?.enabled && !server().vision?.allowRemoteImages)}
+                      title="允许上传图片到远程 MCP"
+                      description="图片可能包含代码、文档、账号信息或界面内容；只有明确开启后 MHcode 才会发送"
+                      control={
+                        <SwitchControl
+                          label="允许上传图片到远程 MCP"
+                          checked={server().vision?.allowRemoteImages ?? false}
+                          onChange={(value) => updateVision(server(), { allowRemoteImages: value })}
+                        />
+                      }
+                    />
+                    <p class="mcp-vision-privacy-note">
+                      <ShieldCheck size={14} />
+                      远程上传授权仅作用于这个 MCP 服务器，关闭后文本、结构化工具调用仍可正常使用。
+                    </p>
+                  </Show>
+                </SettingsCard>
+              </Show>
             </div>
           )}
         </Show>

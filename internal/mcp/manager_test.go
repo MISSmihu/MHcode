@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,6 +21,13 @@ import (
 type addInput struct {
 	A int `json:"a" jsonschema:"first number"`
 	B int `json:"b" jsonschema:"second number"`
+}
+
+type visionInput struct {
+	Image    string `json:"image"`
+	Prompt   string `json:"prompt"`
+	MIMEType string `json:"mimeType"`
+	FileName string `json:"fileName"`
 }
 
 func TestManagerStreamableHTTPDiscoverAndExecute(t *testing.T) {
@@ -97,6 +105,158 @@ func TestManagerStreamableHTTPDiscoverAndExecute(t *testing.T) {
 	if len(snapshots) != 1 || len(snapshots[0].Tools) != 1 || snapshots[0].Tools[0].Name != "mcp__test-server__add" {
 		t.Fatalf("snapshots = %#v", snapshots)
 	}
+}
+
+func TestManagerAnalyzeImageUsesConfiguredWireFormat(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		inputMode string
+		wantImage func(string) string
+	}{
+		{name: "data URL", inputMode: "data-url", wantImage: func(data string) string { return "data:image/png;base64," + data }},
+		{name: "base64", inputMode: "base64", wantImage: func(data string) string { return data }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := &atomic.Int32{}
+			received := make(chan visionInput, 1)
+			manager := newVisionTestManager(t, true, test.inputMode, calls, received)
+			imageData := base64.StdEncoding.EncodeToString([]byte("image-bytes"))
+			progress := make([]tools.ResultPart, 0, 1)
+			ctx := tools.WithProgressSink(context.Background(), func(part tools.ResultPart) {
+				progress = append(progress, part)
+			})
+
+			response, err := manager.AnalyzeImage(ctx, VisionRequest{
+				Name: "screen.png", MIMEType: "image/png", Data: imageData, Prompt: "找出页面错误",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.ToolName != "mcp__vision__inspect_image" || !strings.Contains(response.Summary, "按钮被遮挡") {
+				t.Fatalf("response = %#v", response)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("vision calls = %d, want 1", calls.Load())
+			}
+			input := <-received
+			if input.Image != test.wantImage(imageData) || input.MIMEType != "image/png" || input.FileName != "screen.png" {
+				t.Fatalf("vision input = %#v", input)
+			}
+			if !strings.Contains(input.Prompt, "找出页面错误") {
+				t.Fatalf("vision prompt = %q", input.Prompt)
+			}
+			if len(progress) != 1 || progress[0].Input != "screen.png · image/png" || strings.Contains(progress[0].Input, imageData) {
+				t.Fatalf("vision progress leaked image data: %#v", progress)
+			}
+		})
+	}
+}
+
+func TestManagerAnalyzeImageRequiresRemoteUploadPermission(t *testing.T) {
+	calls := &atomic.Int32{}
+	manager := newVisionTestManager(t, false, "data-url", calls, nil)
+	_, err := manager.AnalyzeImage(context.Background(), VisionRequest{
+		Name: "private.png", MIMEType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("private")),
+	})
+	if err == nil || !strings.Contains(err.Error(), "未允许上传图片到远程 MCP") {
+		t.Fatalf("permission error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("remote vision tool was called %d times without permission", calls.Load())
+	}
+}
+
+func TestCallToolResultAttachmentsPreservesImagesWithoutLeakingBlob(t *testing.T) {
+	pngBytes := []byte{0x89, 'P', 'N', 'G'}
+	webpBytes := []byte("RIFF-webp")
+	result := &sdkmcp.CallToolResult{Content: []sdkmcp.Content{
+		&sdkmcp.TextContent{Text: "视觉分析完成"},
+		&sdkmcp.ImageContent{MIMEType: "image/png", Data: pngBytes},
+		&sdkmcp.EmbeddedResource{Resource: &sdkmcp.ResourceContents{
+			URI: "file:///tmp/chart.webp", MIMEType: "image/webp", Blob: webpBytes,
+		}},
+	}}
+	attachments, warnings := callToolResultAttachments(result)
+	if len(warnings) != 0 || len(attachments) != 2 {
+		t.Fatalf("attachments = %#v, warnings = %#v", attachments, warnings)
+	}
+	if attachments[0].Name != "mcp-image-1.png" || attachments[0].Data != base64.StdEncoding.EncodeToString(pngBytes) {
+		t.Fatalf("image attachment = %#v", attachments[0])
+	}
+	if attachments[1].Name != "chart.webp" || attachments[1].Data != base64.StdEncoding.EncodeToString(webpBytes) {
+		t.Fatalf("resource attachment = %#v", attachments[1])
+	}
+	summary := summarizeCallToolResult(result, "summary-first")
+	if !strings.Contains(summary, "视觉分析完成") || !strings.Contains(summary, "image resource:") {
+		t.Fatalf("summary = %q", summary)
+	}
+	for _, attachment := range attachments {
+		if strings.Contains(summary, attachment.Data) {
+			t.Fatalf("summary leaked image payload: %q", summary)
+		}
+	}
+}
+
+func TestRemoteToolInputForDisplayHidesImagePayload(t *testing.T) {
+	input := remoteToolInputForDisplay("inspect_image", map[string]any{
+		"image": "data:image/png;base64,aGVsbG8=",
+	})
+	if input != "包含图片或二进制数据（已隐藏）" {
+		t.Fatalf("display input = %q", input)
+	}
+}
+
+func TestHasUsableVisionTextRejectsMediaOnlySummaries(t *testing.T) {
+	for _, summary := range []string{
+		"image: image/png (128 bytes)",
+		"image resource: file:///tmp/capture.png (image/png, 128 bytes)",
+		"audio: audio/wav (256 bytes)",
+		"resource: file:///tmp/result.bin",
+	} {
+		if hasUsableVisionText(summary) {
+			t.Fatalf("media-only summary was accepted: %q", summary)
+		}
+	}
+	if !hasUsableVisionText("OCR: 保存按钮被遮挡") {
+		t.Fatal("textual visual analysis was rejected")
+	}
+}
+
+func newVisionTestManager(t *testing.T, allowRemote bool, inputMode string, calls *atomic.Int32, received chan<- visionInput) *Manager {
+	t.Helper()
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "vision-test", Version: "1.0.0"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{
+		Name: "inspect_image", Description: "Analyze an image",
+	}, func(_ context.Context, _ *sdkmcp.CallToolRequest, input visionInput) (*sdkmcp.CallToolResult, any, error) {
+		calls.Add(1)
+		if received != nil {
+			received <- input
+		}
+		return &sdkmcp.CallToolResult{Content: []sdkmcp.Content{
+			&sdkmcp.TextContent{Text: "发现按钮被遮挡"},
+		}}, nil, nil
+	})
+
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(handler)
+	t.Cleanup(httpServer.Close)
+	manager := NewManager()
+	t.Cleanup(manager.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	statuses := manager.Configure(ctx, []ServerConfig{{
+		ID: "vision", Name: "Vision", Transport: TransportStreamableHTTP, URL: httpServer.URL,
+		Enabled: true, AllowNetwork: true, ToolResultPolicy: "summary-first",
+		Vision: VisionToolConfig{
+			Enabled: true, ToolName: "inspect_image", ImageArgument: "image", PromptArgument: "prompt",
+			MIMETypeArgument: "mimeType", FileNameArgument: "fileName", InputMode: inputMode,
+			AllowRemoteImages: allowRemote,
+		},
+	}})
+	if len(statuses) != 1 || statuses[0].State != "ready" {
+		t.Fatalf("vision MCP statuses = %#v", statuses)
+	}
+	return manager
 }
 
 func TestToolsForWorkspaceInjectsCodeGraphProjectPathPerRuntime(t *testing.T) {

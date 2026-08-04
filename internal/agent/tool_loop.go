@@ -1340,14 +1340,18 @@ func (s *Service) runToolLoopWithCompletionState(
 						})
 						return
 					}
-					if part.Name == "" {
-						part.Name = call.Function.Name
+					progressToolName := strings.TrimSpace(part.Name)
+					if progressToolName == "" {
+						progressToolName = call.Function.Name
+						part.Name = progressToolName
 					}
 					if part.Input == "" {
 						part.Input = toolInput
 					}
-					if part.ToolCallID == "" {
-						part.ToolCallID = call.ID
+					progressCallID := strings.TrimSpace(part.ToolCallID)
+					if progressCallID == "" {
+						progressCallID = call.ID
+						part.ToolCallID = progressCallID
 					}
 					if part.Status == "" {
 						part.Status = "running"
@@ -1358,10 +1362,10 @@ func (s *Service) runToolLoopWithCompletionState(
 					}
 					emitChatEvent(sink, ChatStreamEvent{
 						Type:       "tool",
-						Message:    toolProgressMessage(call.Function.Name, eventStatus, part.Output),
-						ToolName:   call.Function.Name,
-						ToolCallID: call.ID,
-						ToolInput:  toolInput,
+						Message:    toolProgressMessage(progressToolName, eventStatus, part.Output),
+						ToolName:   progressToolName,
+						ToolCallID: progressCallID,
+						ToolInput:  part.Input,
 						Status:     eventStatus,
 						Parts:      []tools.ResultPart{part},
 					})
@@ -1941,6 +1945,14 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 	// Build model feedback only after snapshot recording and any automatic
 	// rollback, so the model never receives a stale success message.
 	feedback := formatToolResultFeedback(result, name)
+	feedbackAttachments := result.Attachments
+	if len(result.Attachments) > 0 {
+		visualFeedback, attach := s.bridgeToolResultImages(ctx, name, result.Attachments)
+		if strings.TrimSpace(visualFeedback) != "" {
+			feedback += "\n\n" + visualFeedback
+		}
+		feedbackAttachments = attach
+	}
 	if context := formatLocalArtifactContext(artifactReferencesFromRecords(artifactRecords), 4_000); context != "" {
 		feedback += "\n\n" + context
 	}
@@ -1949,7 +1961,7 @@ func (s *Service) executeToolCall(ctx context.Context, reg *tools.Registry, call
 		ToolCallID:  call.ID,
 		Name:        name,
 		Content:     feedback,
-		Attachments: protocolToolAttachments(result.Attachments),
+		Attachments: protocolToolAttachments(feedbackAttachments),
 	}
 }
 
