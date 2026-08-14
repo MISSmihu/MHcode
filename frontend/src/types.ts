@@ -149,6 +149,22 @@ export type DeepSeekState = {
   lastCheckMessage: string;
   checkedAt?: string;
   models: Model[];
+  balance?: DeepSeekBalance;
+  balanceStatus?: "idle" | "ok" | "error" | string;
+  balanceMessage?: string;
+  balanceCheckedAt?: string;
+};
+
+export type DeepSeekBalance = {
+  available: boolean;
+  infos: DeepSeekBalanceInfo[];
+};
+
+export type DeepSeekBalanceInfo = {
+  currency: string;
+  totalBalance: string;
+  grantedBalance: string;
+  toppedUpBalance: string;
 };
 
 export type DeepSeekSessionState = {

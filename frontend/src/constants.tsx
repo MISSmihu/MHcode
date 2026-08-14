@@ -89,7 +89,8 @@ export const providerPresets: ProviderPreset[] = [
     protocol: "deepseek-official",
     apiType: "chat-completions",
     baseUrl: "https://api.deepseek.com",
-    contextWindowTokens: 128000,
+    balanceUrl: "https://api.deepseek.com/user/balance",
+    contextWindowTokens: 0,
     note: "官方通道，优先用于缓存命中观测。",
   },
   {

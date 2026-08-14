@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { renderMarkdown } from "../src/lib/markdown";
 import { errorMessage } from "../src/lib/errors";
 import { reasoningOptions } from "../src/state/reasoning";
-import { inferModelContextWindow } from "../src/model-context";
+import { deepSeekBalanceSummary, inferModelContextWindow, providerContextWindowLabel } from "../src/model-context";
 import { defaultTeamSettings } from "../src/team-config";
 import { formatElapsedDuration } from "../src/lib/duration";
 
@@ -40,6 +40,8 @@ describe("frontend fallback state", () => {
 
   test("uses exact model ids for context windows", () => {
     expect(inferModelContextWindow("gpt-5.4", "local")).toEqual({ tokens: 1_050_000, source: "catalog" });
+    expect(inferModelContextWindow("deepseek-v4-flash", "deepseek-official")).toEqual({ tokens: 1_000_000, source: "catalog" });
+    expect(inferModelContextWindow("deepseek-v4-pro", "deepseek-official")).toEqual({ tokens: 1_000_000, source: "catalog" });
     expect(inferModelContextWindow("gpt-5.2-chat-latest", "local")).toEqual({ tokens: 128_000, source: "catalog" });
     expect(inferModelContextWindow("gpt-5.6-sol-custom", "local")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
     expect(inferModelContextWindow("proxy/gpt-5.4", "local", 32_768)).toEqual({ tokens: 32_768, source: "provider-default" });
@@ -54,6 +56,42 @@ describe("frontend fallback state", () => {
     expect(inferModelContextWindow("claude-opus-5-20260724", "anthropic-compatible")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
     expect(inferModelContextWindow("claude-opus-4-5-20251101", "anthropic")).toEqual({ tokens: 200_000, source: "catalog" });
     expect(inferModelContextWindow("claude-unknown", "anthropic")).toEqual({ tokens: 64 * 1024, source: "safe-default" });
+  });
+
+  test("summarizes DeepSeek model windows and balances", () => {
+    expect(providerContextWindowLabel({
+      id: "deepseek",
+      name: "DeepSeek 官方",
+      protocol: "deepseek-official",
+      apiType: "chat-completions",
+      baseUrl: "https://api.deepseek.com",
+      balanceUrl: "https://api.deepseek.com/user/balance",
+      extraHeaders: "",
+      extraBodyJson: "",
+      reasoningProfile: "auto",
+      enabled: true,
+      apiKeyConfigured: true,
+      billingKeyConfigured: false,
+      billingProjectId: "",
+      billingApiKeyId: "",
+      defaultModelId: "deepseek-v4-flash",
+      contextWindowTokens: 128_000,
+      inputPricePerMillion: 0,
+      outputPricePerMillion: 0,
+      cacheHitPricePerMillion: 0,
+      cacheMissPricePerMillion: 0,
+      models: [
+        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
+      ],
+      lastSyncStatus: "ok",
+      lastSyncMessage: "连接成功",
+      supportsModelFetch: true,
+    })).toBe("1,000,000 tokens");
+    expect(deepSeekBalanceSummary({
+      available: true,
+      infos: [{ currency: "CNY", totalBalance: "110.00", grantedBalance: "10.00", toppedUpBalance: "100.00" }],
+    })).toBe("110.00 CNY");
   });
 
   test("keeps the five team roles explicit and disabled by default", () => {

@@ -82,6 +82,57 @@ func TestServiceDeepSeekConnectionWithoutKey(t *testing.T) {
 	}
 }
 
+func TestServiceDeepSeekConnectionRefreshesV4ContextAndBalance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Fatalf("authorization = %q", got)
+		}
+		switch r.URL.Path {
+		case "/models":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]string{
+					{"id": "deepseek-v4-flash"},
+					{"id": "deepseek-v4-pro"},
+				},
+			})
+		case "/user/balance":
+			_, _ = w.Write([]byte(`{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"12.50","granted_balance":"2.50","topped_up_balance":"10.00"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: filepath.Join(t.TempDir(), "runtime-settings.json")})
+	settings := service.runtimeSettings.Normalized()
+	settings.Model.Providers[0].BaseURL = server.URL
+	settings.Model.Providers[0].BalanceURL = server.URL + "/user/balance"
+	service.runtimeSettings = settings
+	if _, err := service.SaveDeepSeekAPIKey("test-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := service.TestDeepSeekConnection(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DeepSeek.LastCheckStatus != "ok" {
+		t.Fatalf("check status = %q, want ok: %s", state.DeepSeek.LastCheckStatus, state.DeepSeek.LastCheckMessage)
+	}
+	if len(state.DeepSeek.Models) != 2 || state.DeepSeek.Models[0].ContextWindowTokens != 1_000_000 || state.DeepSeek.Models[1].ContextWindowTokens != 1_000_000 {
+		t.Fatalf("models = %#v, want both 1M", state.DeepSeek.Models)
+	}
+	if state.DeepSeek.Models[0].ContextWindowSource != ContextWindowSourceCatalog {
+		t.Fatalf("context source = %q, want catalog", state.DeepSeek.Models[0].ContextWindowSource)
+	}
+	if state.DeepSeek.Balance == nil || len(state.DeepSeek.Balance.Infos) != 1 || state.DeepSeek.Balance.Infos[0].TotalBalance != "12.50" {
+		t.Fatalf("balance = %#v", state.DeepSeek.Balance)
+	}
+	if state.DeepSeek.BalanceStatus != "ok" || !state.DeepSeek.Balance.Available {
+		t.Fatalf("balance status = %q/%v", state.DeepSeek.BalanceStatus, state.DeepSeek.Balance.Available)
+	}
+}
+
 func TestServiceRuntimeSettingsPersist(t *testing.T) {
 	settingsPath := t.TempDir() + "/runtime-settings.json"
 	service := NewService(ServiceConfig{SkillsDir: t.TempDir(), SettingsPath: settingsPath})

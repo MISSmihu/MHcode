@@ -1,3 +1,5 @@
+import type { DeepSeekBalance, ModelProviderSetting } from "./types";
+
 const exactModelContextWindows: Record<string, number> = {
   "gpt-5": 400_000,
   "gpt-5-mini": 400_000,
@@ -46,6 +48,9 @@ const exactModelContextWindows: Record<string, number> = {
   "o4-mini": 200_000,
   "deepseek-chat": 128_000,
   "deepseek-reasoner": 128_000,
+  // DeepSeek V4 model cards, verified against the official V4 release notes on 2026-08-14.
+  "deepseek-v4-flash": 1_000_000,
+  "deepseek-v4-pro": 1_000_000,
   // xAI model cards, verified against https://docs.x.ai/developers/models on 2026-07-19.
   "grok-4.5": 500_000,
   "grok-4.5-latest": 500_000,
@@ -139,4 +144,26 @@ export function contextWindowSourceLabel(source?: string) {
     case "safe-default": return "安全估算";
     default: return "待识别";
   }
+}
+
+function formatContextWindow(value: number) {
+  if (!value || value <= 0) return "默认";
+  return `${new Intl.NumberFormat("zh-CN").format(value)} tokens`;
+}
+
+export function providerContextWindowLabel(provider: ModelProviderSetting) {
+  const modelWindows = [...new Set(provider.models.map((model) => model.contextWindowTokens).filter((value) => value > 0))];
+  if (modelWindows.length === 1) return formatContextWindow(modelWindows[0]);
+  if (modelWindows.length > 1) return "按模型设置";
+  return formatContextWindow(provider.contextWindowTokens);
+}
+
+export function deepSeekBalanceAmount(value: string, currency: string) {
+  const amount = value.trim() || "0";
+  return currency.trim() ? `${amount} ${currency.trim()}` : amount;
+}
+
+export function deepSeekBalanceSummary(balance?: DeepSeekBalance) {
+  if (!balance || balance.infos.length === 0) return "尚未查询";
+  return balance.infos.map((info) => deepSeekBalanceAmount(info.totalBalance, info.currency)).join(" / ");
 }

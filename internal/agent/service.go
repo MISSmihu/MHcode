@@ -111,12 +111,16 @@ type ChatAttachment struct {
 }
 
 type DeepSeekState struct {
-	Configured       bool             `json:"configured"`
-	BaseURL          string           `json:"baseUrl"`
-	LastCheckStatus  string           `json:"lastCheckStatus"`
-	LastCheckMessage string           `json:"lastCheckMessage"`
-	CheckedAt        string           `json:"checkedAt,omitempty"`
-	Models           []protocol.Model `json:"models"`
+	Configured       bool                      `json:"configured"`
+	BaseURL          string                    `json:"baseUrl"`
+	LastCheckStatus  string                    `json:"lastCheckStatus"`
+	LastCheckMessage string                    `json:"lastCheckMessage"`
+	CheckedAt        string                    `json:"checkedAt,omitempty"`
+	Models           []protocol.Model          `json:"models"`
+	Balance          *protocol.DeepSeekBalance `json:"balance,omitempty"`
+	BalanceStatus    string                    `json:"balanceStatus,omitempty"`
+	BalanceMessage   string                    `json:"balanceMessage,omitempty"`
+	BalanceCheckedAt string                    `json:"balanceCheckedAt,omitempty"`
 }
 
 type DeepSeekSessionState struct {
@@ -329,6 +333,8 @@ func NewService(config ServiceConfig) *Service {
 			LastCheckStatus:  "idle",
 			LastCheckMessage: "等待保存 DeepSeek API Key。",
 			Models:           protocolModelsFromProviderModels(runtimeSettings.Model.Providers, "deepseek"),
+			BalanceStatus:    "idle",
+			BalanceMessage:   "测试连接时会同时查询账户余额。",
 		},
 		builder:    NewContextBuilder(),
 		usageStore: config.UsageStore,
@@ -495,6 +501,10 @@ func (s *Service) SaveModelProviderAPIKey(providerID string, apiKey string) (Wor
 		s.deepSeekState.LastCheckMessage = "DeepSeek API Key 已保存，等待连接测试。"
 		s.deepSeekState.CheckedAt = ""
 		s.deepSeekState.Models = providerProtocolModels(provider.Models)
+		s.deepSeekState.Balance = nil
+		s.deepSeekState.BalanceStatus = "idle"
+		s.deepSeekState.BalanceMessage = "测试连接时会同时查询账户余额。"
+		s.deepSeekState.BalanceCheckedAt = ""
 		if len(s.deepSeekState.Models) == 0 {
 			s.deepSeekState.Models = nil
 		}
@@ -540,6 +550,8 @@ func (s *Service) ClearModelProviderAPIKey(providerID string) (WorkbenchState, e
 			LastCheckStatus:  "idle",
 			LastCheckMessage: "DeepSeek API Key 已清除。",
 			Models:           providerProtocolModels(provider.Models),
+			BalanceStatus:    "idle",
+			BalanceMessage:   "保存 API Key 后可查询账户余额。",
 		}
 		if len(s.deepSeekState.Models) == 0 {
 			s.deepSeekState.Models = nil
@@ -659,6 +671,8 @@ func (s *Service) DeleteModelProvider(providerID string) (WorkbenchState, error)
 			BaseURL:          protocol.DefaultDeepSeekBaseURL,
 			LastCheckStatus:  "idle",
 			LastCheckMessage: "DeepSeek 提供商已删除。",
+			BalanceStatus:    "idle",
+			BalanceMessage:   "保存 API Key 后可查询账户余额。",
 		}
 	}
 	if s.sessionState.ProviderID == providerID {
@@ -700,6 +714,10 @@ func (s *Service) RefreshModelProviderModels(ctx context.Context, providerID str
 		settings.Model.Providers[index] = provider
 		s.runtimeSettings = s.runtimeSettingsWithSecretFlags(settings)
 		s.syncDeepSeekStateFromProvider(provider, providerProtocolModels(provider.Models))
+		if provider.ID == "deepseek" && provider.Protocol == "deepseek-official" {
+			s.deepSeekState.BalanceStatus = "error"
+			s.deepSeekState.BalanceMessage = "模型连接失败，本次未刷新账户余额。"
+		}
 		_ = saveRuntimeSettings(s.settingsPath, s.runtimeSettings)
 		return s.workbenchStateLocked(), nil
 	}
@@ -717,6 +735,9 @@ func (s *Service) RefreshModelProviderModels(ctx context.Context, providerID str
 	settings.Model.Providers[index] = provider
 	s.runtimeSettings = s.runtimeSettingsWithSecretFlags(settings)
 	s.syncDeepSeekStateFromProvider(provider, models)
+	if provider.ID == "deepseek" && provider.Protocol == "deepseek-official" {
+		s.refreshDeepSeekBalance(ctx, provider)
+	}
 	if err := saveRuntimeSettings(s.settingsPath, s.runtimeSettings); err != nil {
 		return s.workbenchStateLocked(), err
 	}
@@ -2724,6 +2745,38 @@ func (s *Service) listProviderModels(ctx context.Context, provider ModelProvider
 		return client.ListModels(ctx)
 	default:
 		return nil, fmt.Errorf("当前协议暂不支持自动获取模型：%s", provider.Protocol)
+	}
+}
+
+func (s *Service) refreshDeepSeekBalance(ctx context.Context, provider ModelProviderSetting) {
+	checkedAt := time.Now().Format(time.RFC3339)
+	s.deepSeekState.BalanceCheckedAt = checkedAt
+	apiKey, err := s.secretVault.Get(secretServiceName, providerSecretAccountName(provider.ID))
+	if err != nil || strings.TrimSpace(apiKey) == "" {
+		s.deepSeekState.BalanceStatus = "error"
+		s.deepSeekState.BalanceMessage = "请先保存 DeepSeek API Key。"
+		return
+	}
+
+	client := protocol.NewDeepSeekProvider(apiKey)
+	client.BaseURL = provider.BaseURL
+	client.BalanceURL = provider.BalanceURL
+	client.ExtraHeaders = provider.ExtraHeaders
+	balanceCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	balance, err := client.GetBalance(balanceCtx)
+	if err != nil {
+		s.deepSeekState.BalanceStatus = "error"
+		s.deepSeekState.BalanceMessage = "余额查询失败：" + err.Error()
+		return
+	}
+
+	s.deepSeekState.Balance = &balance
+	s.deepSeekState.BalanceStatus = "ok"
+	if balance.Available {
+		s.deepSeekState.BalanceMessage = "账户余额可用。"
+	} else {
+		s.deepSeekState.BalanceMessage = "账户余额不足，当前不可调用 DeepSeek API。"
 	}
 }
 

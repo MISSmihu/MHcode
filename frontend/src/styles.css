@@ -6324,6 +6324,58 @@ body[data-theme="light"],
   line-height: 1.45;
 }
 
+.deepseek-balance-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-color);
+}
+
+.deepseek-balance-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.deepseek-balance-row span,
+.deepseek-balance-message {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.deepseek-balance-row strong {
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.deepseek-balance-message {
+  line-height: 1.4;
+}
+
+.deepseek-balance-breakdown {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  padding-left: 2px;
+}
+
+.deepseek-balance-breakdown span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.deepseek-balance-breakdown strong {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: right;
+}
+
 code,
 .hash-box {
   color: var(--code-text);

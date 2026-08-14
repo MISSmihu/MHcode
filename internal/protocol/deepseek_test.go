@@ -75,6 +75,46 @@ func TestDeepSeekListModelsTranslatesError(t *testing.T) {
 	}
 }
 
+func TestDeepSeekGetBalance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/balance" {
+			t.Fatalf("path = %s, want /user/balance", r.URL.Path)
+		}
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
+			t.Fatalf("authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]}`))
+	}))
+	defer server.Close()
+
+	provider := NewDeepSeekProvider("test-key")
+	provider.BaseURL = server.URL
+	balance, err := provider.GetBalance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !balance.Available || len(balance.Infos) != 1 {
+		t.Fatalf("balance = %#v", balance)
+	}
+	info := balance.Infos[0]
+	if info.Currency != "CNY" || info.TotalBalance != "110.00" || info.GrantedBalance != "10.00" || info.ToppedUpBalance != "100.00" {
+		t.Fatalf("balance info = %#v", info)
+	}
+}
+
+func TestDeepSeekGetBalanceRejectsCrossOriginURL(t *testing.T) {
+	provider := NewDeepSeekProvider("test-key")
+	provider.BaseURL = "https://api.deepseek.com"
+	provider.BalanceURL = "https://example.com/user/balance"
+	_, err := provider.GetBalance(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "必须与 API 地址同源") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestDeepSeekStreamParsesDeltaAndUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {

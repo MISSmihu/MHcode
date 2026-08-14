@@ -307,6 +307,10 @@ export async function saveDeepSeekAPIKey(apiKey: string): Promise<WorkbenchState
       lastCheckMessage: "DeepSeek API Key 已保存，等待连接测试。",
       checkedAt: undefined,
       models: [],
+      balance: undefined,
+      balanceStatus: "idle",
+      balanceMessage: "测试连接时会同时查询账户余额。",
+      balanceCheckedAt: undefined,
     },
   };
   fallbackState = updateFallbackProvider("deepseek", (provider) => ({
@@ -332,6 +336,8 @@ export async function clearDeepSeekAPIKey(): Promise<WorkbenchState> {
       lastCheckStatus: "idle",
       lastCheckMessage: "DeepSeek API Key 已清除。",
       models: [],
+      balanceStatus: "idle",
+      balanceMessage: "保存 API Key 后可查询账户余额。",
     },
   };
   fallbackState = updateFallbackProvider("deepseek", (provider) => ({
@@ -359,9 +365,16 @@ export async function testDeepSeekConnection(): Promise<WorkbenchState> {
       lastCheckMessage: "预览模式连接模拟成功，发现 2 个模型。",
       checkedAt: new Date().toISOString(),
       models: [
-        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
-        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
       ],
+      balance: {
+        available: true,
+        infos: [{ currency: "CNY", totalBalance: "100.00", grantedBalance: "10.00", toppedUpBalance: "90.00" }],
+      },
+      balanceStatus: "ok",
+      balanceMessage: "账户余额可用。",
+      balanceCheckedAt: new Date().toISOString(),
     },
   };
   return cloneState(fallbackState);
@@ -956,8 +969,8 @@ export async function refreshModelProviderModels(providerID: string): Promise<Wo
   const now = new Date().toISOString();
   const fallbackModels = providerID === "deepseek"
     ? [
-        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
-        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 128000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
+        { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: "deepseek", contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
       ]
     : [
         { id: "upstream-chat", displayName: "upstream-chat", provider: providerID, contextWindowTokens: 128000, contextWindowSource: "upstream" },
@@ -982,6 +995,13 @@ export async function refreshModelProviderModels(providerID: string): Promise<Wo
         lastCheckStatus: "ok",
         lastCheckMessage: `预览模式连接成功，发现 ${fallbackModels.length} 个模型。`,
         checkedAt: now,
+        balance: {
+          available: true,
+          infos: [{ currency: "CNY", totalBalance: "100.00", grantedBalance: "10.00", toppedUpBalance: "90.00" }],
+        },
+        balanceStatus: "ok",
+        balanceMessage: "账户余额可用。",
+        balanceCheckedAt: now,
       },
       runtimeSettings,
     };
@@ -1821,6 +1841,8 @@ function createFallbackState(level: ReasoningLevel): WorkbenchState {
       lastCheckStatus: "idle",
       lastCheckMessage: "等待保存 DeepSeek API Key。",
       models: [],
+      balanceStatus: "idle",
+      balanceMessage: "保存 API Key 后可查询账户余额。",
     },
     deepSeekSession: {
       active: false,
@@ -2130,13 +2152,13 @@ function defaultRuntimeSettings(): RuntimeSettings {
           protocol: "deepseek-official",
           apiType: "chat-completions",
           baseUrl: "https://api.deepseek.com",
-          balanceUrl: "",
+          balanceUrl: "https://api.deepseek.com/user/balance",
           extraHeaders: "",
           extraBodyJson: "",
           enabled: true,
           apiKeyConfigured: false,
           defaultModelId: "",
-          contextWindowTokens: 128000,
+          contextWindowTokens: 0,
           models: [],
           lastSyncStatus: "idle",
           lastSyncMessage: "等待保存 API Key 后刷新模型。",

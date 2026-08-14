@@ -67,6 +67,9 @@ var exactModelContextWindows = map[string]int{
 	"o4-mini":                 200_000,
 	"deepseek-chat":           128_000,
 	"deepseek-reasoner":       128_000,
+	// DeepSeek V4 model cards, verified against the official V4 release notes on 2026-08-14.
+	"deepseek-v4-flash": 1_000_000,
+	"deepseek-v4-pro":   1_000_000,
 	// xAI model cards, verified against https://docs.x.ai/developers/models on 2026-07-19.
 	"grok-4.5":                                         500_000,
 	"grok-4.5-latest":                                  500_000,

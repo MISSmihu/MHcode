@@ -29,10 +29,23 @@ const (
 type DeepSeekProvider struct {
 	APIKey           string
 	BaseURL          string
+	BalanceURL       string
 	HTTPClient       *http.Client
 	ExtraHeaders     string
 	ExtraBodyJSON    string
 	ReasoningProfile string
+}
+
+type DeepSeekBalance struct {
+	Available bool                  `json:"available"`
+	Infos     []DeepSeekBalanceInfo `json:"infos"`
+}
+
+type DeepSeekBalanceInfo struct {
+	Currency        string `json:"currency"`
+	TotalBalance    string `json:"totalBalance"`
+	GrantedBalance  string `json:"grantedBalance"`
+	ToppedUpBalance string `json:"toppedUpBalance"`
 }
 
 func NewDeepSeekProvider(apiKey string) DeepSeekProvider {
@@ -78,6 +91,41 @@ func (p DeepSeekProvider) ListModels(ctx context.Context) ([]Model, error) {
 		})
 	}
 	return models, nil
+}
+
+func (p DeepSeekProvider) GetBalance(ctx context.Context) (DeepSeekBalance, error) {
+	if strings.TrimSpace(p.APIKey) == "" {
+		return DeepSeekBalance{}, errors.New("deepseek api key is required")
+	}
+
+	endpoint, err := p.balanceEndpoint()
+	if err != nil {
+		return DeepSeekBalance{}, err
+	}
+	resp, err := p.doRequestWithRetry(ctx, http.MethodGet, endpoint, nil, "application/json")
+	if err != nil {
+		return DeepSeekBalance{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return DeepSeekBalance{}, deepSeekAPIError(resp)
+	}
+
+	var payload deepSeekBalanceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return DeepSeekBalance{}, fmt.Errorf("decode deepseek balance: %w", err)
+	}
+	infos := make([]DeepSeekBalanceInfo, 0, len(payload.BalanceInfos))
+	for _, info := range payload.BalanceInfos {
+		infos = append(infos, DeepSeekBalanceInfo{
+			Currency:        strings.TrimSpace(info.Currency),
+			TotalBalance:    strings.TrimSpace(info.TotalBalance),
+			GrantedBalance:  strings.TrimSpace(info.GrantedBalance),
+			ToppedUpBalance: strings.TrimSpace(info.ToppedUpBalance),
+		})
+	}
+	return DeepSeekBalance{Available: payload.IsAvailable, Infos: infos}, nil
 }
 
 func (p DeepSeekProvider) Stream(ctx context.Context, request ChatRequest) (<-chan StreamEvent, error) {
@@ -206,11 +254,44 @@ func (p DeepSeekProvider) Complete(ctx context.Context, request ChatRequest) (Co
 }
 
 func (p DeepSeekProvider) endpoint(path string) string {
+	if strings.HasPrefix(path, "https://") || strings.HasPrefix(path, "http://") {
+		return path
+	}
 	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 	if baseURL == "" {
 		baseURL = DefaultDeepSeekBaseURL
 	}
 	return baseURL + path
+}
+
+func (p DeepSeekProvider) balanceEndpoint() (string, error) {
+	endpoint := strings.TrimSpace(p.BalanceURL)
+	if endpoint == "" {
+		return p.endpoint("/user/balance"), nil
+	}
+	if !strings.HasPrefix(endpoint, "https://") && !strings.HasPrefix(endpoint, "http://") {
+		if !strings.HasPrefix(endpoint, "/") {
+			endpoint = "/" + endpoint
+		}
+		return p.endpoint(endpoint), nil
+	}
+
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if baseURL == "" {
+		baseURL = DefaultDeepSeekBaseURL
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse deepseek base url: %w", err)
+	}
+	balance, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse deepseek balance url: %w", err)
+	}
+	if !strings.EqualFold(base.Scheme, balance.Scheme) || !strings.EqualFold(base.Host, balance.Host) {
+		return "", errors.New("DeepSeek 余额查询 URL 必须与 API 地址同源，避免 API Key 被发送到其他站点")
+	}
+	return endpoint, nil
 }
 
 func (p DeepSeekProvider) client() *http.Client {
@@ -464,6 +545,16 @@ type deepSeekModelsResponse struct {
 	Data []struct {
 		ID string `json:"id"`
 	} `json:"data"`
+}
+
+type deepSeekBalanceResponse struct {
+	IsAvailable  bool `json:"is_available"`
+	BalanceInfos []struct {
+		Currency        string `json:"currency"`
+		TotalBalance    string `json:"total_balance"`
+		GrantedBalance  string `json:"granted_balance"`
+		ToppedUpBalance string `json:"topped_up_balance"`
+	} `json:"balance_infos"`
 }
 
 type deepSeekChatRequest struct {

@@ -53,7 +53,7 @@ import {
   providerFromPreset, createEmptyProvider, defaultAPITypeForProtocol,
   supportsModelFetchForProtocol, parseEnvLines, parseHeaderLines, prefixStatusLabel, thinkingStatusLabel,
 } from "./format";
-import { inferModelContextWindow, contextWindowSourceLabel } from "./model-context";
+import { inferModelContextWindow, contextWindowSourceLabel, providerContextWindowLabel, deepSeekBalanceAmount } from "./model-context";
 import {
   browserClearData, checkForUpdates, deleteAutomationTask, deleteBrowserCredential, downloadUpdate, getAppInfo, getOpenSourceLicenses,
 	getExtensionCatalog, installExtension, refreshExtensionCatalog, revealExtension, runExtensionProjectAction, uninstallExtension,
@@ -448,6 +448,43 @@ export function GeneralSettingsPanel(props: {
           <strong>{props.deepSeek.configured ? "API Key 已保存" : "API Key 未配置"}</strong>
           <p>{props.deepSeek.lastCheckMessage}</p>
           <code>{props.deepSeek.baseUrl}</code>
+          <div class="deepseek-balance-row">
+            <div>
+              <span>账户余额</span>
+              <strong>
+                <Show when={props.deepSeek.balance?.infos?.length} fallback="尚未查询">
+                  <For each={props.deepSeek.balance?.infos ?? []}>
+                    {(info, index) => <>{index() > 0 ? " / " : ""}{deepSeekBalanceAmount(info.totalBalance, info.currency)}</>}
+                  </For>
+                </Show>
+              </strong>
+            </div>
+            <div>
+              <span>状态</span>
+              <strong>
+                {props.deepSeek.balanceStatus === "ok"
+                  ? (props.deepSeek.balance?.available ? "可用" : "余额不足")
+                  : props.deepSeek.balanceStatus
+                    ? statusLabel(props.deepSeek.balanceStatus)
+                    : "待查询"}
+              </strong>
+            </div>
+          </div>
+          <Show when={props.deepSeek.balance?.infos?.length}>
+            <div class="deepseek-balance-breakdown">
+              <For each={props.deepSeek.balance?.infos ?? []}>
+                {(info) => (
+                  <>
+                    <span>{info.currency || "账户"} 充值</span>
+                    <strong>{deepSeekBalanceAmount(info.toppedUpBalance, info.currency)}</strong>
+                    <span>{info.currency || "账户"} 赠送</span>
+                    <strong>{deepSeekBalanceAmount(info.grantedBalance, info.currency)}</strong>
+                  </>
+                )}
+              </For>
+            </div>
+          </Show>
+          <small class="deepseek-balance-message">{props.deepSeek.balanceMessage ?? "测试连接时会同时查询账户余额。"}</small>
         </div>
         <div class="key-row">
           <input
@@ -1705,7 +1742,7 @@ export function ModelSettingsPanel(props: {
                   />
                   <SettingsRow
                     title="余额查询 URL（可选）"
-                    description="仅保存链接；后续可接入供应商余额查询视图"
+                    description="DeepSeek 官方协议默认查询 /user/balance；其他供应商暂仅保存地址"
                     control={
                       <input
                         class="settings-input row-control"
@@ -1815,7 +1852,7 @@ export function ModelSettingsPanel(props: {
                   <div class="provider-model-editor-head">
                     <div>
                       <strong>模型列表</strong>
-                      <span>{provider().models.length} 个模型 · 上下文 {formatTokenWindow(provider().contextWindowTokens)}</span>
+                      <span>{provider().models.length} 个模型 · 上下文 {providerContextWindowLabel(provider())}</span>
                     </div>
                     <div class="settings-row-actions">
                       <button class="settings-soft-button" type="button" onClick={() => addProviderModel(provider())}>

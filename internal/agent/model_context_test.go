@@ -55,6 +55,8 @@ func TestInferModelContextWindowUsesExactCatalogIDs(t *testing.T) {
 		{modelID: "gpt-5.4", tokens: 1_050_000, source: ContextWindowSourceCatalog},
 		{modelID: "gpt-5.2-chat-latest", tokens: 128_000, source: ContextWindowSourceCatalog},
 		{modelID: "gpt-5.6-sol", tokens: 1_050_000, source: ContextWindowSourceCatalog},
+		{modelID: "deepseek-v4-flash", tokens: 1_000_000, source: ContextWindowSourceCatalog},
+		{modelID: "deepseek-v4-pro", tokens: 1_000_000, source: ContextWindowSourceCatalog},
 		{modelID: "gpt-5.6-sol-custom"},
 		{modelID: "proxy/gpt-5.4"},
 		{modelID: "gpt-5.7"},
@@ -209,6 +211,21 @@ func TestResolveProviderModelContextsRecalculatesStaleInferredValues(t *testing.
 	assertModelContext(t, models[2], safeDefaultContextWindowTokens, ContextWindowSourceFallback)
 	assertModelContext(t, models[3], 333_000, ContextWindowSourceManual)
 	assertModelContext(t, models[4], 222_000, ContextWindowSourceUpstream)
+}
+
+func TestResolveProviderModelContextsMigratesDeepSeekV4ProviderDefaultToCatalog(t *testing.T) {
+	provider := ModelProviderSetting{
+		ID:                  "deepseek",
+		Protocol:            "deepseek-official",
+		ContextWindowTokens: 128_000,
+		Models: []ProviderModel{
+			{ID: "deepseek-v4-flash", ContextWindowTokens: 128_000, ContextWindowSource: ContextWindowSourceProvider},
+			{ID: "deepseek-v4-pro", ContextWindowTokens: 128_000, ContextWindowSource: ContextWindowSourceProvider},
+		},
+	}
+	models := resolveProviderModelContexts(provider, providerProtocolModels(provider.Models))
+	assertModelContext(t, models[0], 1_000_000, ContextWindowSourceCatalog)
+	assertModelContext(t, models[1], 1_000_000, ContextWindowSourceCatalog)
 }
 
 func TestContextBudgetReusesPersistedUpstreamWindow(t *testing.T) {

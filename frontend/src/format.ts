@@ -49,6 +49,8 @@ export function fallbackDeepSeekState() {
     lastCheckStatus: "idle",
     lastCheckMessage: "等待保存 DeepSeek API Key。",
     models: [],
+    balanceStatus: "idle",
+    balanceMessage: "保存 API Key 后可查询账户余额。",
   };
 }
 
@@ -207,13 +209,13 @@ export function fallbackRuntimeSettings(): RuntimeSettings {
           protocol: "deepseek-official",
           apiType: "chat-completions",
           baseUrl: "https://api.deepseek.com",
-          balanceUrl: "",
+          balanceUrl: "https://api.deepseek.com/user/balance",
           extraHeaders: "",
           extraBodyJson: "",
           enabled: true,
           apiKeyConfigured: false,
           defaultModelId: "",
-          contextWindowTokens: 128000,
+          contextWindowTokens: 0,
           models: [],
           lastSyncStatus: "idle",
           lastSyncMessage: "等待保存 API Key 后刷新模型。",
@@ -526,8 +528,8 @@ export function modelOptionsForProvider(provider: ModelProviderSetting) {
   }
   if (provider.id === "deepseek") {
     return [
-      { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: provider.id, contextWindowTokens: provider.contextWindowTokens || 128000, contextWindowSource: "catalog" },
-      { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: provider.id, contextWindowTokens: provider.contextWindowTokens || 128000, contextWindowSource: "catalog" },
+      { id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash", provider: provider.id, contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
+      { id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro", provider: provider.id, contextWindowTokens: 1_000_000, contextWindowSource: "catalog" },
     ];
   }
   return [];

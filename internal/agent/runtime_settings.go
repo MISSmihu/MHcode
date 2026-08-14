@@ -304,6 +304,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 					Protocol:           "deepseek-official",
 					APIType:            "chat-completions",
 					BaseURL:            "https://api.deepseek.com",
+					BalanceURL:         "https://api.deepseek.com/user/balance",
 					ReasoningProfile:   "auto",
 					Enabled:            true,
 					LastSyncStatus:     "idle",
@@ -895,6 +896,9 @@ func normalizeModelSettings(settings ModelSettings, _ ModelSettings) ModelSettin
 			provider.BaseURL = defaultBaseURLForProtocol(provider.Protocol)
 		}
 		provider.BalanceURL = strings.TrimSpace(provider.BalanceURL)
+		if provider.BalanceURL == "" && provider.Protocol == "deepseek-official" {
+			provider.BalanceURL = strings.TrimRight(provider.BaseURL, "/") + "/user/balance"
+		}
 		provider.BillingProjectID = strings.TrimSpace(provider.BillingProjectID)
 		provider.BillingAPIKeyID = strings.TrimSpace(provider.BillingAPIKeyID)
 		provider.ExtraHeaders = strings.TrimSpace(provider.ExtraHeaders)
