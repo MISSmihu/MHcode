@@ -17,7 +17,7 @@
 ### 验证
 
 - `go test ./... -count=1`、`go vet ./...` 通过。
-- 前端 103 项测试、TypeScript 检查和 Vite 生产构建通过。
+- 前端 104 项测试、TypeScript 检查和 Vite 生产构建通过。
 - Windows 命令树停止专项测试连续 100 次通过，Wails Windows amd64 生产构建通过。
 
 详细发布说明见 [docs/releases/v0.3.20.md](docs/releases/v0.3.20.md)。
